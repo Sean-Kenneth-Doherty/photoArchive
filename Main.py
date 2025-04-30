@@ -1,13 +1,11 @@
 import os
 import random
 import json
-import tkinter as tk
-from tkinter import filedialog, ttk
-from PIL import Image, ImageTk, ImageEnhance
+from PyQt5 import QtWidgets, QtGui, QtCore
+from PIL import Image, ImageEnhance
 import rawpy
 from queue import Queue
 from threading import Thread
-import inputs  # New import for Xbox controller support
 
 RATINGS_FILE = "elo_ratings.json"
 BLACKLIST_FILE = "blacklist.json"
@@ -58,11 +56,8 @@ def show_next_images():
     if not preloaded_images.empty():
         img1_path, img2_path, left_img, right_img = preloaded_images.get()
         image1, image2 = img1_path, img2_path
-        left_photo, right_photo = ImageTk.PhotoImage(left_img), ImageTk.PhotoImage(right_img)
-        left_label.config(image=left_photo)
-        left_label.image = left_photo
-        right_label.config(image=right_photo)
-        right_label.image = right_photo
+        left_label.setPixmap(QtGui.QPixmap.fromImage(left_img))
+        right_label.setPixmap(QtGui.QPixmap.fromImage(right_img))
         update_image_info()
         return
 
@@ -87,23 +82,20 @@ def resize_image(img, width, height):
 
 def update_images(img1, img2):
     left_img, right_img = open_and_resize_image(img1), open_and_resize_image(img2)
-    left_photo, right_photo = ImageTk.PhotoImage(left_img), ImageTk.PhotoImage(right_img)
-    left_label.config(image=left_photo)
-    left_label.image = left_photo
-    right_label.config(image=right_photo)
-    right_label.image = right_photo
+    left_label.setPixmap(QtGui.QPixmap.fromImage(left_img))
+    right_label.setPixmap(QtGui.QPixmap.fromImage(right_img))
     update_image_info()
 
 def update_image_info():
-    left_info.config(text=f"{os.path.basename(image1)}\nRating: {elo_ratings[os.path.basename(image1)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image1)]['compared']}")
-    right_info.config(text=f"{os.path.basename(image2)}\nRating: {elo_ratings[os.path.basename(image2)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image2)]['compared']}")
+    left_info.setText(f"{os.path.basename(image1)}\nRating: {elo_ratings[os.path.basename(image1)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image1)]['compared']}")
+    right_info.setText(f"{os.path.basename(image2)}\nRating: {elo_ratings[os.path.basename(image2)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image2)]['compared']}")
 
 def on_key(event):
-    if event.keysym == 'Left': select_winner(True)
-    elif event.keysym == 'Right': select_winner(False)
-    elif event.keysym == 'z': blacklist_and_replace_image(True)
-    elif event.keysym == 'x': blacklist_and_replace_image(False)
-    elif event.keysym == 'Escape': quit_program()
+    if event.key() == QtCore.Qt.Key_Left: select_winner(True)
+    elif event.key() == QtCore.Qt.Key_Right: select_winner(False)
+    elif event.key() == QtCore.Qt.Key_Z: blacklist_and_replace_image(True)
+    elif event.key() == QtCore.Qt.Key_X: blacklist_and_replace_image(False)
+    elif event.key() == QtCore.Qt.Key_Escape: quit_program()
 
 def blacklist_and_replace_image(is_left):
     global image1, image2
@@ -125,15 +117,11 @@ def blacklist_and_replace_image(is_left):
     if is_left:
         image1 = new_image
         left_img = open_and_resize_image(image1)
-        left_photo = ImageTk.PhotoImage(left_img)
-        left_label.config(image=left_photo)
-        left_label.image = left_photo
+        left_label.setPixmap(QtGui.QPixmap.fromImage(left_img))
     else:
         image2 = new_image
         right_img = open_and_resize_image(image2)
-        right_photo = ImageTk.PhotoImage(right_img)
-        right_label.config(image=right_photo)
-        right_label.image = right_photo
+        right_label.setPixmap(QtGui.QPixmap.fromImage(right_img))
     
     update_image_info()
 
@@ -162,63 +150,63 @@ def load_blacklist():
     return []
 
 def view_rankings():
-    ranking_window = tk.Toplevel(root)
-    ranking_window.title('Image Rankings')
-    ranking_window.geometry('800x600')
-    ranking_window.configure(bg='#2c2c2c')
-    
-    style = ttk.Style(ranking_window)
-    style.theme_use('clam')
-    style.configure("Treeview", background="#2c2c2c", foreground="white", fieldbackground="#2c2c2c")
-    style.map('Treeview', background=[('selected', '#22559b')])
-    
-    tree = ttk.Treeview(ranking_window, columns=('Filename', 'Rating', 'Compared', 'Blacklisted'), show='headings')
-    tree.heading('Filename', text='Filename')
-    tree.heading('Rating', text='Rating')
-    tree.heading('Compared', text='Compared')
-    tree.heading('Blacklisted', text='Blacklisted')
-    
+    ranking_window = QtWidgets.QWidget()
+    ranking_window.setWindowTitle('Image Rankings')
+    ranking_window.setGeometry(100, 100, 800, 600)
+    ranking_window.setStyleSheet("background-color: #2c2c2c; color: white;")
+
+    layout = QtWidgets.QVBoxLayout(ranking_window)
+    tree = QtWidgets.QTreeWidget()
+    tree.setHeaderLabels(['Filename', 'Rating', 'Compared', 'Blacklisted'])
+    tree.setStyleSheet("QTreeWidget { background-color: #2c2c2c; color: white; } QTreeWidget::item:selected { background-color: #22559b; }")
+
     for image, details in sorted(elo_ratings.items(), key=lambda x: x[1]['rating'], reverse=True):
-        tree.insert('', 'end', values=(image, f"{details['rating']:.2f}", details['compared'], 'Yes' if image in blacklist else 'No'))
-    
-    tree.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        item = QtWidgets.QTreeWidgetItem([image, f"{details['rating']:.2f}", str(details['compared']), 'Yes' if image in blacklist else 'No'])
+        tree.addTopLevelItem(item)
+
+    layout.addWidget(tree)
+    ranking_window.setLayout(layout)
+    ranking_window.show()
 
 def view_top_ranked():
-    top_rank_window = tk.Toplevel(root)
-    top_rank_window.title('Top Ranked Images')
-    top_rank_window.state('zoomed')
-    top_rank_window.configure(bg='#2c2c2c')
-    
-    canvas = tk.Canvas(top_rank_window, bg='#2c2c2c', highlightthickness=0)
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar = ttk.Scrollbar(top_rank_window, orient=tk.VERTICAL, command=canvas.yview)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    canvas.configure(yscrollcommand=scrollbar.set)
-    frame = ttk.Frame(canvas, style='TFrame')
-    canvas.create_window((0, 0), window=frame, anchor='nw')
-    
+    top_rank_window = QtWidgets.QWidget()
+    top_rank_window.setWindowTitle('Top Ranked Images')
+    top_rank_window.setStyleSheet("background-color: #2c2c2c; color: white;")
+    top_rank_window.showMaximized()
+
+    layout = QtWidgets.QVBoxLayout(top_rank_window)
+    scroll_area = QtWidgets.QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setStyleSheet("background-color: #2c2c2c;")
+
+    scroll_content = QtWidgets.QWidget()
+    scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
+
     for filename, details in sorted(elo_ratings.items(), key=lambda x: x[1]['rating'], reverse=True)[:TOP_RANK_COUNT]:
         img_path = details["path"]
         rating = round(details["rating"], 2)
         if os.path.exists(img_path) and filename not in blacklist:
             img = open_and_resize_image(img_path, width=400, height=300)
-            photo = ImageTk.PhotoImage(img)
-            image_label = ttk.Label(frame, image=photo, style='TLabel')
-            image_label.image = photo
-            image_label.pack(pady=10)
-            ttk.Label(frame, text=f'{filename}\nRating: {rating}', style='TLabel').pack()
+            photo = QtGui.QPixmap.fromImage(img)
+            image_label = QtWidgets.QLabel()
+            image_label.setPixmap(photo)
+            scroll_layout.addWidget(image_label)
+            scroll_layout.addWidget(QtWidgets.QLabel(f'{filename}\nRating: {rating}'))
         elif filename in blacklist:
-            ttk.Label(frame, text=f'{filename} is blacklisted. Rating: {rating}', style='TLabel').pack()
+            scroll_layout.addWidget(QtWidgets.QLabel(f'{filename} is blacklisted. Rating: {rating}'))
         else:
-            ttk.Label(frame, text=f'{filename} not found. Rating: {rating}', style='TLabel').pack()
-    
-    frame.update_idletasks()
-    canvas.config(scrollregion=canvas.bbox("all"))
+            scroll_layout.addWidget(QtWidgets.QLabel(f'{filename} not found. Rating: {rating}'))
+
+    scroll_content.setLayout(scroll_layout)
+    scroll_area.setWidget(scroll_content)
+    layout.addWidget(scroll_area)
+    top_rank_window.setLayout(layout)
+    top_rank_window.show()
 
 def quit_program():
     save_ratings()
     save_blacklist()
-    root.quit()
+    app.quit()
 
 def open_and_resize_image(img_path, width=None, height=None):
     img = open_image(img_path)
@@ -246,39 +234,18 @@ def update_progress():
     unrated_count = get_unrated_count()
     total_count = len(images)
     progress = (total_count - unrated_count) / total_count * 100
-    progress_bar['value'] = progress
+    progress_bar.setValue(progress)
 
-def create_styled_button(parent, text, command):
-    return tk.Button(parent, text=text, command=command, bg="#4CAF50", fg="white", 
-                     activebackground="#45a049", activeforeground="white", 
-                     relief=tk.FLAT, padx=20, pady=10, font=("Helvetica", 12))
-
-# New function to handle Xbox controller input
-def handle_controller_input():
-    while True:
-        try:
-            events = inputs.get_gamepad()
-            for event in events:
-                if event.code == 'BTN_SOUTH' and event.state == 1:  # A button
-                    root.event_generate('<<ControllerLeft>>')
-                elif event.code == 'BTN_EAST' and event.state == 1:  # B button
-                    root.event_generate('<<ControllerRight>>')
-                elif event.code == 'BTN_WEST' and event.state == 1:  # X button
-                    root.event_generate('<<ControllerBlacklistLeft>>')
-                elif event.code == 'BTN_NORTH' and event.state == 1:  # Y button
-                    root.event_generate('<<ControllerBlacklistRight>>')
-        except inputs.UnpluggedError:
-            # No gamepad found, sleep for a while before trying again
-            import time
-            time.sleep(1)
-        except Exception as e:
-            print(f"Unexpected error in controller input: {e}")
-            # Sleep to avoid tight loop if persistent error
-            import time
-            time.sleep(1)
+def create_styled_button(text, command):
+    button = QtWidgets.QPushButton(text)
+    button.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px 20px; font-size: 12pt;")
+    button.clicked.connect(command)
+    return button
 
 # Main program
-folder_path = filedialog.askdirectory(title='Select a folder containing images')
+app = QtWidgets.QApplication([])
+
+folder_path = QtWidgets.QFileDialog.getExistingDirectory(None, 'Select a folder containing images')
 images = get_images_from_folder(folder_path)
 elo_ratings = load_ratings()
 blacklist = load_blacklist()
@@ -297,73 +264,62 @@ image_width, image_height = 800, 600
 preloaded_images = Queue(maxsize=5)
 Thread(target=preload_images, daemon=True).start()
 
-# Start the controller input thread
-Thread(target=handle_controller_input, daemon=True).start()
+root = QtWidgets.QWidget()
+root.setWindowTitle('Image Ranking')
+root.showMaximized()
+root.setStyleSheet("background-color: #2C2C2C; color: white;")
 
-try:
-    Thread(target=handle_controller_input, daemon=True).start()
-    print("Xbox controller support enabled. Connect a controller to use it.")
-except Exception as e:
-    print(f"Could not initialize Xbox controller support: {e}")
-    print("Continuing without controller support. Use keyboard controls.")
+main_layout = QtWidgets.QVBoxLayout(root)
 
-root = tk.Tk()
-root.title('Image Ranking')
-root.state('zoomed')
-root.configure(bg='#2C2C2C')
+image_layout = QtWidgets.QHBoxLayout()
+main_layout.addLayout(image_layout)
 
-main_frame = tk.Frame(root, bg='#2C2C2C', padx=20, pady=20)
-main_frame.pack(fill=tk.BOTH, expand=True)
+left_label = QtWidgets.QLabel()
+left_label.setStyleSheet("background-color: #2C2C2C;")
+image_layout.addWidget(left_label)
 
-image_frame = tk.Frame(main_frame, bg='#2C2C2C')
-image_frame.pack(fill=tk.BOTH, expand=True)
+right_label = QtWidgets.QLabel()
+right_label.setStyleSheet("background-color: #2C2C2C;")
+image_layout.addWidget(right_label)
 
-left_frame = tk.Frame(image_frame, bg='#2C2C2C')
-left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-left_label = tk.Label(left_frame, bg='#2C2C2C')
-left_label.pack(fill=tk.BOTH, expand=True)
-left_info = tk.Label(left_frame, bg='#2C2C2C', fg='white', font=('Helvetica', 12))
-left_info.pack(pady=10)
+info_layout = QtWidgets.QHBoxLayout()
+main_layout.addLayout(info_layout)
 
-right_frame = tk.Frame(image_frame, bg='#2C2C2C')
-right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
-right_label = tk.Label(right_frame, bg='#2C2C2C')
-right_label.pack(fill=tk.BOTH, expand=True)
-right_info = tk.Label(right_frame, bg='#2C2C2C', fg='white', font=('Helvetica', 12))
-right_info.pack(pady=10)
+left_info = QtWidgets.QLabel()
+left_info.setStyleSheet("color: white; font-size: 12pt;")
+info_layout.addWidget(left_info)
 
-button_frame = tk.Frame(main_frame, bg='#2C2C2C')
-button_frame.pack(side=tk.BOTTOM, pady=20)
+right_info = QtWidgets.QLabel()
+right_info.setStyleSheet("color: white; font-size: 12pt;")
+info_layout.addWidget(right_info)
 
-left_button = create_styled_button(button_frame, "← Left (←)", lambda: select_winner(True))
-left_button.pack(side=tk.LEFT, padx=5)
-right_button = create_styled_button(button_frame, "Right (→) →", lambda: select_winner(False))
-right_button.pack(side=tk.LEFT, padx=5)
-view_ranking_button = create_styled_button(button_frame, "View Rankings", view_rankings)
-view_ranking_button.pack(side=tk.LEFT, padx=5)
-view_top_button = create_styled_button(button_frame, "View Top Ranked", view_top_ranked)
-view_top_button.pack(side=tk.LEFT, padx=5)
-quit_button = create_styled_button(button_frame, "Quit", quit_program)
-quit_button.pack(side=tk.LEFT, padx=5)
+button_layout = QtWidgets.QHBoxLayout()
+main_layout.addLayout(button_layout)
 
-progress_frame = tk.Frame(root, bg='#2C2C2C', height=30)
-progress_frame.pack(side=tk.BOTTOM, fill=tk.X)
-progress_bar = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=100, mode='determinate')
-progress_bar.pack(fill=tk.X, padx=20, pady=10)
+left_button = create_styled_button("← Left (←)", lambda: select_winner(True))
+button_layout.addWidget(left_button)
 
-# Bind controller events
-root.bind('<<ControllerLeft>>', lambda e: select_winner(True))
-root.bind('<<ControllerRight>>', lambda e: select_winner(False))
-root.bind('<<ControllerBlacklistLeft>>', lambda e: blacklist_and_replace_image(True))
-root.bind('<<ControllerBlacklistRight>>', lambda e: blacklist_and_replace_image(False))
+right_button = create_styled_button("Right (→) →", lambda: select_winner(False))
+button_layout.addWidget(right_button)
 
-# Existing key bindings
-root.bind('<Left>', on_key)
-root.bind('<Right>', on_key)
-root.bind('<z>', on_key)
-root.bind('<x>', on_key)
-root.bind('<Escape>', on_key)
+view_ranking_button = create_styled_button("View Rankings", view_rankings)
+button_layout.addWidget(view_ranking_button)
+
+view_top_button = create_styled_button("View Top Ranked", view_top_ranked)
+button_layout.addWidget(view_top_button)
+
+quit_button = create_styled_button("Quit", quit_program)
+button_layout.addWidget(quit_button)
+
+progress_bar = QtWidgets.QProgressBar()
+progress_bar.setStyleSheet("background-color: #2C2C2C; color: white;")
+main_layout.addWidget(progress_bar)
+
+root.setLayout(main_layout)
+
+root.keyPressEvent = on_key
 
 show_next_images()
 update_progress()
-root.mainloop()
+root.show()
+app.exec_()
