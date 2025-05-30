@@ -1,369 +1,332 @@
+#!/usr/bin/env python3
+"""
+PhotoRanker — Minimal v5.1
+==========================
+Small PyQt5 photo‑ranking tool with **SQLite‑only persistence**.
+This patch (v5.1) adds **automatic schema migration** so older
+`photo_ranker.db` files—from versions that lacked the `rank` column—work
+without errors.
+
+Patch highlights
+----------------
+* `_init_schema()` now checks `PRAGMA table_info(images)` and `ALTER TABLE …
+  ADD COLUMN rank INTEGER` if missing.
+
+Keyboard
+--------
+← better → worse Z blacklist‑left X blacklist‑right Esc quit
+"""
+
+from __future__ import annotations
+
+import hashlib
 import os
 import random
-import json
-import tkinter as tk
-from tkinter import filedialog, ttk
-from PIL import Image, ImageTk, ImageEnhance
-import rawpy
-from queue import Queue
-from threading import Thread
-import inputs  # New import for Xbox controller support
+import sqlite3
+import sys
+from typing import List, Optional, Tuple
 
-RATINGS_FILE = "elo_ratings.json"
-BLACKLIST_FILE = "blacklist.json"
-TOP_RANK_COUNT = 10
-Image.MAX_IMAGE_PIXELS = None  # To handle large images
+from PIL import Image
+import rawpy  # type: ignore
+from PyQt5 import QtCore, QtGui, QtWidgets
 
-def open_image(img_path):
-    return Image.open(img_path) if not img_path.lower().endswith('.dng') else Image.fromarray(rawpy.imread(img_path).postprocess())
+DB_FILE = "photo_ranker.db"
+K_FACTOR = 32  # Elo constant
 
-def get_images_from_folder(folder_path):
-    return [os.path.join(subdir, file) for subdir, _, files in os.walk(folder_path) for file in files if file.lower().endswith(('jpg', 'png', 'jpeg', 'dng'))]
+# ----------------------------------------------------------------------------
+# Helpers --------------------------------------------------------------------
 
-def update_elo_rank(winner_elo, loser_elo, K):
-    expected_winner = 1 / (1 + 10 ** ((loser_elo - winner_elo) / 400))
-    winner_elo += K * (1 - expected_winner)
-    loser_elo += K * (expected_winner - 1)
-    return winner_elo, loser_elo
+def file_hash(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while blk := fh.read(chunk):
+            h.update(blk)
+    return h.hexdigest()
 
-def get_unrated_count():
-    return sum(1 for img in images if elo_ratings[os.path.basename(img)]['rating'] == 1200)
 
-def select_winner(left_win):
-    global image1, image2
-    winner, loser = (image1, image2) if left_win else (image2, image1)
-    filename_winner, filename_loser = os.path.basename(winner), os.path.basename(loser)
+def open_image(path: str) -> Image.Image:
+    if path.lower().endswith(".dng"):
+        with rawpy.imread(path) as raw:
+            return Image.fromarray(raw.postprocess())
+    return Image.open(path)
 
-    elo_ratings[filename_winner]['compared'] += 1
-    elo_ratings[filename_loser]['compared'] += 1
-    elo_ratings[filename_winner]['confidence'] = elo_ratings[filename_winner]['compared'] / float(len(images))
-    elo_ratings[filename_loser]['confidence'] = elo_ratings[filename_loser]['compared'] / float(len(images))
 
-    winner_elo, loser_elo = elo_ratings[filename_winner]['rating'], elo_ratings[filename_loser]['rating']
-    K = 32 if abs(winner_elo - loser_elo) < 100 else 16
-    winner_elo, loser_elo = update_elo_rank(winner_elo, loser_elo, K)
+def pil_to_qimage(img: Image.Image) -> QtGui.QImage:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    w, h = img.size
+    return QtGui.QImage(img.tobytes("raw", "RGBA"), w, h, QtGui.QImage.Format_RGBA8888)
 
-    elo_ratings[filename_winner]['rating'] = winner_elo
-    elo_ratings[filename_loser]['rating'] = loser_elo
-    
-    update_progress()
-    show_next_images()
 
-def get_least_compared_images():
-    return sorted([img for img in images if os.path.basename(img) not in blacklist], 
-                  key=lambda img: elo_ratings[os.path.basename(img)]['compared'])
+class ResponsiveLabel(QtWidgets.QLabel):
+    def __init__(self):
+        super().__init__()
+        self._pix: Optional[QtGui.QPixmap] = None
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-def show_next_images():
-    global image1, image2
-    if not preloaded_images.empty():
-        img1_path, img2_path, left_img, right_img = preloaded_images.get()
-        image1, image2 = img1_path, img2_path
-        left_photo, right_photo = ImageTk.PhotoImage(left_img), ImageTk.PhotoImage(right_img)
-        left_label.config(image=left_photo)
-        left_label.image = left_photo
-        right_label.config(image=right_photo)
-        right_label.image = right_photo
-        update_image_info()
-        return
+    def setPixmap(self, pix: QtGui.QPixmap):  # type: ignore[override]
+        self._pix = pix
+        self._update()
 
-    least_compared_images = get_least_compared_images()[:20]  # Grab the 20 least compared images
-    if len(least_compared_images) < 2:
-        print("Not enough images to compare. Please add more images or remove some from the blacklist.")
-        return
+    def resizeEvent(self, _ev):
+        self._update()
 
-    image1 = random.choice(least_compared_images)
-    image2 = random.choice([img for img in least_compared_images if img != image1])
+    def _update(self):
+        if self._pix:
+            super().setPixmap(
+                self._pix.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            )
 
-    if random.choice([True, False]): image1, image2 = image2, image1
+# ----------------------------------------------------------------------------
+# SQLite layer ---------------------------------------------------------------
 
-    update_images(image1, image2)
+class DB:
+    def __init__(self, path: str):
+        self.con = sqlite3.connect(path)
+        self._init_schema()
 
-def resize_image(img, width, height):
-    img_ratio = img.width / img.height
-    target_ratio = width / height
-    new_width = width if img_ratio > target_ratio else int(height * img_ratio)
-    new_height = int(width / img_ratio) if img_ratio > target_ratio else height
-    return img.resize((new_width, new_height), Image.LANCZOS)
+    def _init_schema(self):
+        """Create table if missing and add new columns when upgrading."""
+        # initial table if never created
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS images (
+                   hash TEXT PRIMARY KEY,
+                   path TEXT,
+                   rating REAL DEFAULT 1200,
+                   compared INTEGER DEFAULT 0,
+                   blacklist INTEGER DEFAULT 0
+               )"""
+        )
+        # migrate: add rank column if absent
+        cols = [row[1] for row in self.con.execute("PRAGMA table_info(images)")]
+        if "rank" not in cols:
+            self.con.execute("ALTER TABLE images ADD COLUMN rank INTEGER")
+        self.con.commit()
 
-def update_images(img1, img2):
-    left_img, right_img = open_and_resize_image(img1), open_and_resize_image(img2)
-    left_photo, right_photo = ImageTk.PhotoImage(left_img), ImageTk.PhotoImage(right_img)
-    left_label.config(image=left_photo)
-    left_label.image = left_photo
-    right_label.config(image=right_photo)
-    right_label.image = right_photo
-    update_image_info()
+    # maintenance
+    def touch(self, h: str, path: str):
+        self.con.execute("INSERT OR IGNORE INTO images(hash, path) VALUES(?, ?)", (h, path))
+        self.con.execute("UPDATE images SET path=? WHERE hash=?", (path, h))
+        self.con.commit()
 
-def update_image_info():
-    left_info.config(text=f"{os.path.basename(image1)}\nRating: {elo_ratings[os.path.basename(image1)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image1)]['compared']}")
-    right_info.config(text=f"{os.path.basename(image2)}\nRating: {elo_ratings[os.path.basename(image2)]['rating']:.2f}\nCompared: {elo_ratings[os.path.basename(image2)]['compared']}")
+    # queries
+    def unranked(self) -> List[str]:
+        return [r[0] for r in self.con.execute("SELECT hash FROM images WHERE blacklist=0 AND rank IS NULL")]
 
-def on_key(event):
-    if event.keysym == 'Left': select_winner(True)
-    elif event.keysym == 'Right': select_winner(False)
-    elif event.keysym == 'z': blacklist_and_replace_image(True)
-    elif event.keysym == 'x': blacklist_and_replace_image(False)
-    elif event.keysym == 'Escape': quit_program()
+    def ranked_order(self) -> List[str]:
+        return [r[0] for r in self.con.execute("SELECT hash FROM images WHERE rank IS NOT NULL AND blacklist=0 ORDER BY rank ASC")]
 
-def blacklist_and_replace_image(is_left):
-    global image1, image2
-    image_to_blacklist = image1 if is_left else image2
-    filename = os.path.basename(image_to_blacklist)
-    if filename not in blacklist:
-        blacklist.append(filename)
-        print(f"Blacklisted: {filename}")
-        save_blacklist()
-    
-    # Get a new image to replace the blacklisted one
-    least_compared_images = get_least_compared_images()
-    if not least_compared_images:
-        print("No more images available to compare.")
-        return
-    
-    new_image = random.choice([img for img in least_compared_images if img != image1 and img != image2])
-    
-    if is_left:
-        image1 = new_image
-        left_img = open_and_resize_image(image1)
-        left_photo = ImageTk.PhotoImage(left_img)
-        left_label.config(image=left_photo)
-        left_label.image = left_photo
-    else:
-        image2 = new_image
-        right_img = open_and_resize_image(image2)
-        right_photo = ImageTk.PhotoImage(right_img)
-        right_label.config(image=right_photo)
-        right_label.image = right_photo
-    
-    update_image_info()
+    def path(self, h: str) -> str:
+        row = self.con.execute("SELECT path FROM images WHERE hash=?", (h,)).fetchone()
+        return row[0] if row else ""
 
-def save_ratings():
-    with open(RATINGS_FILE, 'w') as file:
-        json.dump(elo_ratings, file)
+    def rating(self, h: str) -> float:
+        return self.con.execute("SELECT rating FROM images WHERE hash=?", (h,)).fetchone()[0]
 
-def save_blacklist():
-    with open(BLACKLIST_FILE, 'w') as file:
-        json.dump(blacklist, file)
+    def rank(self, h: str) -> Optional[int]:
+        row = self.con.execute("SELECT rank FROM images WHERE hash=?", (h,)).fetchone()
+        return row[0] if row and row[0] is not None else None
 
-def load_ratings():
-    if os.path.exists(RATINGS_FILE):
-        with open(RATINGS_FILE, 'r') as file:
-            loaded_ratings = json.load(file)
-            for key, value in loaded_ratings.items():
-                if isinstance(value, (int, float)):
-                    loaded_ratings[key] = {'path': '', 'rating': value, 'compared': 0, 'confidence': 0.0}
-            return loaded_ratings
-    return {}
+    def update_elo(self, winner: str, loser: str):
+        rw, rl = self.rating(winner), self.rating(loser)
+        expected_w = 1 / (1 + 10 ** ((rl - rw) / 400))
+        rw_new = rw + K_FACTOR * (1 - expected_w)
+        rl_new = rl + K_FACTOR * (expected_w - 1)
+        self.con.executemany(
+            "UPDATE images SET rating=?, compared = compared+1 WHERE hash=?",
+            [(rw_new, winner), (rl_new, loser)],
+        )
+        self.con.commit()
 
-def load_blacklist():
-    if os.path.exists(BLACKLIST_FILE):
-        with open(BLACKLIST_FILE, 'r') as file:
-            return json.load(file)
-    return []
+    def update_ranks(self, ordered: List[str]):
+        self.con.executemany("UPDATE images SET rank=? WHERE hash=?", [(i + 1, h) for i, h in enumerate(ordered)])
+        self.con.commit()
 
-def view_rankings():
-    ranking_window = tk.Toplevel(root)
-    ranking_window.title('Image Rankings')
-    ranking_window.geometry('800x600')
-    ranking_window.configure(bg='#2c2c2c')
-    
-    style = ttk.Style(ranking_window)
-    style.theme_use('clam')
-    style.configure("Treeview", background="#2c2c2c", foreground="white", fieldbackground="#2c2c2c")
-    style.map('Treeview', background=[('selected', '#22559b')])
-    
-    tree = ttk.Treeview(ranking_window, columns=('Filename', 'Rating', 'Compared', 'Blacklisted'), show='headings')
-    tree.heading('Filename', text='Filename')
-    tree.heading('Rating', text='Rating')
-    tree.heading('Compared', text='Compared')
-    tree.heading('Blacklisted', text='Blacklisted')
-    
-    for image, details in sorted(elo_ratings.items(), key=lambda x: x[1]['rating'], reverse=True):
-        tree.insert('', 'end', values=(image, f"{details['rating']:.2f}", details['compared'], 'Yes' if image in blacklist else 'No'))
-    
-    tree.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+    def blacklist(self, h: str):
+        self.con.execute("UPDATE images SET blacklist=1, rank=NULL WHERE hash=?", (h,))
+        self.con.commit()
 
-def view_top_ranked():
-    top_rank_window = tk.Toplevel(root)
-    top_rank_window.title('Top Ranked Images')
-    top_rank_window.state('zoomed')
-    top_rank_window.configure(bg='#2c2c2c')
-    
-    canvas = tk.Canvas(top_rank_window, bg='#2c2c2c', highlightthickness=0)
-    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar = ttk.Scrollbar(top_rank_window, orient=tk.VERTICAL, command=canvas.yview)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    canvas.configure(yscrollcommand=scrollbar.set)
-    frame = ttk.Frame(canvas, style='TFrame')
-    canvas.create_window((0, 0), window=frame, anchor='nw')
-    
-    for filename, details in sorted(elo_ratings.items(), key=lambda x: x[1]['rating'], reverse=True)[:TOP_RANK_COUNT]:
-        img_path = details["path"]
-        rating = round(details["rating"], 2)
-        if os.path.exists(img_path) and filename not in blacklist:
-            img = open_and_resize_image(img_path, width=400, height=300)
-            photo = ImageTk.PhotoImage(img)
-            image_label = ttk.Label(frame, image=photo, style='TLabel')
-            image_label.image = photo
-            image_label.pack(pady=10)
-            ttk.Label(frame, text=f'{filename}\nRating: {rating}', style='TLabel').pack()
-        elif filename in blacklist:
-            ttk.Label(frame, text=f'{filename} is blacklisted. Rating: {rating}', style='TLabel').pack()
+# ----------------------------------------------------------------------------
+# Sorter ---------------------------------------------------------------------
+
+class PairwiseSorter:
+    def __init__(self, unranked: List[str], db: DB, seeded: List[str]):
+        self.db = db
+        self.pool = unranked[:]
+        random.shuffle(self.pool)
+        self.sorted = seeded[:]  # already‑ranked list
+        self._cand: Optional[str] = None
+        self.low = self.high = 0
+
+    def next_pair(self) -> Tuple[Optional[str], Optional[str]]:
+        if self._cand is None:
+            while self.pool:
+                self._cand = self.pool.pop()
+                if self._cand not in self.sorted:
+                    break
+            else:
+                return None, None
+            if not self.sorted:
+                self.sorted.append(self._cand)
+                self._cand = None
+                self.db.update_ranks(self.sorted)
+                return self.next_pair()
+            self.low, self.high = 0, len(self.sorted)
+        mid = (self.low + self.high) // 2
+        return self._cand, self.sorted[mid]
+
+    def vote(self, cand_better: bool):
+        if self._cand is None:
+            return
+        ref_idx = (self.low + self.high) // 2
+        ref = self.sorted[ref_idx]
+        winner, loser = (self._cand, ref) if cand_better else (ref, self._cand)
+        self.db.update_elo(winner, loser)
+        if cand_better:
+            self.high = ref_idx
         else:
-            ttk.Label(frame, text=f'{filename} not found. Rating: {rating}', style='TLabel').pack()
-    
-    frame.update_idletasks()
-    canvas.config(scrollregion=canvas.bbox("all"))
+            self.low = ref_idx + 1
+        if self.low >= self.high:
+            self.sorted.insert(self.low, self._cand)
+            self._cand = None
+            self.db.update_ranks(self.sorted)
 
-def quit_program():
-    save_ratings()
-    save_blacklist()
-    root.quit()
+    def progress(self) -> Tuple[int, int]:
+        done = len(self.sorted)
+        return done, done + len(self.pool) + (1 if self._cand else 0)
 
-def open_and_resize_image(img_path, width=None, height=None):
-    img = open_image(img_path)
-    if width and height:
-        return resize_image(img, width, height)
-    return resize_image(img, image_width, image_height)
+    def add_hashes(self, hs: List[str]):
+        for h in hs:
+            if h not in self.pool and h not in self.sorted and h != self._cand:
+                self.pool.append(h)
+        random.shuffle(self.pool)
 
-def get_next_images_for_preload():
-    least_compared = get_least_compared_images()[:20]
-    if len(least_compared) < 2:
-        return None, None
-    img1, img2 = random.sample(least_compared, 2)
-    return img1, img2
+# ----------------------------------------------------------------------------
+# Folder ingest --------------------------------------------------------------
 
-def preload_images():
-    while True:
-        img1, img2 = get_next_images_for_preload()
-        if img1 is None or img2 is None:
-            continue
-        left_img = open_and_resize_image(img1)
-        right_img = open_and_resize_image(img2)
-        preloaded_images.put((img1, img2, left_img, right_img))
+def ingest_folder(folder: str, db: DB) -> List[str]:
+    new_hashes: List[str] = []
+    for root, _d, files in os.walk(folder):
+        for f in files:
+            if not f.lower().endswith((".jpg", ".jpeg", ".png", ".dng")):
+                continue
+            p = os.path.join(root, f)
+            h = file_hash(p)
+            db.touch(h, p)
+            new_hashes.append(h)
+    return new_hashes
 
-def update_progress():
-    unrated_count = get_unrated_count()
-    total_count = len(images)
-    progress = (total_count - unrated_count) / total_count * 100
-    progress_bar['value'] = progress
+# ----------------------------------------------------------------------------
+# Main -----------------------------------------------------------------------
 
-def create_styled_button(parent, text, command):
-    return tk.Button(parent, text=text, command=command, bg="#4CAF50", fg="white", 
-                     activebackground="#45a049", activeforeground="white", 
-                     relief=tk.FLAT, padx=20, pady=10, font=("Helvetica", 12))
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    db = DB(DB_FILE)
 
-# New function to handle Xbox controller input
-def handle_controller_input():
-    while True:
-        try:
-            events = inputs.get_gamepad()
-            for event in events:
-                if event.code == 'BTN_SOUTH' and event.state == 1:  # A button
-                    root.event_generate('<<ControllerLeft>>')
-                elif event.code == 'BTN_EAST' and event.state == 1:  # B button
-                    root.event_generate('<<ControllerRight>>')
-                elif event.code == 'BTN_WEST' and event.state == 1:  # X button
-                    root.event_generate('<<ControllerBlacklistLeft>>')
-                elif event.code == 'BTN_NORTH' and event.state == 1:  # Y button
-                    root.event_generate('<<ControllerBlacklistRight>>')
-        except inputs.UnpluggedError:
-            # No gamepad found, sleep for a while before trying again
-            import time
-            time.sleep(1)
-        except Exception as e:
-            print(f"Unexpected error in controller input: {e}")
-            # Sleep to avoid tight loop if persistent error
-            import time
-            time.sleep(1)
+    ranked = db.ranked_order()
+    unranked = db.unranked()
 
-# Main program
-folder_path = filedialog.askdirectory(title='Select a folder containing images')
-images = get_images_from_folder(folder_path)
-elo_ratings = load_ratings()
-blacklist = load_blacklist()
+    if not (ranked or unranked):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(None, "Select image folder")
+        if not folder:
+            sys.exit()
+        unranked = ingest_folder(folder, db)
 
-for image in images:
-    filename = os.path.basename(image)
-    existing_entry = elo_ratings.get(filename, {'rating': 1200, 'compared': 0, 'confidence': 0.0})
-    elo_ratings[filename] = {
-        'path': image,
-        'rating': existing_entry.get('rating', 1200),
-        'compared': existing_entry.get('compared', 0),
-        'confidence': existing_entry.get('confidence', 0.0)
-    }
+    if not (ranked or unranked):
+        QtWidgets.QMessageBox.warning(None, "No images", "No non‑blacklisted images found.")
+        sys.exit()
 
-image_width, image_height = 800, 600
-preloaded_images = Queue(maxsize=5)
-Thread(target=preload_images, daemon=True).start()
+    sorter = PairwiseSorter(unranked, db, ranked)
 
-# Start the controller input thread
-Thread(target=handle_controller_input, daemon=True).start()
+    # UI setup
+    win = QtWidgets.QMainWindow()
+    win.setWindowTitle("PhotoRanker v5.1")
+    central = QtWidgets.QWidget()
+    win.setCentralWidget(central)
+    vbox = QtWidgets.QVBoxLayout(central)
+    info = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+    left, right = ResponsiveLabel(), ResponsiveLabel()
+    hbox = QtWidgets.QHBoxLayout()
+    hbox.addWidget(left)
+    hbox.addWidget(right)
+    vbox.addWidget(info)
+    vbox.addLayout(hbox)
 
-try:
-    Thread(target=handle_controller_input, daemon=True).start()
-    print("Xbox controller support enabled. Connect a controller to use it.")
-except Exception as e:
-    print(f"Could not initialize Xbox controller support: {e}")
-    print("Continuing without controller support. Use keyboard controls.")
+    # menu
+    menubar = win.menuBar()
+    file_menu = menubar.addMenu("&File")
+    act_add = QtWidgets.QAction("Add Folder…", win)
+    act_add.setShortcut(QtGui.QKeySequence("Ctrl+O"))
 
-root = tk.Tk()
-root.title('Image Ranking')
-root.state('zoomed')
-root.configure(bg='#2C2C2C')
+    def add_folder():
+        folder = QtWidgets.QFileDialog.getExistingDirectory(win, "Add image folder")
+        if folder:
+            new_hashes = ingest_folder(folder, db)
+            sorter.add_hashes([h for h in new_hashes if h not in ranked and h not in unranked])
+            unranked.extend(new_hashes)
+            refresh()
 
-main_frame = tk.Frame(root, bg='#2C2C2C', padx=20, pady=20)
-main_frame.pack(fill=tk.BOTH, expand=True)
+    act_add.triggered.connect(add_folder)
+    file_menu.addAction(act_add)
 
-image_frame = tk.Frame(main_frame, bg='#2C2C2C')
-image_frame.pack(fill=tk.BOTH, expand=True)
+    file_menu.addSeparator()
+    act_quit = QtWidgets.QAction("Quit", win)
+    act_quit.setShortcut(QtGui.QKeySequence("Ctrl+Q"))
+    act_quit.triggered.connect(app.quit)
+    file_menu.addAction(act_quit)
 
-left_frame = tk.Frame(image_frame, bg='#2C2C2C')
-left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-left_label = tk.Label(left_frame, bg='#2C2C2C')
-left_label.pack(fill=tk.BOTH, expand=True)
-left_info = tk.Label(left_frame, bg='#2C2C2C', fg='white', font=('Helvetica', 12))
-left_info.pack(pady=10)
+    win.showMaximized()
 
-right_frame = tk.Frame(image_frame, bg='#2C2C2C')
-right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
-right_label = tk.Label(right_frame, bg='#2C2C2C')
-right_label.pack(fill=tk.BOTH, expand=True)
-right_info = tk.Label(right_frame, bg='#2C2C2C', fg='white', font=('Helvetica', 12))
-right_info.pack(pady=10)
+    # helpers
+    total_photos = len(ranked) + len(unranked)
 
-button_frame = tk.Frame(main_frame, bg='#2C2C2C')
-button_frame.pack(side=tk.BOTTOM, pady=20)
+    def _rank_str(h: str) -> str:
+        r = db.rank(h)
+        return f"#{r}" if r else "?"
 
-left_button = create_styled_button(button_frame, "← Left (←)", lambda: select_winner(True))
-left_button.pack(side=tk.LEFT, padx=5)
-right_button = create_styled_button(button_frame, "Right (→) →", lambda: select_winner(False))
-right_button.pack(side=tk.LEFT, padx=5)
-view_ranking_button = create_styled_button(button_frame, "View Rankings", view_rankings)
-view_ranking_button.pack(side=tk.LEFT, padx=5)
-view_top_button = create_styled_button(button_frame, "View Top Ranked", view_top_ranked)
-view_top_button.pack(side=tk.LEFT, padx=5)
-quit_button = create_styled_button(button_frame, "Quit", quit_program)
-quit_button.pack(side=tk.LEFT, padx=5)
+    def refresh():
+        pair = sorter.next_pair()
+        if pair == (None, None):
+            info.setText("✓ All done — leaderboard saved.")
+            left.clear()
+            right.clear()
+            return
+        h_a, h_b = pair
+        left.setPixmap(QtGui.QPixmap.fromImage(pil_to_qimage(open_image(db.path(h_a)))))
+        right.setPixmap(QtGui.QPixmap.fromImage(pil_to_qimage(open_image(db.path(h_b)))))
+        done, todo = sorter.progress()
+        info.setText(
+            f"{done}/{todo} ({done/todo*100:.1f}%)  |  {_rank_str(h_a)} vs {_rank_str(h_b)} / {total_photos}  |  {int(db.rating(h_a))} vs {int(db.rating(h_b))} Elo"
+        )
 
-progress_frame = tk.Frame(root, bg='#2C2C2C', height=30)
-progress_frame.pack(side=tk.BOTTOM, fill=tk.X)
-progress_bar = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=100, mode='determinate')
-progress_bar.pack(fill=tk.X, padx=20, pady=10)
+    # key events
+    def on_key(evt):
+        key = evt.key()
+        if key == QtCore.Qt.Key_Left:
+            sorter.vote(True)
+            refresh()
+        elif key == QtCore.Qt.Key_Right:
+            sorter.vote(False)
+            refresh()
+        elif key == QtCore.Qt.Key_Z:  # blacklist left
+            cand, _ref = sorter.next_pair()
+            if cand:
+                db.blacklist(cand)
+            refresh()
+        elif key == QtCore.Qt.Key_X:  # blacklist right
+            _cand, ref = sorter.next_pair()
+            if ref:
+                db.blacklist(ref)
+            refresh()
+        elif key == QtCore.Qt.Key_Escape:
+            app.quit()
 
-# Bind controller events
-root.bind('<<ControllerLeft>>', lambda e: select_winner(True))
-root.bind('<<ControllerRight>>', lambda e: select_winner(False))
-root.bind('<<ControllerBlacklistLeft>>', lambda e: blacklist_and_replace_image(True))
-root.bind('<<ControllerBlacklistRight>>', lambda e: blacklist_and_replace_image(False))
+    win.keyPressEvent = on_key  # type: ignore
 
-# Existing key bindings
-root.bind('<Left>', on_key)
-root.bind('<Right>', on_key)
-root.bind('<z>', on_key)
-root.bind('<x>', on_key)
-root.bind('<Escape>', on_key)
+    refresh()
+    sys.exit(app.exec_())
 
-show_next_images()
-update_progress()
-root.mainloop()
+
+if __name__ == "__main__":
+    main()
