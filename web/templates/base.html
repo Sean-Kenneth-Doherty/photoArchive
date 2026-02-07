@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}PhotoRanker{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="/" class="nav-brand">PhotoRanker</a>
+        {% block navbar_center %}{% endblock %}
+        <div class="nav-links">
+            <a href="/compare" class="nav-link">Compare</a>
+            <a href="/rankings" class="nav-link">Rankings</a>
+        </div>
+    </nav>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <script src="/static/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

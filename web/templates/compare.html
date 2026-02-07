@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}PhotoRanker — Compare{% endblock %}
+{% block content %}
+<div class="compare-container">
+    <div class="compare-header">
+        <div class="compare-progress">
+            <p id="compare-progress-text">Loading pairs...</p>
+        </div>
+        <div class="compare-mode-toggle">
+            <button id="mode-mosaic" class="mode-btn active" onclick="PhotoRanker.setCompareMode('mosaic')">Mosaic</button>
+            <button id="mode-swiss" class="mode-btn" onclick="PhotoRanker.setCompareMode('swiss')">Swiss</button>
+            <button id="mode-topn" class="mode-btn" onclick="PhotoRanker.setCompareMode('topn')">Top 50</button>
+        </div>
+    </div>
+
+    <!-- A/B mode -->
+    <div class="compare-images" id="compare-images">
+        <div class="compare-side" id="compare-left">
+            <img id="compare-left-img" src="" alt="Left image">
+            <div class="compare-info" id="compare-left-info"></div>
+        </div>
+        <div class="compare-divider"></div>
+        <div class="compare-side" id="compare-right">
+            <img id="compare-right-img" src="" alt="Right image">
+            <div class="compare-info" id="compare-right-info"></div>
+        </div>
+    </div>
+
+    <div class="compare-controls">
+        <div class="compare-hint" id="compare-hints">
+            <span class="key">←</span> Left wins &nbsp;
+            <span class="key">→</span> Right wins &nbsp;
+            <span class="key">↑</span> Undo
+        </div>
+    </div>
+
+    <!-- Mosaic mode -->
+    <div class="mosaic-container hidden" id="mosaic-container">
+        <div class="mosaic-grid" id="mosaic-grid"></div>
+        <div class="mosaic-actions">
+            <div class="mosaic-hint" id="mosaic-hint">
+                Click the <strong>best image</strong> to crown it. The grid refills with challengers.
+            </div>
+            <div class="mosaic-buttons">
+                <button onclick="PhotoRanker.mosaicNext()">Shuffle grid</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="compare-empty hidden" id="compare-empty">
+        <h2>Not enough images to compare</h2>
+        <p>You need at least 2 kept images. <a href="/cull">Go cull some images first.</a></p>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', () => PhotoRanker.initCompare());
+</script>
+{% endblock %}
