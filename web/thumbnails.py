@@ -73,10 +73,11 @@ def _generate_thumbnail_sync(filepath: str, size: str, image_id: int) -> bytes:
     target_width = SIZES[size]
 
     try:
-        if filepath.lower().endswith(".dng"):
+        ext = filepath.lower().rsplit(".", 1)[-1]
+        if ext in ("dng", "cr3"):
             import rawpy
             with rawpy.imread(filepath) as raw:
-                rgb = raw.postprocess()
+                rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True)
             img = Image.fromarray(rgb)
         else:
             img = Image.open(filepath)
@@ -137,12 +138,11 @@ async def run_prefetch_worker():
         try:
             generated = 0
 
-            # Priority 1: sm thumbnails for kept/maybe images (mosaic needs these)
+            # Prefetch sm thumbnails for kept images in small batches
             conn = await db.get_db()
             try:
                 cursor = await conn.execute(
-                    "SELECT id, filepath FROM images WHERE status IN ('kept', 'maybe') ORDER BY elo DESC LIMIT ?",
-                    (CACHE_LIMITS["sm"],),
+                    "SELECT id, filepath FROM images WHERE status IN ('kept', 'maybe') ORDER BY comparisons ASC LIMIT 50",
                 )
                 kept_rows = await cursor.fetchall()
             finally:
@@ -156,30 +156,8 @@ async def run_prefetch_worker():
                         _prefetch_executor, _generate_thumbnail_sync, row["filepath"], "sm", row["id"]
                     )
                     generated += 1
-                    if generated % 3 == 0:
-                        await asyncio.sleep(0)
-
-            # Priority 2: lg thumbnails for unculled images (cull mode)
-            conn = await db.get_db()
-            try:
-                cursor = await conn.execute(
-                    "SELECT id, filepath FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
-                    (CACHE_LIMITS["lg"],),
-                )
-                rows = await cursor.fetchall()
-            finally:
-                await conn.close()
-
-            for row in rows:
-                if not _prefetching:
-                    break
-                if not has_cached("lg", row["id"]):
-                    await loop.run_in_executor(
-                        _prefetch_executor, _generate_thumbnail_sync, row["filepath"], "lg", row["id"]
-                    )
-                    generated += 1
-                    if generated % 3 == 0:
-                        await asyncio.sleep(0)
+                    # Yield to event loop after every thumbnail so requests aren't starved
+                    await asyncio.sleep(0.05)
 
             # Flush orientation detections to DB
             with _orientation_lock:

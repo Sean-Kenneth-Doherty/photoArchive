@@ -247,12 +247,22 @@ async def undo_last_comparison():
         await db.close()
 
 
-async def get_rankings(limit: int = 100, offset: int = 0):
+RANKING_SORTS = {
+    "elo": "elo DESC",
+    "elo_asc": "elo ASC",
+    "comparisons": "comparisons DESC",
+    "least_compared": "comparisons ASC",
+    "filename": "filename ASC",
+    "newest": "id DESC",
+}
+
+async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
     db = await get_db()
     try:
+        order = RANKING_SORTS.get(sort, "elo DESC")
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons, status FROM images "
-            "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC LIMIT ? OFFSET ?",
+            f"SELECT id, filename, filepath, elo, comparisons, status FROM images "
+            f"WHERE status IN ('kept', 'maybe') ORDER BY {order} LIMIT ? OFFSET ?",
             (limit, offset),
         )
         return await cursor.fetchall()
@@ -298,6 +308,22 @@ async def get_image_by_id(image_id: int):
     try:
         cursor = await db.execute("SELECT * FROM images WHERE id = ?", (image_id,))
         return await cursor.fetchone()
+    finally:
+        await db.close()
+
+
+async def get_images_by_ids(image_ids: list[int]) -> dict[int, dict]:
+    """Fetch multiple images by ID in a single query. Returns {id: row_dict}."""
+    if not image_ids:
+        return {}
+    db = await get_db()
+    try:
+        placeholders = ",".join("?" for _ in image_ids)
+        cursor = await db.execute(
+            f"SELECT * FROM images WHERE id IN ({placeholders})", image_ids
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: dict(row) for row in rows}
     finally:
         await db.close()
 

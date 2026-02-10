@@ -294,11 +294,15 @@ const PhotoRanker = (() => {
     let mosaicImages = []; // currently visible images [{id, filename, elo, thumb_url}, ...]
     let mosaicAge = []; // how many clicks each image has survived on the board
     let mosaicPickCount = 0;
-    let mosaicLastPick = null;
-    let mosaicPickMode = 'best';
+    let mosaicStrategy = 'explore';
+
+    function mosaicGridElo() {
+        if (mosaicImages.length === 0) return 0;
+        return mosaicImages.reduce((s, img) => s + img.elo, 0) / mosaicImages.length;
+    }
 
     async function loadMosaicBatch() {
-        const res = await fetch(`/api/mosaic/next?n=${MOSAIC_SIZE}`);
+        const res = await fetch(`/api/mosaic/next?n=${MOSAIC_SIZE}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}`);
         const data = await res.json();
         compareStats = data.stats || {};
         updateCompareProgress();
@@ -311,8 +315,9 @@ const PhotoRanker = (() => {
         mosaicImages = data.images;
         mosaicAge = new Array(data.images.length).fill(0);
         mosaicPickCount = 0;
-        mosaicLastPick = null;
         mosaicReplacements = [];
+        mosaicFilling = false;
+        mosaicBusy = false;
         renderMosaic();
         mosaicFillReplacements();
     }
@@ -321,16 +326,23 @@ const PhotoRanker = (() => {
         const grid = document.getElementById('mosaic-grid');
         grid.innerHTML = '';
 
+        // Adapt grid dimensions to image count
+        const n = mosaicImages.length;
+        let cols, rows;
+        if (n <= 2) { cols = 2; rows = 1; }
+        else if (n <= 4) { cols = 2; rows = 2; }
+        else if (n <= 6) { cols = 3; rows = 2; }
+        else if (n <= 9) { cols = 3; rows = 3; }
+        else { cols = 4; rows = Math.ceil(n / 4); }
+        grid.style.setProperty('--mosaic-cols', cols);
+        grid.style.setProperty('--mosaic-rows', rows);
+
         for (const img of mosaicImages) {
             const cell = document.createElement('div');
             cell.className = 'mosaic-cell';
             cell.dataset.id = img.id;
             cell.onclick = () => mosaicClick(img.id);
-            cell.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}">
-                <div class="mosaic-rank"></div>
-                <div class="mosaic-filename">${img.filename}</div>
-            `;
+            cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}">`;
             preloadImage(img.thumb_url);
             grid.appendChild(cell);
         }
@@ -338,43 +350,64 @@ const PhotoRanker = (() => {
 
     // Pre-fetched replacement images ready to swap in instantly
     let mosaicReplacements = [];
+    let mosaicFilling = false;
 
     async function mosaicFillReplacements() {
-        if (mosaicReplacements.length >= 10) return;
-        const excludeIds = [
-            ...mosaicImages.map(img => img.id),
-            ...mosaicReplacements.map(img => img.id),
-        ].join(',');
+        if (mosaicFilling || mosaicReplacements.length >= 10) return;
+        mosaicFilling = true;
         try {
-            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}`);
+            const excludeIds = [
+                ...mosaicImages.map(img => img.id),
+                ...mosaicReplacements.map(img => img.id),
+            ].join(',');
+            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}`);
             const data = await res.json();
             if (data.stats) {
                 compareStats = data.stats;
                 updateCompareProgress();
             }
+            // Deduplicate against current grid and existing replacements
+            const onGrid = new Set(mosaicImages.map(img => img.id));
+            const inBuffer = new Set(mosaicReplacements.map(img => img.id));
             for (const img of data.images) {
-                mosaicReplacements.push(img);
-                preloadImage(img.thumb_url);
+                if (!onGrid.has(img.id) && !inBuffer.has(img.id)) {
+                    mosaicReplacements.push(img);
+                    inBuffer.add(img.id);
+                    preloadImage(img.thumb_url);
+                }
             }
-        } catch {}
+        } catch {} finally {
+            mosaicFilling = false;
+        }
     }
 
+    let mosaicBusy = false;
+
     function mosaicClick(id) {
+        if (mosaicBusy) return;
         const idx = mosaicImages.findIndex(img => img.id === id);
         if (idx === -1) return;
+        mosaicBusy = true;
 
         const otherIds = mosaicImages.filter(img => img.id !== id).map(img => img.id);
 
-        // Fire and forget — clicked image beats all others
+        // Fire and forget with error handling
         fetch('/api/mosaic/pick', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ winner_id: id, loser_ids: otherIds }),
+        }).catch(() => {
+            showToast('Failed to save pick — check connection');
         });
 
         // Update stats immediately (N-1 comparisons per click)
         compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length;
         updateCompareProgress();
+
+        // Green flash + scale pulse on the picked cell
+        const cells = document.querySelectorAll('.mosaic-cell');
+        const pickedCell = cells[idx];
+        if (pickedCell) pickedCell.classList.add('mosaic-picked');
 
         // Age all non-clicked images
         for (let i = 0; i < mosaicAge.length; i++) {
@@ -394,44 +427,56 @@ const PhotoRanker = (() => {
         const replaceIndices = [idx];
         if (oldestIdx >= 0 && oldestAge >= 10) replaceIndices.push(oldestIdx);
 
-        // Swap cells instantly from pre-fetched replacements
-        const cells = document.querySelectorAll('.mosaic-cell');
-        for (const ri of replaceIndices) {
-            const targetCell = cells[ri];
-            if (!targetCell || mosaicReplacements.length === 0) continue;
-            const newImg = mosaicReplacements.shift();
-            mosaicImages[ri] = newImg;
-            mosaicAge[ri] = 0;
-            targetCell.dataset.id = newImg.id;
-            targetCell.onclick = () => mosaicClick(newImg.id);
-            targetCell.querySelector('img').src = newImg.thumb_url;
-            targetCell.querySelector('img').alt = newImg.filename;
-            targetCell.querySelector('.mosaic-rank').textContent = '';
-            targetCell.querySelector('.mosaic-filename').textContent = newImg.filename;
-        }
+        // Swap after animation completes
+        setTimeout(() => {
+            for (const ri of replaceIndices) {
+                const targetCell = cells[ri];
+                if (!targetCell || mosaicReplacements.length === 0) continue;
+                const newImg = mosaicReplacements.shift();
+                mosaicImages[ri] = newImg;
+                mosaicAge[ri] = 0;
+                targetCell.dataset.id = newImg.id;
+                targetCell.onclick = () => mosaicClick(newImg.id);
+                targetCell.querySelector('img').src = newImg.thumb_url;
+                targetCell.querySelector('img').alt = newImg.filename;
+                targetCell.classList.remove('mosaic-picked');
+            }
 
-        // Refill replacement buffer in the background
-        mosaicFillReplacements();
+            mosaicBusy = false;
 
-        if (mosaicImages.length < 2) {
-            showCompareEmpty();
-        }
+            // Refill replacement buffer in the background
+            mosaicFillReplacements();
+
+            if (mosaicImages.length < 2) {
+                showCompareEmpty();
+            }
+        }, 150);
     }
 
-    function mosaicUndo() {
-        // Undo not practical in continuous mode — would need to undo N-1 comparisons
-        // For now, just undo the last DB comparison entry
-        if (!mosaicLastPick) return;
-        fetch('/api/compare/undo', { method: 'POST' });
-        mosaicLastPick = null;
+    function showToast(msg) {
+        let toast = document.getElementById('mosaic-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'mosaic-toast';
+            toast.className = 'toast';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = msg;
+        toast.classList.add('visible');
+        setTimeout(() => toast.classList.remove('visible'), 3000);
     }
 
-    function mosaicSkipRest() {
-        // Shuffle the current grid with fresh images
+    function setMosaicStrategy(strategy) {
+        mosaicStrategy = strategy;
+        const btn = document.getElementById('strategy-' + strategy);
+        if (btn) {
+            btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        }
         loadMosaicBatch();
     }
 
-    function mosaicNext() {
+    function mosaicShuffle() {
         loadMosaicBatch();
     }
 
@@ -565,8 +610,11 @@ const PhotoRanker = (() => {
 
     function setCompareMode(mode) {
         compareMode = mode;
-        document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-        document.getElementById('mode-' + mode).classList.add('active');
+        const btn = document.getElementById('mode-' + mode);
+        if (btn) {
+            btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        }
 
         const abContainer = document.getElementById('compare-images');
         const abControls = document.querySelector('.compare-controls');
@@ -601,15 +649,30 @@ const PhotoRanker = (() => {
 
     // ==================== RANKINGS ====================
 
+    let rankingsSort = 'elo';
+
     async function initRankings() {
         rankingsOffset = 0;
         await loadRankings();
     }
 
+    function setRankingsSort(sort) {
+        rankingsSort = sort;
+        rankingsOffset = 0;
+        document.getElementById('rankings-grid').innerHTML = '';
+        const btn = document.getElementById('sort-' + sort);
+        if (btn) {
+            btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+        }
+        loadRankings();
+    }
+
     async function loadRankings() {
-        const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}`);
+        const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
+        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
@@ -618,12 +681,14 @@ const PhotoRanker = (() => {
             const card = document.createElement('div');
             card.className = 'rank-card';
             card.onclick = () => openLightbox(img);
+
+            const infoLine = showRank
+                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo} Elo</span>`
+                : `<span class="rank-elo">${img.elo} Elo</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">
-                <div class="rank-card-info">
-                    <span class="rank-number">#${rank}</span>
-                    <span class="rank-elo">${img.elo} Elo</span>
-                </div>
+                <div class="rank-card-info">${infoLine}</div>
                 <div class="rank-filename">${img.filename}</div>
             `;
             grid.appendChild(card);
@@ -663,12 +728,19 @@ const PhotoRanker = (() => {
 
     // ==================== UTILITIES ====================
 
+    const PRELOAD_LIMIT = 200;
+
     function preloadImage(url) {
         if (preloaded.has(url)) return;
+        // Evict oldest entries when limit reached
+        if (preloaded.size >= PRELOAD_LIMIT) {
+            const first = preloaded.keys().next().value;
+            preloaded.delete(first);
+        }
         const promise = new Promise((resolve) => {
             const img = new Image();
             img.onload = resolve;
-            img.onerror = resolve; // resolve anyway so we don't block
+            img.onerror = resolve;
             img.src = url;
         });
         preloaded.set(url, promise);
@@ -683,13 +755,13 @@ const PhotoRanker = (() => {
         setCullMode,
         setCompareMode,
         loadMoreRankings,
+        setRankingsSort,
         exportRankings,
         closeLightbox,
         gridSelectAll,
         gridSelectNone,
         gridSubmit,
-        mosaicUndo,
-        mosaicSkipRest,
-        mosaicNext,
+        mosaicShuffle,
+        setMosaicStrategy,
     };
 })();

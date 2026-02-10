@@ -6,10 +6,10 @@
         <div class="compare-progress">
             <p id="compare-progress-text">Loading pairs...</p>
         </div>
-        <div class="compare-mode-toggle">
-            <button id="mode-mosaic" class="mode-btn active" onclick="PhotoRanker.setCompareMode('mosaic')">Mosaic</button>
-            <button id="mode-swiss" class="mode-btn" onclick="PhotoRanker.setCompareMode('swiss')">Swiss</button>
-            <button id="mode-topn" class="mode-btn" onclick="PhotoRanker.setCompareMode('topn')">Top 50</button>
+        <div class="compare-mode-toggle toggle-group">
+            <button id="mode-mosaic" class="active" onclick="PhotoRanker.setCompareMode('mosaic')">Mosaic</button>
+            <button id="mode-swiss" onclick="PhotoRanker.setCompareMode('swiss')">Swiss</button>
+            <button id="mode-topn" onclick="PhotoRanker.setCompareMode('topn')">Top 50</button>
         </div>
     </div>
 
@@ -38,11 +38,14 @@
     <div class="mosaic-container hidden" id="mosaic-container">
         <div class="mosaic-grid" id="mosaic-grid"></div>
         <div class="mosaic-actions">
-            <div class="mosaic-hint" id="mosaic-hint">
-                Click the <strong>best image</strong> to crown it. The grid refills with challengers.
+            <div class="toggle-group">
+                <button id="strategy-explore" class="active" onclick="PhotoRanker.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
+                <button id="strategy-compete" onclick="PhotoRanker.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
+                <button id="strategy-top" onclick="PhotoRanker.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
+                <button id="strategy-random" onclick="PhotoRanker.setMosaicStrategy('random')" title="Uniform random">Random</button>
             </div>
             <div class="mosaic-buttons">
-                <button onclick="PhotoRanker.mosaicNext()">Shuffle grid</button>
+                <button onclick="PhotoRanker.mosaicShuffle()">Shuffle</button>
             </div>
         </div>
     </div>

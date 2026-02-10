@@ -99,8 +99,10 @@ a:hover {
     border-color: #6cb4ee;
 }
 
+.btn-primary,
 .input-group button,
-button {
+.rankings-actions button,
+.cull-grid-buttons .grid-submit-btn {
     padding: 10px 20px;
     background: #6cb4ee;
     color: #111;
@@ -112,14 +114,53 @@ button {
     transition: background 0.15s;
 }
 
+.btn-primary:hover,
 .input-group button:hover,
-button:hover {
+.rankings-actions button:hover {
     background: #90caf9;
+}
+
+button {
+    cursor: pointer;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    transition: background 0.15s;
 }
 
 button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+/* Toggle button groups (sort, strategy, mode switches) */
+.toggle-group {
+    display: flex;
+    gap: 2px;
+    background: #1a1a1a;
+    border-radius: 6px;
+    padding: 2px;
+}
+
+.toggle-group button {
+    padding: 6px 14px;
+    font-size: 12px;
+    background: transparent;
+    color: #666;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+}
+
+.toggle-group button:hover {
+    color: #aaa;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.toggle-group button.active {
+    background: #333;
+    color: #e0e0e0;
 }
 
 .scan-progress {
@@ -528,20 +569,6 @@ button:disabled {
     gap: 4px;
 }
 
-.mode-btn {
-    padding: 6px 16px;
-    background: #333;
-    color: #888;
-    border: 1px solid #444;
-    font-size: 13px;
-}
-
-.mode-btn.active {
-    background: #6cb4ee;
-    color: #111;
-    border-color: #6cb4ee;
-}
-
 .compare-images {
     flex: 1;
     display: flex;
@@ -605,10 +632,9 @@ button:disabled {
 .mosaic-grid {
     flex: 1;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    grid-template-rows: repeat(3, 1fr);
-    gap: 4px;
-    padding: 4px;
+    grid-template-columns: repeat(var(--mosaic-cols, 4), 1fr);
+    grid-template-rows: repeat(var(--mosaic-rows, 3), 1fr);
+    gap: 2px;
     min-height: 0;
 }
 
@@ -618,12 +644,9 @@ button:disabled {
     border: 3px solid transparent;
     border-radius: 4px;
     overflow: hidden;
-    transition: border-color 0.15s, opacity 0.3s;
+    transition: border-color 0.1s, transform 0.1s, box-shadow 0.1s;
     min-height: 0;
-}
-
-.mosaic-cell.fading-out {
-    opacity: 0;
+    background: transparent;
 }
 
 .mosaic-cell img {
@@ -634,13 +657,14 @@ button:disabled {
 }
 
 .mosaic-cell:hover {
-    border-color: #555;
+    border-color: #444;
 }
 
-.mosaic-cell.ranked {
-    opacity: 0.35;
-    border-color: #6cb4ee;
-    cursor: default;
+.mosaic-cell.mosaic-picked {
+    border-color: #4a9;
+    transform: scale(1.04);
+    z-index: 10;
+    box-shadow: 0 0 20px rgba(68, 170, 136, 0.4);
 }
 
 .mosaic-cell .mosaic-rank {
@@ -737,13 +761,24 @@ button:disabled {
 
 .rankings-header {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
+    gap: 12px;
     margin-bottom: 24px;
 }
 
 .rankings-header h1 {
     font-size: 24px;
+}
+
+.rankings-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.rank-comparisons {
+    font-size: 12px;
+    color: #888;
 }
 
 .rankings-actions {
@@ -765,8 +800,9 @@ button:disabled {
 
 .rankings-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    align-items: start;
 }
 
 .rank-card {
@@ -785,8 +821,7 @@ button:disabled {
 
 .rank-card img {
     width: 100%;
-    aspect-ratio: 4/3;
-    object-fit: cover;
+    display: block;
 }
 
 .rank-card-info {
@@ -844,4 +879,26 @@ button:disabled {
     color: #888;
     font-size: 14px;
     margin-top: 16px;
+}
+
+/* Toast notification */
+.toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: #c74;
+    color: #fff;
+    padding: 10px 20px;
+    border-radius: 6px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    pointer-events: none;
+    z-index: 2000;
+}
+
+.toast.visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
 }

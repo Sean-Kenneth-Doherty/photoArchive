@@ -2,7 +2,7 @@ import os
 import asyncio
 from db import insert_images_batch
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".dng"}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".dng", ".cr3", ".tif", ".tiff", ".webp"}
 
 # Global scan state
 scan_state = {

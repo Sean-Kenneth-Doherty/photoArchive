@@ -257,19 +257,45 @@ async def cull_undo():
 # --- Mosaic Ranking API ---
 
 @app.get("/api/mosaic/next")
-async def mosaic_next(n: int = 12, exclude: str = ""):
-    """Get kept images for mosaic ranking, excluding IDs already on screen."""
+async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0):
+    """Get kept images for mosaic ranking with configurable sampling strategy."""
     exclude_ids = set()
     if exclude:
         exclude_ids = {int(x) for x in exclude.split(",") if x.strip().isdigit()}
 
-    images = await db.get_kept_images_for_pairing()
+    if strategy == "top":
+        images = await db.get_top_images(limit=50)
+    else:
+        images = await db.get_kept_images_for_pairing()
+
     if len(images) < 2:
         return {"images": [], "total_kept": len(images)}
 
     import random
-    image_dicts = [dict(img) for img in images if img["id"] not in exclude_ids]
-    sample = random.sample(image_dicts, min(n, len(image_dicts)))
+    candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
+    count = min(n, len(candidates))
+
+    if strategy == "explore":
+        # Favor least-compared images
+        weights = [1.0 / (img["comparisons"] + 1) for img in candidates]
+    elif strategy == "compete" and grid_elo > 0:
+        # Favor images with Elo close to the grid average
+        weights = [1.0 / (abs(img["elo"] - grid_elo) + 50) for img in candidates]
+    elif strategy == "top":
+        # Favor highest-rated within the top 50
+        weights = [img["elo"] for img in candidates]
+    else:
+        # Random — uniform
+        weights = [1.0 for _ in candidates]
+
+    sample = []
+    indices = list(range(len(candidates)))
+    for _ in range(count):
+        if not indices:
+            break
+        chosen = random.choices(indices, weights=[weights[i] for i in indices], k=1)[0]
+        sample.append(candidates[chosen])
+        indices.remove(chosen)
 
     result = []
     for img in sample:
@@ -287,57 +313,38 @@ async def mosaic_next(n: int = 12, exclude: str = ""):
 @app.post("/api/mosaic/pick")
 async def mosaic_pick(request: Request):
     """
-    User picked the worst or best image from the visible mosaic.
-    Worst mode body: { "loser_id": int, "winner_ids": [int, ...] }
-    Best mode body:  { "winner_id": int, "loser_ids": [int, ...] }
+    User picked the best image from the visible mosaic.
+    Body: { "winner_id": int, "loser_ids": [int, ...] }
     K=12 per pair.
     """
     body = await request.json()
-
-    # Determine direction
-    if "loser_id" in body:
-        picked_id = body["loser_id"]
-        other_ids = body.get("winner_ids", [])
-        picked_is_loser = True
-    elif "winner_id" in body:
-        picked_id = body["winner_id"]
-        other_ids = body.get("loser_ids", [])
-        picked_is_loser = False
-    else:
-        return JSONResponse({"error": "Need loser_id+winner_ids or winner_id+loser_ids"}, status_code=400)
+    picked_id = body.get("winner_id")
+    other_ids = body.get("loser_ids", [])
 
     if not picked_id or not other_ids:
-        return JSONResponse({"error": "Need picked image and other images"}, status_code=400)
+        return JSONResponse({"error": "Need winner_id and loser_ids"}, status_code=400)
 
-    picked = await db.get_image_by_id(picked_id)
-    if not picked:
+    # Single batch query instead of N+1 individual queries
+    all_ids = [picked_id] + list(other_ids)
+    images = await db.get_images_by_ids(all_ids)
+
+    if picked_id not in images:
         return JSONResponse({"error": "Picked image not found"}, status_code=404)
-    picked = dict(picked)
 
-    others = {}
-    for oid in other_ids:
-        img = await db.get_image_by_id(oid)
-        if img:
-            others[oid] = dict(img)
-
+    picked = images[picked_id]
     picked_elo = picked["elo"]
+
     conn = await db.get_db()
     try:
-        for oid, other in others.items():
-            if picked_is_loser:
-                # Other beats picked
-                new_other, new_picked = pairing.update_elo(other["elo"], picked_elo, k=12.0)
-                winner_id, loser_id = oid, picked_id
-                elo_before_w, elo_before_l = other["elo"], picked_elo
-            else:
-                # Picked beats other
-                new_picked, new_other = pairing.update_elo(picked_elo, other["elo"], k=12.0)
-                winner_id, loser_id = picked_id, oid
-                elo_before_w, elo_before_l = picked_elo, other["elo"]
+        for oid in other_ids:
+            other = images.get(oid)
+            if not other:
+                continue
+            new_picked, new_other = pairing.update_elo(picked_elo, other["elo"], k=12.0)
 
             await conn.execute(
                 "INSERT INTO comparisons (winner_id, loser_id, mode, elo_before_winner, elo_before_loser) VALUES (?, ?, 'mosaic', ?, ?)",
-                (winner_id, loser_id, elo_before_w, elo_before_l),
+                (picked_id, oid, picked_elo, other["elo"]),
             )
             await conn.execute(
                 "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
@@ -347,13 +354,13 @@ async def mosaic_pick(request: Request):
 
         await conn.execute(
             "UPDATE images SET elo = ?, comparisons = comparisons + ? WHERE id = ?",
-            (picked_elo, len(others), picked_id),
+            (picked_elo, len(other_ids), picked_id),
         )
         await conn.commit()
     finally:
         await conn.close()
 
-    return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(others)}
+    return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(other_ids)}
 
 
 # --- Compare API ---
@@ -430,8 +437,8 @@ async def compare_undo():
 # --- Rankings API ---
 
 @app.get("/api/rankings")
-async def api_rankings(limit: int = 100, offset: int = 0):
-    images = await db.get_rankings(limit=limit, offset=offset)
+async def api_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
+    images = await db.get_rankings(limit=limit, offset=offset, sort=sort)
     result = []
     for img in images:
         d = dict(img)
