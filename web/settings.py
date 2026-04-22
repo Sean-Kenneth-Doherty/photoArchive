@@ -21,14 +21,6 @@ DEFAULT_SETTINGS = {
     "ssd_cache_gb": 10,
     "memory_cache_gb": 0.5,
     "pregenerate_on_idle": True,
-    "user_workers": 4,
-    "prefetch_workers": 2,
-    "browser_cache_max_age": 86400,
-    "browser_cache_stale_while_revalidate": 604800,
-    "scan_prefetch_limit": 20,
-    "cull_prefetch_limit": 24,
-    "compare_prefetch_limit": 16,
-    "mosaic_prefetch_limit": 24,
     "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
     "embed_model_revision": "main",
     "embed_model_dir": _default_model_dir("Qwen/Qwen3-VL-Embedding-2B"),
@@ -40,14 +32,6 @@ INT_RANGES = {
     "thumb_size_lg": (128, 8192),
     "thumb_quality": (40, 100),
     "ssd_cache_gb": (0, 4096),
-    "user_workers": (1, 32),
-    "prefetch_workers": (1, 16),
-    "browser_cache_max_age": (0, 31536000),
-    "browser_cache_stale_while_revalidate": (0, 31536000),
-    "scan_prefetch_limit": (0, 200),
-    "cull_prefetch_limit": (0, 200),
-    "compare_prefetch_limit": (0, 200),
-    "mosaic_prefetch_limit": (0, 200),
 }
 
 FLOAT_RANGES = {
@@ -56,6 +40,53 @@ FLOAT_RANGES = {
 
 _lock = threading.Lock()
 _settings = None
+
+BROWSER_CACHE_MAX_AGE = 86400
+BROWSER_CACHE_STALE_WHILE_REVALIDATE = 604800
+
+
+def _system_memory_gb() -> float | None:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size <= 0 or phys_pages <= 0:
+            return None
+        return (page_size * phys_pages) / (1024 ** 3)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def _derive_runtime_tuning(memory_cache_gb: float) -> dict:
+    cpu_count = max(1, os.cpu_count() or 4)
+    system_memory_gb = _system_memory_gb()
+
+    user_workers = _clamp(cpu_count - 1, 2, 12)
+    if system_memory_gb is not None:
+        if system_memory_gb < 8:
+            user_workers = min(user_workers, 4)
+        elif system_memory_gb < 16:
+            user_workers = min(user_workers, 6)
+
+    prefetch_workers = _clamp(max(1, user_workers // 2), 1, 6)
+    cache_aggression = max(1, min(4, int(memory_cache_gb / 0.5) if memory_cache_gb > 0 else 1))
+    warm_factor = max(1, prefetch_workers * cache_aggression)
+
+    return {
+        "cpu_count": cpu_count,
+        "system_memory_gb": round(system_memory_gb, 1) if system_memory_gb is not None else None,
+        "user_workers": user_workers,
+        "prefetch_workers": prefetch_workers,
+        "scan_prefetch_limit": _clamp(warm_factor * 8, 24, 96),
+        "cull_prefetch_limit": _clamp(warm_factor * 6, 12, 48),
+        "compare_prefetch_limit": _clamp(warm_factor * 4, 8, 32),
+        "mosaic_prefetch_limit": _clamp(warm_factor * 6, 12, 48),
+        "browser_cache_max_age": BROWSER_CACHE_MAX_AGE,
+        "browser_cache_stale_while_revalidate": BROWSER_CACHE_STALE_WHILE_REVALIDATE,
+    }
 
 
 def _resolve_cache_dir(path: str, default: str) -> str:
@@ -141,6 +172,7 @@ def normalize_settings(raw: dict | None) -> dict:
         normalized["thumb_size_lg"] = normalized["thumb_size_md"]
 
     normalized["pregenerate_on_idle"] = bool(raw.get("pregenerate_on_idle", normalized["pregenerate_on_idle"]))
+    normalized.update(_derive_runtime_tuning(normalized["memory_cache_gb"]))
 
     return normalized
 
@@ -170,12 +202,13 @@ def get_settings() -> dict:
 def save_settings(raw: dict | None) -> dict:
     global _settings
     normalized = normalize_settings(raw)
+    persisted = {key: normalized[key] for key in DEFAULT_SETTINGS}
     temp_path = f"{SETTINGS_PATH}.tmp"
 
     with _lock:
         os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
         with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(normalized, f, indent=2, sort_keys=True)
+            json.dump(persisted, f, indent=2, sort_keys=True)
         os.replace(temp_path, SETTINGS_PATH)
         _settings = normalized
         return copy.deepcopy(_settings)
@@ -188,7 +221,7 @@ def reset_settings() -> dict:
             os.remove(SETTINGS_PATH)
         except FileNotFoundError:
             pass
-        _settings = copy.deepcopy(DEFAULT_SETTINGS)
+        _settings = normalize_settings({})
         return copy.deepcopy(_settings)
 
 
