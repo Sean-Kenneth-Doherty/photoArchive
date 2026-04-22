@@ -289,7 +289,8 @@ RANKING_SORTS = {
 STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
-                       orientation: str = "", compared: str = "", min_stars: int = 0):
+                       orientation: str = "", compared: str = "", min_stars: int = 0,
+                       folder: str = ""):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -310,6 +311,10 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
         if min_stars > 0 and min_stars in STAR_THRESHOLDS:
             conditions.append("elo >= ?")
             params.append(STAR_THRESHOLDS[min_stars])
+
+        if folder:
+            conditions.append("filepath LIKE ?")
+            params.append(f"%/{folder}/%")
 
         where = " AND ".join(conditions)
         params.extend([limit, offset])

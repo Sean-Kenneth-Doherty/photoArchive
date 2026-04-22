@@ -463,10 +463,12 @@ async def compare_undo():
 async def api_rankings(
     limit: int = 100, offset: int = 0, sort: str = "elo",
     orientation: str = "", compared: str = "", min_stars: int = 0,
+    folder: str = "",
 ):
     images = await db.get_rankings(
         limit=limit, offset=offset, sort=sort,
         orientation=orientation, compared=compared, min_stars=min_stars,
+        folder=folder,
     )
     result = []
     for img in images:
@@ -764,6 +766,40 @@ async def api_collections(n_clusters: int = 20):
     # Sort by size descending
     collections.sort(key=lambda c: c["count"], reverse=True)
     return {"collections": collections}
+
+
+@app.get("/api/folders")
+async def api_folders():
+    """Get folder tree with image counts."""
+    conn = await db.get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT filepath FROM images WHERE status IN ('kept', 'maybe')"
+        )
+        rows = await cursor.fetchall()
+    finally:
+        await conn.close()
+
+    # Find common root and build relative folder tree
+    if not rows:
+        return {"folders": []}
+
+    paths = [os.path.dirname(row["filepath"]) for row in rows]
+    root = os.path.commonpath(paths)
+
+    folder_counts = {}
+    for p in paths:
+        rel = os.path.relpath(p, root)
+        # Build hierarchy: each level gets counted
+        parts = rel.split(os.sep)
+        for depth in range(1, len(parts) + 1):
+            key = os.sep.join(parts[:depth])
+            folder_counts[key] = folder_counts.get(key, 0) + 1
+
+    # Sort by path and return
+    folders = [{"path": k, "count": v, "depth": k.count(os.sep)}
+               for k, v in sorted(folder_counts.items())]
+    return {"folders": folders, "root": root}
 
 
 @app.get("/api/stats")

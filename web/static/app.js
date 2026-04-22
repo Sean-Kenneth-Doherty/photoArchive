@@ -743,7 +743,7 @@ const PhotoArchive = (() => {
     let thumbHeight = 220;
     let libraryImages = []; // all loaded images for lightbox navigation
     let lightboxIndex = -1;
-    let filters = { orientation: '', compared: '', rating: '' };
+    let filters = { orientation: '', compared: '', rating: '', folder: '' };
 
     async function initLibrary() {
         rankingsOffset = 0;
@@ -758,6 +758,21 @@ const PhotoArchive = (() => {
         } catch {}
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
+
+        // Load folder list
+        fetch('/api/folders').then(r => r.json()).then(data => {
+            const sel = document.getElementById('filter-folder');
+            if (!sel || !data.folders) return;
+            // Show only top-level folders (depth 0) for cleanliness
+            const topFolders = data.folders.filter(f => f.depth <= 1);
+            for (const f of topFolders) {
+                const opt = document.createElement('option');
+                opt.value = f.path;
+                const indent = f.depth > 0 ? '  ' : '';
+                opt.textContent = `${indent}${f.path} (${f.count})`;
+                sel.appendChild(opt);
+            }
+        }).catch(() => {});
 
         // Infinite scroll
         window.addEventListener('scroll', () => {
@@ -876,6 +891,7 @@ const PhotoArchive = (() => {
         if (filters.orientation) url += `&orientation=${filters.orientation}`;
         if (filters.compared) url += `&compared=${filters.compared}`;
         if (filters.rating) url += `&min_stars=${filters.rating}`;
+        if (filters.folder) url += `&folder=${encodeURIComponent(filters.folder)}`;
         const res = await fetch(url);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
