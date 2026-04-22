@@ -117,9 +117,7 @@ async def start_scan(request: Request):
         # Start prefetching thumbnails for early images
         if count <= 200:
             images = await db.get_unculled_images(limit=50)
-            await thumbnails.prefetch_images(
-                [dict(r) for r in images], "lg"
-            )
+            await thumbnails.prefetch_images([dict(r) for r in images], "lg", limit=20)
 
     asyncio.create_task(scanner.scan_folder(folder, on_batch=on_batch))
     return {"status": "started", "folder": folder}
@@ -133,7 +131,7 @@ async def scan_status():
 # --- Thumbnail ---
 
 @app.get("/api/thumb/{size}/{image_id}")
-async def serve_thumbnail(size: str, image_id: int):
+async def serve_thumbnail(request: Request, size: str, image_id: int):
     if size not in thumbnails.SIZES:
         return JSONResponse({"error": "Invalid size"}, status_code=400)
 
@@ -141,11 +139,15 @@ async def serve_thumbnail(size: str, image_id: int):
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
 
+    headers = thumbnails.response_headers(image["filepath"], size, image_id)
+    if request.headers.get("if-none-match") == headers["ETag"]:
+        return Response(status_code=304, headers=headers)
+
     data = await thumbnails.get_thumbnail(image["filepath"], size, image_id)
     if not data:
         return JSONResponse({"error": "Thumbnail generation failed"}, status_code=500)
 
-    return Response(content=data, media_type="image/jpeg")
+    return Response(content=data, media_type="image/jpeg", headers=headers)
 
 
 # --- Cache Status ---
@@ -156,7 +158,7 @@ async def cache_status(ahead: int = 100):
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
-            "SELECT id FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
+            "SELECT id, filepath FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
             (ahead,),
         )
         rows = await cursor.fetchall()
@@ -164,7 +166,7 @@ async def cache_status(ahead: int = 100):
         await conn.close()
 
     total = len(rows)
-    cached = sum(1 for r in rows if thumbnails.has_cached("lg", r["id"]))
+    cached = sum(1 for r in rows if thumbnails.has_cached("lg", r["filepath"], r["id"]))
     return {"total": total, "cached": cached, "window": ahead}
 
 
@@ -181,15 +183,15 @@ async def cull_next(n: int = 10, size: str = "lg", orientation: str = ""):
         images = await db.get_unculled_images(limit=n)
 
     result = []
-    prefetch_tasks = []
+    prefetch_rows = []
 
     for img in images:
         d = dict(img)
-        prefetch_tasks.append(thumbnails.get_thumbnail(d["filepath"], size, d["id"]))
+        prefetch_rows.append(d)
         result.append({"id": d["id"], "filename": d["filename"], "thumb_url": f"/api/thumb/{size}/{d['id']}"})
 
-    if prefetch_tasks:
-        await asyncio.gather(*prefetch_tasks)
+    if prefetch_rows:
+        await thumbnails.prefetch_images(prefetch_rows, size, limit=min(len(prefetch_rows), 24))
 
     stats = await db.get_stats()
     return {"images": result, "stats": stats}
@@ -268,7 +270,10 @@ async def cull_undo():
 # --- Mosaic Ranking API ---
 
 @app.get("/api/mosaic/next")
-async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0):
+async def mosaic_next(
+    n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0,
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+):
     """Get kept images for mosaic ranking with configurable sampling strategy."""
     exclude_ids = set()
     if exclude:
@@ -284,6 +289,22 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
 
     import random
     candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
+
+    # Apply filters
+    if orientation in ("landscape", "portrait"):
+        candidates = [c for c in candidates if c.get("orientation") == orientation]
+    if compared == "compared":
+        candidates = [c for c in candidates if c["comparisons"] > 0]
+    elif compared == "uncompared":
+        candidates = [c for c in candidates if c["comparisons"] == 0]
+    elif compared == "confident":
+        candidates = [c for c in candidates if c["comparisons"] >= 10]
+    if min_stars > 0:
+        from db import STAR_THRESHOLDS
+        threshold = STAR_THRESHOLDS.get(min_stars, 0)
+        candidates = [c for c in candidates if c["elo"] >= threshold]
+    if folder:
+        candidates = [c for c in candidates if f"/{folder}/" in c.get("filepath", "")]
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
         img["effective_elo"] = img["elo"] if img["comparisons"] > 0 else (img.get("predicted_elo") or img["elo"])
@@ -328,6 +349,9 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
             "elo": round(img["effective_elo"], 1),
             "thumb_url": f"/api/thumb/sm/{img['id']}",
         })
+
+    if sample:
+        await thumbnails.prefetch_images(sample, "sm", limit=min(len(sample), 24))
 
     stats = await db.get_stats()
     return {"images": result, "total_kept": len(images), "stats": stats}
@@ -403,18 +427,17 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
     result = []
-    prefetch_tasks = []
+    prefetch_rows = []
     for left, right in pairs:
-        prefetch_tasks.append(thumbnails.get_thumbnail(left["filepath"], "md", left["id"]))
-        prefetch_tasks.append(thumbnails.get_thumbnail(right["filepath"], "md", right["id"]))
+        prefetch_rows.append(left)
+        prefetch_rows.append(right)
         result.append({
             "left": {"id": left["id"], "filename": left["filename"], "elo": round(left["elo"], 1), "thumb_url": f"/api/thumb/md/{left['id']}"},
             "right": {"id": right["id"], "filename": right["filename"], "elo": round(right["elo"], 1), "thumb_url": f"/api/thumb/md/{right['id']}"},
         })
 
-    # Ensure all thumbnails are ready before responding
-    if prefetch_tasks:
-        await asyncio.gather(*prefetch_tasks)
+    if prefetch_rows:
+        await thumbnails.prefetch_images(prefetch_rows, "md", limit=min(len(prefetch_rows), 16))
 
     stats = await db.get_stats()
     return {"pairs": result, "total_kept": len(image_dicts), "stats": stats}

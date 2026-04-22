@@ -41,51 +41,13 @@
             <option value="filename">Filename</option>
         </select>
         <button class="filter-icon sort-dir-btn" id="sort-dir-btn" onclick="PhotoArchive.toggleSortDir()" title="Toggle sort direction">
-            <svg width="14" height="14" viewBox="0 0 14 14" id="sort-dir-icon">
+            <svg width="14" height="14" viewBox="0 0 14 14">
                 <path d="M4 2v10M4 10l-2.5-2.5M4 10l2.5-2.5M10 12V2M10 4l-2.5 2.5M10 4l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
         </button>
     </div>
     <div class="bar-divider"></div>
-    <div class="bar-section bar-filters">
-        <div class="filter-group" title="Orientation">
-            <button class="filter-icon" onclick="PhotoArchive.toggleFilter('orientation','landscape',this)" title="Landscape">
-                <svg width="18" height="13" viewBox="0 0 18 13"><rect x=".5" y=".5" width="17" height="12" rx="1.5" fill="none" stroke="currentColor" stroke-width="1"/></svg>
-            </button>
-            <button class="filter-icon" onclick="PhotoArchive.toggleFilter('orientation','portrait',this)" title="Portrait">
-                <svg width="11" height="15" viewBox="0 0 11 15"><rect x=".5" y=".5" width="10" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1"/></svg>
-            </button>
-        </div>
-        <div class="filter-sep"></div>
-        <div class="filter-group" title="Ranked status">
-            <button class="filter-icon" onclick="PhotoArchive.toggleFilter('compared','compared',this)" title="Ranked">
-                <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2.5 6.5l2.5 3 5.5-6" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-            <button class="filter-icon" onclick="PhotoArchive.toggleFilter('compared','uncompared',this)" title="Unranked">
-                <svg width="13" height="13" viewBox="0 0 13 13"><line x1="3" y1="3" x2="10" y2="10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><line x1="10" y1="3" x2="3" y2="10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="filter-icon" onclick="PhotoArchive.toggleFilter('compared','confident',this)" title="High confidence (10+)">
-                <svg width="13" height="13" viewBox="0 0 13 13"><path d="M2 7l2.5 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 4.5l2.5 3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-        </div>
-        <div class="filter-sep"></div>
-        <div class="filter-group filter-stars" title="Minimum rating">
-            <button class="filter-star" data-star="1" onclick="PhotoArchive.toggleStar(1)">&#9734;</button>
-            <button class="filter-star" data-star="2" onclick="PhotoArchive.toggleStar(2)">&#9734;</button>
-            <button class="filter-star" data-star="3" onclick="PhotoArchive.toggleStar(3)">&#9734;</button>
-            <button class="filter-star" data-star="4" onclick="PhotoArchive.toggleStar(4)">&#9734;</button>
-            <button class="filter-star" data-star="5" onclick="PhotoArchive.toggleStar(5)">&#9734;</button>
-        </div>
-        <div class="filter-sep"></div>
-        <select id="filter-folder" class="bar-select" onchange="PhotoArchive.setFilter('folder', this.value)">
-            <option value="">All Folders</option>
-        </select>
-    </div>
-    <div class="bar-divider"></div>
-    <div class="bar-section bar-size">
-        <input type="range" id="thumb-size" class="bar-slider" min="120" max="400" value="220"
-               oninput="PhotoArchive.setThumbSize(this.value)" title="Thumbnail size">
-    </div>
+    {% include '_filters.html' %}
     <div class="bar-divider"></div>
     <div class="bar-section bar-stats">
         <span id="compare-stat-comparisons" class="bar-stat-num">0</span> comparisons

@@ -212,7 +212,7 @@ async def get_kept_images_for_pairing():
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons, predicted_elo, uncertainty FROM images "
+            "SELECT id, filename, filepath, elo, comparisons, predicted_elo, uncertainty, orientation FROM images "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
         )
         return await cursor.fetchall()

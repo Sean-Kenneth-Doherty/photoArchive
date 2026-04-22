@@ -302,7 +302,7 @@ const PhotoArchive = (() => {
     }
 
     async function loadMosaicBatch() {
-        const res = await fetch(`/api/mosaic/next?n=${MOSAIC_SIZE}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}`);
+        const res = await fetch(`/api/mosaic/next?n=${MOSAIC_SIZE}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}${filterParams()}`);
         const data = await res.json();
         compareStats = data.stats || {};
         updateCompareProgress();
@@ -377,7 +377,7 @@ const PhotoArchive = (() => {
                 ...mosaicImages.map(img => img.id),
                 ...mosaicReplacements.map(img => img.id),
             ].join(',');
-            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}`);
+            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}${filterParams()}`);
             const data = await res.json();
             if (data.stats) {
                 compareStats = data.stats;
@@ -503,11 +503,13 @@ const PhotoArchive = (() => {
         document.addEventListener('keydown', handleCompareKey);
         document.getElementById('compare-left').addEventListener('click', () => submitComparison('left'));
         document.getElementById('compare-right').addEventListener('click', () => submitComparison('right'));
-        // Start in mosaic mode by default
         setCompareMode('mosaic');
-        // Poll AI status for the bottom bar
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
+        // Load folder list for filter dropdown
+        loadFolderList();
+        // Star hover preview
+        initStarHover();
     }
 
     async function pollAIStatus() {
@@ -747,6 +749,15 @@ const PhotoArchive = (() => {
     let lightboxIndex = -1;
     let filters = { orientation: '', compared: '', rating: '', folder: '' };
 
+    function filterParams() {
+        let p = '';
+        if (filters.orientation) p += `&orientation=${filters.orientation}`;
+        if (filters.compared) p += `&compared=${filters.compared}`;
+        if (filters.rating) p += `&min_stars=${filters.rating}`;
+        if (filters.folder) p += `&folder=${encodeURIComponent(filters.folder)}`;
+        return p;
+    }
+
     const SORT_KEYS = {
         'elo':         { desc: 'elo',           asc: 'elo_asc' },
         'ai':          { desc: 'ai',            asc: 'ai_asc' },
@@ -769,41 +780,8 @@ const PhotoArchive = (() => {
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
 
-        // Star hover preview
-        document.querySelectorAll('.filter-star').forEach(star => {
-            star.addEventListener('mouseenter', () => {
-                const level = parseInt(star.dataset.star);
-                document.querySelectorAll('.filter-star').forEach(s => {
-                    s.classList.toggle('hovered', parseInt(s.dataset.star) <= level);
-                    if (!s.classList.contains('lit')) {
-                        s.textContent = parseInt(s.dataset.star) <= level ? '★' : '☆';
-                    }
-                });
-            });
-            star.addEventListener('mouseleave', () => {
-                document.querySelectorAll('.filter-star').forEach(s => {
-                    s.classList.remove('hovered');
-                    if (!s.classList.contains('lit')) {
-                        s.textContent = '☆';
-                    }
-                });
-            });
-        });
-
-        // Load folder list
-        fetch('/api/folders').then(r => r.json()).then(data => {
-            const sel = document.getElementById('filter-folder');
-            if (!sel || !data.folders) return;
-            // Show only top-level folders (depth 0) for cleanliness
-            const topFolders = data.folders.filter(f => f.depth <= 1);
-            for (const f of topFolders) {
-                const opt = document.createElement('option');
-                opt.value = f.path;
-                const indent = f.depth > 0 ? '  ' : '';
-                opt.textContent = `${indent}${f.path} (${f.count})`;
-                sel.appendChild(opt);
-            }
-        }).catch(() => {});
+        loadFolderList();
+        initStarHover();
 
         // Infinite scroll
         window.addEventListener('scroll', () => {
@@ -937,11 +915,7 @@ const PhotoArchive = (() => {
     async function loadRankings() {
         if (rankingsLoading) return;
         rankingsLoading = true;
-        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`;
-        if (filters.orientation) url += `&orientation=${filters.orientation}`;
-        if (filters.compared) url += `&compared=${filters.compared}`;
-        if (filters.rating) url += `&min_stars=${filters.rating}`;
-        if (filters.folder) url += `&folder=${encodeURIComponent(filters.folder)}`;
+        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}${filterParams()}`;
         const res = await fetch(url);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
@@ -1051,35 +1025,39 @@ const PhotoArchive = (() => {
         });
     }
 
+    function reloadForFilters() {
+        // Reload the appropriate view based on which page we're on
+        const grid = document.getElementById('rankings-grid');
+        if (grid) {
+            rankingsOffset = 0;
+            rankingsExhausted = false;
+            libraryImages = [];
+            grid.innerHTML = '';
+            loadRankings();
+        } else {
+            // Compare page — reload mosaic
+            loadMosaicBatch();
+        }
+    }
+
     function setFilter(key, value) {
         filters[key] = value;
-        rankingsOffset = 0;
-        rankingsExhausted = false;
-        libraryImages = [];
-        document.getElementById('rankings-grid').innerHTML = '';
-        loadRankings();
+        reloadForFilters();
     }
 
     function toggleFilter(key, value, btn) {
-        // Toggle: click active filter to clear it
         if (filters[key] === value) {
             filters[key] = '';
             btn.classList.remove('active');
         } else {
-            // Deactivate siblings in same group
             btn.parentElement.querySelectorAll('.filter-icon').forEach(b => b.classList.remove('active'));
             filters[key] = value;
             btn.classList.add('active');
         }
-        rankingsOffset = 0;
-        rankingsExhausted = false;
-        libraryImages = [];
-        document.getElementById('rankings-grid').innerHTML = '';
-        loadRankings();
+        reloadForFilters();
     }
 
     function toggleStar(level) {
-        // Click same star to clear, otherwise set minimum
         const newValue = filters.rating == level ? '' : level;
         filters.rating = newValue;
         document.querySelectorAll('.filter-star').forEach(s => {
@@ -1088,11 +1066,42 @@ const PhotoArchive = (() => {
             s.classList.toggle('lit', lit);
             s.textContent = lit ? '★' : '☆';
         });
-        rankingsOffset = 0;
-        rankingsExhausted = false;
-        libraryImages = [];
-        document.getElementById('rankings-grid').innerHTML = '';
-        loadRankings();
+        reloadForFilters();
+    }
+
+    function loadFolderList() {
+        fetch('/api/folders').then(r => r.json()).then(data => {
+            const sel = document.getElementById('filter-folder');
+            if (!sel || !data.folders) return;
+            const topFolders = data.folders.filter(f => f.depth <= 1);
+            for (const f of topFolders) {
+                const opt = document.createElement('option');
+                opt.value = f.path;
+                const indent = f.depth > 0 ? '  ' : '';
+                opt.textContent = `${indent}${f.path} (${f.count})`;
+                sel.appendChild(opt);
+            }
+        }).catch(() => {});
+    }
+
+    function initStarHover() {
+        document.querySelectorAll('.filter-star').forEach(star => {
+            star.addEventListener('mouseenter', () => {
+                const level = parseInt(star.dataset.star);
+                document.querySelectorAll('.filter-star').forEach(s => {
+                    s.classList.toggle('hovered', parseInt(s.dataset.star) <= level);
+                    if (!s.classList.contains('lit')) {
+                        s.textContent = parseInt(s.dataset.star) <= level ? '★' : '☆';
+                    }
+                });
+            });
+            star.addEventListener('mouseleave', () => {
+                document.querySelectorAll('.filter-star').forEach(s => {
+                    s.classList.remove('hovered');
+                    if (!s.classList.contains('lit')) s.textContent = '☆';
+                });
+            });
+        });
     }
 
     function eloToStars(elo, comparisons) {
