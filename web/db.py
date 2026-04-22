@@ -427,6 +427,7 @@ async def get_unembedded_images(limit: int = 64):
             "SELECT i.id, i.filepath FROM images i "
             "LEFT JOIN embeddings e ON i.id = e.image_id "
             "WHERE e.image_id IS NULL AND i.status IN ('kept', 'maybe') "
+            "ORDER BY RANDOM() "
             "LIMIT ?",
             (limit,),
         )

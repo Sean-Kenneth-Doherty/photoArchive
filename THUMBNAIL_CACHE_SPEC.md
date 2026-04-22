@@ -132,6 +132,103 @@ This means: if pre-generation Phase 2 (md thumbnails) runs before or
 alongside the embedding worker, embedding speed improves dramatically
 since the I/O bottleneck shifts from HDD reads to GPU inference.
 
+## Thumbnail Generation Optimizations
+
+### 1. Generate all sizes from one read
+
+When any size is requested and others are missing, generate all missing
+sizes from a single file read. Cascade the resize (original→lg→md→sm)
+so each step works on a smaller image:
+
+```python
+def generate_all_sizes(filepath, image_id, needed_sizes):
+    img = open_image(filepath)  # one HDD read
+    for size in ['lg', 'md', 'sm']:
+        if size in needed_sizes:
+            img = img.resize(SIZES[size])  # cascade: each input is the previous output
+            save_to_ssd(size, image_id, img)
+```
+
+### 2. JPEG draft mode for small thumbnails
+
+For JPEGs, decode at reduced resolution using Pillow's draft mode.
+A 6000x4000 JPEG decoded at 1/8 = 750x500, then resize to 400px.
+Skips decompressing 95% of pixels — 3-5x faster for sm generation:
+
+```python
+img = Image.open(path)
+img.draft('RGB', (target_width * 2, target_height * 2))
+img.load()
+img = img.resize((target_width, target_height), Image.LANCZOS)
+```
+
+### 3. Extract embedded JPEG from RAW files
+
+RAW files (CR3, DNG) contain embedded JPEG previews at ~1920px+.
+Extract the preview instead of decoding the RAW data — turns a
+2-5 second RAW decode into a ~50ms JPEG extraction:
+
+```python
+raw = rawpy.imread(path)
+thumb = raw.extract_thumb()
+if thumb.format == rawpy.ThumbFormat.JPEG:
+    img = Image.open(io.BytesIO(thumb.data))  # instant
+```
+
+Fall back to full RAW decode only if the embedded preview is too small
+for the requested thumbnail size.
+
+### 4. Pipelined I/O and compute
+
+Overlap HDD reads with CPU resize/encode. While image N is being
+resized, start reading image N+1 from disk. Use a two-stage pipeline
+with a prefetch buffer:
+
+```
+HDD thread:  [---read A---][---read B---][---read C---]
+CPU thread:            [resize+encode A][resize+encode B][resize+encode C]
+```
+
+### 5. libjpeg-turbo
+
+Ensure Pillow uses libjpeg-turbo (2-6x faster JPEG encode/decode via
+SIMD). On Arch: `pacman -S libjpeg-turbo`. Pillow picks it up
+automatically, no code changes needed.
+
+### 6. Filesystem-ordered bulk pre-generation
+
+When pre-generating all thumbnails, process images sorted by filepath
+(not by Elo). Spinning HDDs are dramatically faster with sequential
+reads vs random seeks. The photos are organized by folder/date, so
+filepath order = sequential disk access:
+
+```python
+# Bulk pre-generation: ORDER BY filepath ASC (sequential HDD reads)
+# Priority pre-generation (top-rated first): ORDER BY elo DESC (random, small subset)
+```
+
+### 7. Aspect ratio detection during generation
+
+Already implemented: the thumbnail generator detects orientation and
+aspect_ratio from image dimensions during the first resize. Store these
+in the images table so the frontend can lay out grids before thumbnails
+finish loading (no layout shift).
+
+### Expected speedups (combined)
+
+| Optimization | Speedup | Applies to |
+|---|---|---|
+| Single read → all sizes | 3x fewer HDD reads | Pre-generation |
+| JPEG draft mode | 3-5x for sm generation | sm thumbnails |
+| RAW embedded JPEG | 10-50x for RAW files | Any RAW thumbnail |
+| Pipelined I/O | ~1.5x throughput | Pre-generation |
+| libjpeg-turbo | 2-6x encode/decode | All JPEG operations |
+| Sequential disk order | 2-5x for bulk reads | Pre-generation |
+
+Combined, bulk pre-generation should go from ~2-3 images/sec to
+~15-30 images/sec for JPEGs, completing 20k images in ~15-20 minutes
+instead of hours.
+
 ## New API Endpoints
 
 ```

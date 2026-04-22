@@ -8,10 +8,10 @@ Background worker that:
 4. Provides text-to-image search via shared embedding space
 """
 
+import asyncio
 import logging
 import os
 import struct
-import asyncio
 import time
 from collections import deque
 
@@ -30,6 +30,8 @@ EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
 BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
 EMBED_SPEED_WINDOW_SECONDS = 300
+EMBED_CANDIDATE_MULTIPLIER = 16
+EMBED_RETRY_SECONDS = 600
 
 # Module-level reference for text search (set by run_clip_worker on startup)
 _model = None
@@ -53,6 +55,7 @@ _worker_status = {
     "overall_images_per_min": 0.0,
 }
 _embedding_history = deque()
+_embed_retry_after: dict[int, float] = {}
 
 
 def _set_worker_status(state: str, message: str = "", ready: bool = False, last_error: str = ""):
@@ -108,6 +111,37 @@ def _record_embedding_batch(count: int, seconds: float):
     _recompute_speed_metrics(now)
 
 
+def _schedule_embed_retry(image_id: int, error: str):
+    wait_seconds = EMBED_RETRY_SECONDS
+    if "No such file" in error or "FileNotFoundError" in error:
+        wait_seconds = EMBED_RETRY_SECONDS
+    elif "cannot identify image file" in error:
+        wait_seconds = EMBED_RETRY_SECONDS * 3
+
+    _embed_retry_after[image_id] = time.time() + wait_seconds
+
+
+def _select_ready_candidates(rows):
+    now = time.time()
+    selected = []
+    cooled_down = 0
+    next_retry_at = None
+
+    for row in rows:
+        retry_after = _embed_retry_after.get(row["id"], 0)
+        if retry_after > now:
+            cooled_down += 1
+            if next_retry_at is None or retry_after < next_retry_at:
+                next_retry_at = retry_after
+            continue
+
+        selected.append(row)
+        if len(selected) >= BATCH_SIZE:
+            break
+
+    return selected, cooled_down, next_retry_at
+
+
 def get_worker_status() -> dict:
     _recompute_speed_metrics()
     return dict(_worker_status)
@@ -137,34 +171,74 @@ def _load_model(model_dir: str, model_id: str):
     return model
 
 
-def _embed_images(model, image_paths: list[str]) -> list[np.ndarray]:
-    """Embed images from file paths. Returns list of numpy arrays (or None for failures)."""
-    from PIL import Image
+def _load_image_for_embedding(path: str):
+    from PIL import Image as PILImage, ImageOps
 
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".dng", ".cr3"):
+        import rawpy
+
+        with rawpy.imread(path) as raw:
+            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True)
+        return PILImage.fromarray(rgb)
+
+    with PILImage.open(path) as source:
+        source.load()
+        img = ImageOps.exif_transpose(source)
+        if img is source:
+            img = source.copy()
+    return img
+
+
+def _embed_images(model, image_paths: list[str]) -> tuple[list[np.ndarray | None], list[str | None]]:
+    """Embed images from file paths. Returns vectors plus per-image error strings."""
+    from PIL import Image as PILImage
+
+    results = [None] * len(image_paths)
+    errors = [None] * len(image_paths)
     valid = []
     valid_indices = []
     for i, path in enumerate(image_paths):
+        img = None
         try:
-            img = Image.open(path).convert("RGB")
+            img = _load_image_for_embedding(path)
             # Resize to max 1024px on long side to keep VRAM reasonable
             max_side = max(img.size)
             if max_side > 1024:
                 scale = 1024 / max_side
-                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+                img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
             valid.append(img)
             valid_indices.append(i)
         except Exception as e:
+            errors[i] = f"{type(e).__name__}: {e}"
             log.debug(f"Skipping image {path}: {e}")
+            if img is not None:
+                try:
+                    img.close()
+                except Exception:
+                    pass
 
     if not valid:
-        return [None] * len(image_paths)
+        return results, errors
 
-    embeddings = model.encode(valid, normalize_embeddings=True)
-
-    results = [None] * len(image_paths)
-    for idx, valid_i in enumerate(valid_indices):
-        results[valid_i] = embeddings[idx].astype(np.float32)
-    return results
+    try:
+        embeddings = model.encode(valid, normalize_embeddings=True)
+        for idx, valid_i in enumerate(valid_indices):
+            results[valid_i] = embeddings[idx].astype(np.float32)
+        return results, errors
+    except Exception as e:
+        failure = f"{type(e).__name__}: {e}"
+        for valid_i in valid_indices:
+            errors[valid_i] = failure
+        return results, errors
+    finally:
+        for img in valid:
+            try:
+                img.close()
+            except Exception:
+                pass
 
 
 def encode_text(query: str) -> np.ndarray | None:
@@ -223,8 +297,6 @@ async def run_clip_worker():
 
     last_train_count = 0
     has_model = False
-    batches_since_train = 0
-    TRAIN_EVERY_N_BATCHES = 5  # train more frequently since batches are small
 
     while True:
         try:
@@ -240,7 +312,6 @@ async def run_clip_worker():
                 _loaded_model_id = None
                 _loaded_model_revision = None
                 has_model = False
-                batches_since_train = 0
                 _set_worker_status(
                     "waiting_for_model",
                     f"Install {model_id} from Settings to enable AI features.",
@@ -262,41 +333,60 @@ async def run_clip_worker():
                 _loaded_model_revision = model_revision
                 last_train_count = await db.get_comparison_count()
                 has_model = False
-                batches_since_train = 0
                 _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
 
             # Phase 1: Embed unembedded images
-            unembedded = await db.get_unembedded_images(limit=BATCH_SIZE)
+            candidates = await db.get_unembedded_images(limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER)
+            unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
                 _set_worker_status("embedding", f"Embedding {len(unembedded)} images…", ready=True)
                 image_paths = [row["filepath"] for row in unembedded]
                 embed_started = time.perf_counter()
 
-                vectors = await loop.run_in_executor(
+                vectors, errors = await loop.run_in_executor(
                     None, _embed_images, _model, image_paths
                 )
 
                 batch = []
-                for row, vec in zip(unembedded, vectors):
+                failed = []
+                for row, vec, error in zip(unembedded, vectors, errors):
                     if vec is not None:
                         batch.append((row["id"], vec_to_blob(vec)))
+                        _embed_retry_after.pop(row["id"], None)
+                    elif error:
+                        failed.append((row["id"], error))
+                        _schedule_embed_retry(row["id"], error)
 
                 if batch:
                     await db.store_embeddings_batch(batch)
                     _record_embedding_batch(len(batch), time.perf_counter() - embed_started)
                     embedded_count = await db.get_embedding_count()
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")
+                    has_model = False
 
-                batches_since_train += 1
+                if failed and not batch:
+                    sample_error = failed[0][1]
+                    _set_worker_status(
+                        "embedding",
+                        f"Skipping {len(failed)} unavailable files for now; retrying other images. Latest error: {sample_error}",
+                        ready=True,
+                    )
                 await asyncio.sleep(0.1)
+                continue
 
-                if batches_since_train < TRAIN_EVERY_N_BATCHES:
-                    continue
+            if candidates and cooled_down:
+                wait_for = max(1, int(next_retry_at - time.time())) if next_retry_at else 5
+                _set_worker_status(
+                    "embedding",
+                    f"Waiting to retry {cooled_down} unavailable files in about {wait_for}s.",
+                    ready=True,
+                )
+                await asyncio.sleep(min(wait_for, 10))
+                continue
 
             # Phase 2: Train/retrain the taste model
-            batches_since_train = 0
             current_count = await db.get_comparison_count()
-            if not has_model or current_count - last_train_count >= RETRAIN_EVERY or unembedded:
+            if not has_model or current_count - last_train_count >= RETRAIN_EVERY:
                 _set_worker_status("training", "Updating taste model predictions…", ready=True)
                 training_data = await db.get_training_data()
                 if len(training_data) >= 20:
