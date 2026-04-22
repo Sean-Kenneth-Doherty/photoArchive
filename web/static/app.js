@@ -1032,14 +1032,14 @@ const PhotoArchive = (() => {
         const infoEl = document.getElementById('loupe-info');
         const exifEl = document.getElementById('loupe-exif');
 
-        // Progressive loading: sm (instant) → md (fast) → full
+        // Progressive loading: sm (instant) -> md (fast) -> full original
         loupeImg.src = img.thumb_url; // sm, already cached
         const md = new Image();
         md.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = md.src; };
         md.src = `/api/thumb/md/${img.id}`;
-        const lg = new Image();
-        lg.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = lg.src; };
-        lg.src = `/api/thumb/lg/${img.id}`;
+        const full = new Image();
+        full.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = full.src; };
+        full.src = `/api/full/${img.id}`;
 
         // Info
         const stars = eloToStars(img.elo, img.comparisons);
@@ -1051,8 +1051,16 @@ const PhotoArchive = (() => {
         updateFilmstripActive();
 
         // Prefetch neighbors
-        if (lightboxIndex > 0) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex - 1].id}`);
-        if (lightboxIndex < libraryImages.length - 1) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex + 1].id}`);
+        if (lightboxIndex > 0) {
+            const prevId = libraryImages[lightboxIndex - 1].id;
+            preloadImage(`/api/thumb/md/${prevId}`);
+            preloadImage(`/api/full/${prevId}`);
+        }
+        if (lightboxIndex < libraryImages.length - 1) {
+            const nextId = libraryImages[lightboxIndex + 1].id;
+            preloadImage(`/api/thumb/md/${nextId}`);
+            preloadImage(`/api/full/${nextId}`);
+        }
 
         // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
@@ -1310,11 +1318,11 @@ const PhotoArchive = (() => {
         'thumb_size_sm',
         'thumb_size_md',
         'thumb_size_lg',
-        'jpeg_quality',
-        'cache_limit_sm',
-        'cache_limit_md',
-        'cache_limit_lg',
-        'disk_cache_dir',
+        'thumb_quality',
+        'memory_cache_mb',
+        'ssd_cache_dir',
+        'ssd_cache_gb',
+        'pregenerate_on_idle',
         'user_workers',
         'prefetch_workers',
         'browser_cache_max_age',
@@ -1333,13 +1341,80 @@ const PhotoArchive = (() => {
         el.className = 'settings-status' + (tone ? ' ' + tone : '');
     }
 
-    function renderSettingsMeta(data) {
-        const cacheEl = document.getElementById('cache-stats-inline');
-        const pathEl = document.getElementById('settings-path');
-        if (cacheEl && data.cache_stats) {
-            const stats = data.cache_stats;
-            cacheEl.textContent = `sm ${stats.sm || 0} · md ${stats.md || 0} · lg ${stats.lg || 0}`;
+    function formatBytes(bytes) {
+        const value = Number(bytes || 0);
+        if (value <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let size = value;
+        let unit = 0;
+        while (size >= 1024 && unit < units.length - 1) {
+            size /= 1024;
+            unit += 1;
         }
+        const digits = size >= 100 || unit === 0 ? 0 : size >= 10 ? 1 : 2;
+        return `${size.toFixed(digits)} ${units[unit]}`;
+    }
+
+    function formatCacheTier(label, tier) {
+        if (!tier) return `${label}: —`;
+        const budget = Number(tier.budget_bytes || 0);
+        const progressTotal = Number(tier.progress_total || 0);
+        const progress = progressTotal > 0
+            ? `${Number(tier.count || 0).toLocaleString()} / ${progressTotal.toLocaleString()} (${Number(tier.progress_pct || 0).toFixed(1)}%)`
+            : `${Number(tier.count || 0).toLocaleString()} cached`;
+        const budgetText = budget > 0
+            ? `${formatBytes(tier.bytes)} / ${formatBytes(budget)}`
+            : `${formatBytes(tier.bytes)} / off`;
+        return `${label}: ${budgetText} · ${progress}`;
+    }
+
+    function renderCacheSettingsStatus(cacheStatus) {
+        if (!cacheStatus) return;
+
+        const memory = cacheStatus.memory || {};
+        const disk = cacheStatus.disk || {};
+        const tiers = disk.tiers || {};
+        const pregen = cacheStatus.pregen || {};
+
+        const cacheEl = document.getElementById('cache-stats-inline');
+        const ramEl = document.getElementById('cache-ram-usage');
+        const ssdEl = document.getElementById('cache-ssd-usage');
+        const smEl = document.getElementById('cache-tier-sm');
+        const mdEl = document.getElementById('cache-tier-md');
+        const lgEl = document.getElementById('cache-tier-lg');
+        const fullEl = document.getElementById('cache-tier-full');
+        const pregenEl = document.getElementById('cache-pregen-summary');
+
+        if (cacheEl) {
+            cacheEl.textContent = `${formatBytes(memory.used_bytes)} / ${formatBytes(memory.limit_bytes)}`;
+        }
+        if (ramEl) {
+            const memoryTiers = memory.tiers || {};
+            const parts = ['sm', 'md', 'lg'].map((size) => {
+                const tier = memoryTiers[size] || {};
+                return `${size} ${Number(tier.count || 0)} · ${formatBytes(tier.bytes)}`;
+            });
+            ramEl.textContent = parts.join('   ');
+        }
+        if (ssdEl) {
+            const pct = Number(disk.utilization_pct || 0);
+            ssdEl.textContent = `${formatBytes(disk.used_bytes)} / ${formatBytes(disk.limit_bytes)} (${pct.toFixed(1)}%)`;
+        }
+        if (smEl) smEl.textContent = formatCacheTier('sm', tiers.sm);
+        if (mdEl) mdEl.textContent = formatCacheTier('md', tiers.md);
+        if (lgEl) lgEl.textContent = formatCacheTier('lg', tiers.lg);
+        if (fullEl) fullEl.textContent = formatCacheTier('full', tiers.full);
+        if (pregenEl) {
+            const state = pregen.state || 'idle';
+            const phase = pregen.active_phase ? ` · ${pregen.active_phase}` : '';
+            const message = pregen.message ? ` · ${pregen.message}` : '';
+            pregenEl.textContent = `${state}${phase}${message}`;
+        }
+    }
+
+    function renderSettingsMeta(data) {
+        const pathEl = document.getElementById('settings-path');
+        renderCacheSettingsStatus(data.cache_stats);
         if (pathEl && data.settings_path) {
             pathEl.textContent = data.settings_path;
         }
@@ -1442,7 +1517,8 @@ const PhotoArchive = (() => {
         for (const field of SETTINGS_FIELDS) {
             const input = document.getElementById(field);
             if (!input || settings[field] === undefined || settings[field] === null) continue;
-            input.value = settings[field];
+            if (input.type === 'checkbox') input.checked = Boolean(settings[field]);
+            else input.value = settings[field];
         }
     }
 
@@ -1451,7 +1527,9 @@ const PhotoArchive = (() => {
         for (const field of SETTINGS_FIELDS) {
             const input = document.getElementById(field);
             if (!input) continue;
-            payload[field] = input.type === 'number' ? parseInt(input.value || '0', 10) : input.value;
+            if (input.type === 'checkbox') payload[field] = input.checked;
+            else if (input.type === 'number') payload[field] = parseInt(input.value || '0', 10);
+            else payload[field] = input.value;
         }
         return payload;
     }
@@ -1532,11 +1610,41 @@ const PhotoArchive = (() => {
             }
             renderSettingsMeta(data);
             setSettingsStatus(
-                `Cleared ${data.memory_entries_cleared || 0} RAM entries and ${data.disk_files_removed || 0} disk files.`,
+                `Cleared ${data.memory_entries_cleared || 0} RAM entries (${formatBytes(data.memory_bytes_cleared || 0)}) and ${data.disk_files_removed || 0} disk files.`,
                 'success'
             );
         } catch (err) {
             setSettingsStatus(`Cache clear failed: ${err.message}`, 'error');
+        }
+    }
+
+    async function startCachePregeneration() {
+        setSettingsStatus('Starting cache pre-generation…', 'muted');
+        try {
+            const res = await fetch('/api/cache/pregen/start', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Could not start pre-generation');
+            }
+            renderCacheSettingsStatus(data.cache);
+            setSettingsStatus('Pre-generation is running.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Could not start pre-generation: ${err.message}`, 'error');
+        }
+    }
+
+    async function stopCachePregeneration() {
+        setSettingsStatus('Pausing cache pre-generation…', 'muted');
+        try {
+            const res = await fetch('/api/cache/pregen/stop', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Could not pause pre-generation');
+            }
+            renderCacheSettingsStatus(data.cache);
+            setSettingsStatus('Pre-generation paused.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Could not pause pre-generation: ${err.message}`, 'error');
         }
     }
 
@@ -1621,6 +1729,8 @@ const PhotoArchive = (() => {
         saveSettings,
         resetSettings,
         clearThumbnailCache,
+        startCachePregeneration,
+        stopCachePregeneration,
         installAIModel,
     };
 })();

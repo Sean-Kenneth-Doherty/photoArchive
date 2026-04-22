@@ -1030,12 +1030,31 @@ button:disabled {
     background: #1d1d1d;
 }
 
+.settings-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #bdbdbd;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.settings-checkbox input {
+    width: auto;
+    margin: 0;
+    accent-color: #6cb4ee;
+}
+
 .settings-metric-list {
     display: grid;
     gap: 8px;
     color: #8f8f8f;
     font-size: 12px;
     line-height: 1.45;
+}
+
+.settings-metric-list strong {
+    color: #d7dde4;
 }
 
 .settings-metric-list code {
@@ -1046,6 +1065,7 @@ button:disabled {
 .settings-actions {
     display: flex;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .bar-settings-note {

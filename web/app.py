@@ -21,6 +21,7 @@ templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "t
 
 # Track cull history for undo (in-memory stack of {image_id, previous_status})
 _cull_history: list[dict] = []
+_BROWSER_IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/ai/status",
     "/api/cache/status",
@@ -183,6 +184,17 @@ async def serve_full_image(request: Request, image_id: int):
     image = await db.get_image_by_id(image_id)
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
+
+    ext = os.path.splitext(image["filepath"])[1].lower()
+    if ext not in _BROWSER_IMAGE_EXTENSIONS:
+        headers = thumbnails.response_headers(image["filepath"], "lg", image_id)
+        if request.headers.get("if-none-match") == headers["ETag"]:
+            return Response(status_code=304, headers=headers)
+
+        data = await thumbnails.get_thumbnail(image["filepath"], "lg", image_id)
+        if not data:
+            return JSONResponse({"error": "Preview generation failed"}, status_code=500)
+        return Response(content=data, media_type="image/jpeg", headers=headers)
 
     headers = thumbnails.response_headers(image["filepath"], thumbnails.FULL_TIER, image_id)
     if request.headers.get("if-none-match") == headers["ETag"]:

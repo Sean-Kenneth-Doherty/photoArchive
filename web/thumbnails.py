@@ -64,6 +64,7 @@ _prefetching = False
 _pregen_manual_mode = False
 _pregen_manual_pause = False
 _pregen_scan_offsets = {tier: 0 for tier in THUMB_TIERS}
+_last_thumb_config_signature = ""
 _pregen_status = {
     "enabled": True,
     "manual_mode": False,
@@ -252,6 +253,16 @@ def _clear_memory_cache() -> dict:
     }
 
 
+def _clear_memory_tiers(tiers: tuple[str, ...]):
+    global _memory_cache_bytes
+    with _cache_lock:
+        for key in list(_memory_cache.keys()):
+            if key[0] not in tiers:
+                continue
+            _signature, data = _memory_cache.pop(key)
+            _memory_cache_bytes -= len(data)
+
+
 def _memory_stats() -> dict:
     with _cache_lock:
         tiers = {size: {"count": 0, "bytes": 0} for size in THUMB_TIERS}
@@ -319,6 +330,34 @@ def _enforce_all_disk_budgets():
                 _enforce_tier_budget_locked(conn, size)
         finally:
             conn.close()
+
+
+def _clear_disk_tiers(tiers: tuple[str, ...]):
+    with _meta_lock:
+        conn = _db_connect()
+        try:
+            placeholders = ",".join("?" for _ in tiers)
+            rows = conn.execute(
+                f"SELECT cache_root, size, image_id, path FROM cache_entries "
+                f"WHERE cache_root = ? AND size IN ({placeholders})",
+                (SSD_CACHE_DIR, *tiers),
+            ).fetchall()
+            for row in rows:
+                _remove_cache_entry_locked(conn, row)
+            conn.commit()
+        finally:
+            conn.close()
+
+    for tier in tiers:
+        tier_dir = os.path.join(SSD_CACHE_DIR, tier)
+        if not os.path.isdir(tier_dir):
+            continue
+        for entry in os.scandir(tier_dir):
+            if entry.is_file(follow_symlinks=False):
+                try:
+                    os.remove(entry.path)
+                except OSError:
+                    pass
 
 
 def _get_disk_entry(
@@ -907,6 +946,10 @@ def cache_stats() -> dict:
     }
 
 
+def _thumb_config_signature() -> str:
+    return f"{CACHE_VERSION}|{SIZES['sm']}|{SIZES['md']}|{SIZES['lg']}|{THUMB_QUALITY}"
+
+
 def get_pregen_status(target_total: int = 0) -> dict:
     stats = cache_stats()
     phases = {}
@@ -959,7 +1002,7 @@ def configure(config: dict):
     global PREGENERATE_ON_IDLE, _memory_cache_bytes
     global BROWSER_CACHE_MAX_AGE, BROWSER_CACHE_STALE_WHILE_REVALIDATE
     global _executor_workers, _prefetch_workers_count, _executor, _prefetch_executor
-    global _disk_allocations, _pregen_manual_pause
+    global _disk_allocations, _last_thumb_config_signature, _pregen_manual_pause
 
     SIZES["sm"] = int(config.get("thumb_size_sm", SIZES["sm"]))
     SIZES["md"] = int(config.get("thumb_size_md", SIZES["md"]))
@@ -983,6 +1026,13 @@ def configure(config: dict):
     )
     SSD_CACHE_DIR = os.path.abspath(str(disk_cache_dir).strip() or SSD_CACHE_DIR)
     _ensure_disk_cache_dirs()
+
+    new_thumb_config_signature = _thumb_config_signature()
+    if _last_thumb_config_signature and new_thumb_config_signature != _last_thumb_config_signature:
+        _clear_memory_tiers(THUMB_TIERS)
+        _clear_disk_tiers(THUMB_TIERS)
+    _last_thumb_config_signature = new_thumb_config_signature
+
     _disk_allocations = _allocate_disk_budget(SSD_CACHE_BYTES)
 
     if not PREGENERATE_ON_IDLE and not _pregen_manual_mode:
