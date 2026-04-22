@@ -1067,28 +1067,26 @@ button:disabled {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 26px;
+    width: 24px;
     height: 24px;
-    background: transparent;
-    color: #555;
+    background: none;
+    color: #666;
     border: none;
-    border-radius: 3px;
+    border-radius: 0;
     cursor: pointer;
-    transition: color 0.15s, background 0.15s;
+    transition: color 0.15s;
 }
 
 .filter-icon:hover {
-    color: #bbb;
-    background: rgba(255,255,255,0.06);
+    color: #aaa;
 }
 
 .filter-icon.active {
-    color: #6cb4ee;
-    background: rgba(108,180,238,0.1);
+    color: #fff;
 }
 
 .sort-dir-btn.active {
-    color: #6cb4ee;
+    color: #fff;
 }
 
 .filter-sep {
@@ -1104,10 +1102,10 @@ button:disabled {
 }
 
 .filter-star {
-    background: transparent;
+    background: none;
     border: none;
-    color: #3a3a3a;
-    font-size: 13px;
+    color: #555;
+    font-size: 12px;
     cursor: pointer;
     padding: 1px 0;
     line-height: 1;
@@ -1115,11 +1113,11 @@ button:disabled {
 }
 
 .filter-star:hover {
-    color: #b8962f;
+    color: #aaa;
 }
 
 .filter-star.lit {
-    color: #d4a843;
+    color: #fff;
 }
 
 /* Bar filter selects */
