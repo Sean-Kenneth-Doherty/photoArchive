@@ -1015,7 +1015,16 @@ def configure(config: dict):
             BROWSER_CACHE_STALE_WHILE_REVALIDATE,
         )
     )
-    MEMORY_CACHE_BYTES = max(0, int(config.get("memory_cache_mb", 512))) * 1024 * 1024
+    memory_cache_gb = config.get("memory_cache_gb")
+    if memory_cache_gb is None:
+        try:
+            memory_cache_gb = float(config.get("memory_cache_mb", 512)) / 1024.0
+        except (TypeError, ValueError):
+            memory_cache_gb = 0.5
+    try:
+        MEMORY_CACHE_BYTES = max(0, int(float(memory_cache_gb) * 1024 * 1024 * 1024))
+    except (TypeError, ValueError):
+        MEMORY_CACHE_BYTES = int(0.5 * 1024 * 1024 * 1024)
     SSD_CACHE_BYTES = max(0, int(config.get("ssd_cache_gb", 10))) * 1024 * 1024 * 1024
     PREGENERATE_ON_IDLE = _as_bool(config.get("pregenerate_on_idle"), PREGENERATE_ON_IDLE)
 

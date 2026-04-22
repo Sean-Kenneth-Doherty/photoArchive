@@ -1319,7 +1319,7 @@ const PhotoArchive = (() => {
         'thumb_size_md',
         'thumb_size_lg',
         'thumb_quality',
-        'memory_cache_mb',
+        'memory_cache_gb',
         'ssd_cache_dir',
         'ssd_cache_gb',
         'pregenerate_on_idle',
@@ -1528,7 +1528,7 @@ const PhotoArchive = (() => {
             const input = document.getElementById(field);
             if (!input) continue;
             if (input.type === 'checkbox') payload[field] = input.checked;
-            else if (input.type === 'number') payload[field] = parseInt(input.value || '0', 10);
+            else if (input.type === 'number') payload[field] = Number(input.value || '0');
             else payload[field] = input.value;
         }
         return payload;

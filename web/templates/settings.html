@@ -63,19 +63,6 @@
         </section>
 
         <section class="settings-card">
-            <h2>Memory Cache</h2>
-            <p class="settings-card-copy">Keep the hottest thumbnails in RAM so repeat views skip both SSD reads and image generation.</p>
-            <label class="settings-field">
-                <span>RAM budget (MB)</span>
-                <input id="memory_cache_mb" type="number" min="0" max="16384" step="1">
-            </label>
-            <div class="settings-metric-list">
-                <div>Current RAM cache: <strong id="cache-stats-inline">—</strong></div>
-                <div>Per-tier usage: <strong id="cache-ram-usage">—</strong></div>
-            </div>
-        </section>
-
-        <section class="settings-card">
             <h2>Workers</h2>
             <p class="settings-card-copy">User workers serve on-demand thumbs. Prefetch workers fill the cache in the background.</p>
             <label class="settings-field">
@@ -109,22 +96,13 @@
             </label>
         </section>
 
-        <section class="settings-card">
-            <h2>Browser Cache</h2>
-            <p class="settings-card-copy">These values tune how long browsers can reuse thumbnails before revalidating them.</p>
-            <label class="settings-field">
-                <span>Max age seconds</span>
-                <input id="browser_cache_max_age" type="number" min="0" max="31536000" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Stale-while-revalidate seconds</span>
-                <input id="browser_cache_stale_while_revalidate" type="number" min="0" max="31536000" step="1">
-            </label>
-        </section>
-
         <section class="settings-card settings-card-wide">
-            <h2>SSD Cache</h2>
-            <p class="settings-card-copy">One SSD budget is split automatically across `sm`, `md`, `lg`, and full originals. Faster local storage here is the biggest win if your source archive lives on HDD.</p>
+            <h2>Cache</h2>
+            <p class="settings-card-copy">RAM, SSD, and browser thumbnail caching all live here. The SSD budget is split automatically across `sm`, `md`, `lg`, and full originals.</p>
+            <label class="settings-field">
+                <span>RAM budget (GB)</span>
+                <input id="memory_cache_gb" type="number" min="0" max="64" step="0.25">
+            </label>
             <label class="settings-field">
                 <span>Cache directory</span>
                 <input id="ssd_cache_dir" type="text" spellcheck="false" autocomplete="off">
@@ -137,7 +115,17 @@
                 <input id="pregenerate_on_idle" type="checkbox">
                 <span>Pre-generate thumbnails while the app is idle</span>
             </label>
+            <label class="settings-field">
+                <span>Browser max age (seconds)</span>
+                <input id="browser_cache_max_age" type="number" min="0" max="31536000" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Browser stale-while-revalidate (seconds)</span>
+                <input id="browser_cache_stale_while_revalidate" type="number" min="0" max="31536000" step="1">
+            </label>
             <div class="settings-metric-list">
+                <div>RAM cache: <strong id="cache-stats-inline">—</strong></div>
+                <div>RAM tiers: <strong id="cache-ram-usage">—</strong></div>
                 <div>SSD cache: <strong id="cache-ssd-usage">—</strong></div>
                 <div id="cache-tier-sm">sm: —</div>
                 <div id="cache-tier-md">md: —</div>

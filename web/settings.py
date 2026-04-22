@@ -19,7 +19,7 @@ DEFAULT_SETTINGS = {
     "thumb_quality": 92,
     "ssd_cache_dir": os.path.join(WEB_DIR, ".thumbcache"),
     "ssd_cache_gb": 10,
-    "memory_cache_mb": 512,
+    "memory_cache_gb": 0.5,
     "pregenerate_on_idle": True,
     "user_workers": 4,
     "prefetch_workers": 2,
@@ -40,7 +40,6 @@ INT_RANGES = {
     "thumb_size_lg": (128, 8192),
     "thumb_quality": (40, 100),
     "ssd_cache_gb": (0, 4096),
-    "memory_cache_mb": (0, 16384),
     "user_workers": (1, 32),
     "prefetch_workers": (1, 16),
     "browser_cache_max_age": (0, 31536000),
@@ -49,6 +48,10 @@ INT_RANGES = {
     "cull_prefetch_limit": (0, 200),
     "compare_prefetch_limit": (0, 200),
     "mosaic_prefetch_limit": (0, 200),
+}
+
+FLOAT_RANGES = {
+    "memory_cache_gb": (0.0, 64.0),
 }
 
 _lock = threading.Lock()
@@ -75,7 +78,15 @@ def normalize_settings(raw: dict | None) -> dict:
         raw = {**raw, "thumb_quality": raw.get("jpeg_quality")}
     if "ssd_cache_dir" not in raw and "disk_cache_dir" in raw:
         raw = {**raw, "ssd_cache_dir": raw.get("disk_cache_dir")}
-    if "memory_cache_mb" not in raw:
+    if "memory_cache_gb" not in raw and "memory_cache_mb" in raw:
+        try:
+            raw = {
+                **raw,
+                "memory_cache_gb": max(0.0, float(raw.get("memory_cache_mb", 0)) / 1024.0),
+            }
+        except (TypeError, ValueError):
+            pass
+    if "memory_cache_gb" not in raw:
         cache_limit_values = [
             raw.get("cache_limit_sm"),
             raw.get("cache_limit_md"),
@@ -86,7 +97,7 @@ def normalize_settings(raw: dict | None) -> dict:
                 approx_entries = sum(int(value or 0) for value in cache_limit_values)
                 raw = {
                     **raw,
-                    "memory_cache_mb": max(64, min(16384, approx_entries // 8 or 512)),
+                    "memory_cache_gb": max(0.25, min(64.0, (approx_entries // 8 or 512) / 1024.0)),
                 }
             except (TypeError, ValueError):
                 pass
@@ -115,6 +126,14 @@ def normalize_settings(raw: dict | None) -> dict:
         except (TypeError, ValueError):
             value = normalized[key]
         normalized[key] = max(min_value, min(max_value, value))
+
+    for key, (min_value, max_value) in FLOAT_RANGES.items():
+        value = raw.get(key, normalized[key])
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = normalized[key]
+        normalized[key] = round(max(min_value, min(max_value, value)), 2)
 
     if normalized["thumb_size_sm"] > normalized["thumb_size_md"]:
         normalized["thumb_size_md"] = normalized["thumb_size_sm"]
