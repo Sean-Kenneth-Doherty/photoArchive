@@ -29,6 +29,12 @@ CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
 CREATE INDEX IF NOT EXISTS idx_images_elo ON images(elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_comparisons ON images(comparisons);
 CREATE INDEX IF NOT EXISTS idx_comparisons_pair ON comparisons(winner_id, loser_id);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    image_id INTEGER PRIMARY KEY REFERENCES images(id),
+    embedding BLOB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -44,11 +50,16 @@ async def init_db():
     db = await get_db()
     try:
         await db.executescript(SCHEMA)
-        # Migration: add orientation column if missing
-        try:
-            await db.execute("ALTER TABLE images ADD COLUMN orientation TEXT DEFAULT NULL")
-        except Exception:
-            pass  # Column already exists
+        # Migrations: add columns if missing
+        for col, defn in [
+            ("orientation", "TEXT DEFAULT NULL"),
+            ("predicted_elo", "REAL DEFAULT NULL"),
+            ("uncertainty", "REAL DEFAULT NULL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
+            except Exception:
+                pass  # Column already exists
         await db.commit()
     finally:
         await db.close()
@@ -183,7 +194,7 @@ async def get_kept_images_for_pairing():
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons FROM images "
+            "SELECT id, filename, filepath, elo, comparisons, predicted_elo, uncertainty FROM images "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
         )
         return await cursor.fetchall()
@@ -351,5 +362,95 @@ async def get_scan_folder():
         if row:
             return os.path.dirname(row["filepath"])
         return None
+    finally:
+        await db.close()
+
+
+# --- Embedding / Active Learning ---
+
+async def get_unembedded_images(limit: int = 64):
+    """Get kept/maybe images that don't have CLIP embeddings yet."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT i.id, i.filepath FROM images i "
+            "LEFT JOIN embeddings e ON i.id = e.image_id "
+            "WHERE e.image_id IS NULL AND i.status IN ('kept', 'maybe') "
+            "LIMIT ?",
+            (limit,),
+        )
+        return await cursor.fetchall()
+    finally:
+        await db.close()
+
+
+async def store_embeddings_batch(rows: list[tuple[int, bytes]]):
+    """Store CLIP embedding blobs. Each row: (image_id, embedding_bytes)."""
+    db = await get_db()
+    try:
+        await db.executemany(
+            "INSERT OR REPLACE INTO embeddings (image_id, embedding) VALUES (?, ?)",
+            rows,
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_training_data():
+    """Get embeddings + Elo for images with direct comparisons (training set)."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT e.image_id, e.embedding, i.elo FROM embeddings e "
+            "JOIN images i ON e.image_id = i.id "
+            "WHERE i.comparisons > 0"
+        )
+        return await cursor.fetchall()
+    finally:
+        await db.close()
+
+
+async def get_all_embeddings():
+    """Get all embeddings for prediction pass."""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT e.image_id, e.embedding FROM embeddings e "
+            "JOIN images i ON e.image_id = i.id "
+            "WHERE i.status IN ('kept', 'maybe')"
+        )
+        return await cursor.fetchall()
+    finally:
+        await db.close()
+
+
+async def bulk_update_predictions(rows: list[tuple[float, float, int]]):
+    """Update predicted_elo and uncertainty. Each row: (predicted_elo, uncertainty, image_id)."""
+    db = await get_db()
+    try:
+        await db.executemany(
+            "UPDATE images SET predicted_elo = ?, uncertainty = ? WHERE id = ?",
+            rows,
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_comparison_count() -> int:
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) as c FROM comparisons")
+        return (await cursor.fetchone())["c"]
+    finally:
+        await db.close()
+
+
+async def get_embedding_count() -> int:
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) as c FROM embeddings")
+        return (await cursor.fetchone())["c"]
     finally:
         await db.close()

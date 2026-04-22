@@ -5,3 +5,5 @@ Pillow
 rawpy
 jinja2
 python-multipart
+open-clip-torch
+scikit-learn

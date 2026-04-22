@@ -26,6 +26,11 @@ async def startup():
     await db.init_db()
     asyncio.create_task(thumbnails.run_prefetch_worker())
     asyncio.create_task(classify_orientations_background())
+    try:
+        import clip_worker
+        asyncio.create_task(clip_worker.run_clip_worker())
+    except ImportError:
+        pass  # CLIP features disabled — missing open-clip-torch or scikit-learn
 
 
 async def classify_orientations_background():
@@ -72,22 +77,22 @@ async def shutdown():
 async def index(request: Request):
     stats = await db.get_stats()
     folder = await db.get_scan_folder()
-    return templates.TemplateResponse("index.html", {"request": request, "stats": stats, "folder": folder})
+    return templates.TemplateResponse(request, "index.html", {"stats": stats, "folder": folder})
 
 
 @app.get("/cull", response_class=HTMLResponse)
 async def cull_page(request: Request):
-    return templates.TemplateResponse("cull.html", {"request": request})
+    return templates.TemplateResponse(request, "cull.html")
 
 
 @app.get("/compare", response_class=HTMLResponse)
 async def compare_page(request: Request):
-    return templates.TemplateResponse("compare.html", {"request": request})
+    return templates.TemplateResponse(request, "compare.html")
 
 
 @app.get("/rankings", response_class=HTMLResponse)
 async def rankings_page(request: Request):
-    return templates.TemplateResponse("rankings.html", {"request": request})
+    return templates.TemplateResponse(request, "rankings.html")
 
 
 # --- Scan API ---
@@ -275,7 +280,16 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
     candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
     count = min(n, len(candidates))
 
-    if strategy == "explore":
+    if strategy == "learn":
+        # AI-guided: favor images the taste model is most uncertain about
+        weights = []
+        for img in candidates:
+            u = img.get("uncertainty")
+            if u is not None:
+                weights.append(u + 0.01)  # small floor to avoid zero
+            else:
+                weights.append(1.0 / (img["comparisons"] + 1))  # fallback to explore
+    elif strategy == "explore":
         # Favor least-compared images
         weights = [1.0 / (img["comparisons"] + 1) for img in candidates]
     elif strategy == "compete" and grid_elo > 0:

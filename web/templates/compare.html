@@ -39,6 +39,7 @@
         <div class="mosaic-grid" id="mosaic-grid"></div>
         <div class="mosaic-actions">
             <div class="toggle-group">
+                <button id="strategy-learn" onclick="PhotoRanker.setMosaicStrategy('learn')" title="AI-guided: show most informative images">Learn</button>
                 <button id="strategy-explore" class="active" onclick="PhotoRanker.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
                 <button id="strategy-compete" onclick="PhotoRanker.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
                 <button id="strategy-top" onclick="PhotoRanker.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
