@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 
 import ai_models
 import db
+import elo_propagation
 import pairing
 import scanner
 import settings
@@ -596,6 +597,9 @@ async def mosaic_pick(request: Request):
     finally:
         await conn.close()
 
+    # Fire-and-forget: propagate Elo to similar images via embeddings
+    asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, other_ids, k=12.0))
+
     return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(other_ids)}
 
 
@@ -658,6 +662,9 @@ async def submit_comparison(request: Request):
         winner["elo"], loser["elo"],
         new_winner_elo, new_loser_elo,
     )
+
+    # Fire-and-forget: propagate Elo to similar images via embeddings
+    asyncio.create_task(elo_propagation.propagate_comparison(winner_id, loser_id, k))
 
     return {
         "ok": True,
