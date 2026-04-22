@@ -1131,6 +1131,17 @@ button:disabled {
     color: #fff;
 }
 
+.lightbox-meta {
+    text-align: center;
+}
+
+.lightbox-exif {
+    color: #666;
+    font-size: 12px;
+    margin-top: 4px;
+    font-family: monospace;
+}
+
 .lightbox-actions {
     margin-top: 8px;
     display: flex;

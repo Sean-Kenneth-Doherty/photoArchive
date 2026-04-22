@@ -930,11 +930,28 @@ const PhotoArchive = (() => {
         const lb = document.getElementById('lightbox');
         const lbImg = document.getElementById('lightbox-img');
         const lbInfo = document.getElementById('lightbox-info');
+        const lbExif = document.getElementById('lightbox-exif');
         lbImg.src = `/api/thumb/md/${img.id}`;
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = '★'.repeat(stars) + '☆'.repeat(5 - stars);
         lbInfo.textContent = `${img.filename}  ·  ${img.elo} Elo  ·  ${starStr}  ·  ${img.comparisons} comparisons`;
+        if (lbExif) lbExif.textContent = '';
         lb.classList.remove('hidden');
+
+        // Load EXIF asynchronously
+        fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
+            if (!lbExif || !data.exif) return;
+            const e = data.exif;
+            const parts = [];
+            if (e.camera_model) parts.push(e.camera_model);
+            if (e.lens) parts.push(e.lens);
+            if (e.focal_length) parts.push(e.focal_length);
+            if (e.aperture) parts.push(e.aperture);
+            if (e.shutter_speed) parts.push(e.shutter_speed + 's');
+            if (e.iso) parts.push('ISO ' + e.iso);
+            if (e.date) parts.push(e.date);
+            lbExif.textContent = parts.join('  ·  ');
+        }).catch(() => {});
     }
 
     function lightboxNext() {

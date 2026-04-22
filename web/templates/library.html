@@ -17,7 +17,10 @@
         <div class="lightbox-nav lightbox-prev" onclick="event.stopPropagation(); PhotoArchive.lightboxPrev()">&#8249;</div>
         <div class="lightbox-center" onclick="PhotoArchive.closeLightbox()">
             <img id="lightbox-img" src="" alt="">
-            <div class="lightbox-info" id="lightbox-info"></div>
+            <div class="lightbox-meta">
+                <div class="lightbox-info" id="lightbox-info"></div>
+                <div class="lightbox-exif" id="lightbox-exif"></div>
+            </div>
             <div class="lightbox-actions">
                 <button class="lightbox-btn" onclick="event.stopPropagation(); PhotoArchive.findSimilar()">Find Similar</button>
             </div>

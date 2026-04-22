@@ -668,6 +668,51 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
     return {"pairs": result}
 
 
+@app.get("/api/image/{image_id}/exif")
+async def api_exif(image_id: int):
+    """Extract EXIF metadata from an image."""
+    image = await db.get_image_by_id(image_id)
+    if not image:
+        return JSONResponse({"error": "Image not found"}, status_code=404)
+
+    from PIL import Image as PILImage
+    from PIL.ExifTags import TAGS
+    try:
+        img = PILImage.open(image["filepath"])
+        exif_raw = img.getexif()
+        img.close()
+    except Exception:
+        return {"exif": {}}
+
+    exif = {}
+    tag_map = {
+        "Make": "camera_make", "Model": "camera_model",
+        "FocalLength": "focal_length", "FNumber": "aperture",
+        "ExposureTime": "shutter_speed", "ISOSpeedRatings": "iso",
+        "DateTimeOriginal": "date", "LensModel": "lens",
+        "ImageWidth": "width", "ImageLength": "height",
+    }
+    for tag_id, value in exif_raw.items():
+        tag_name = TAGS.get(tag_id, "")
+        if tag_name in tag_map:
+            # Convert IFDRational to float/string
+            if hasattr(value, 'numerator'):
+                if tag_name == "ExposureTime" and value.numerator > 0:
+                    if value < 1:
+                        value = f"1/{int(1/float(value))}"
+                    else:
+                        value = f"{float(value):.1f}"
+                elif tag_name == "FNumber":
+                    value = f"f/{float(value):.1f}"
+                elif tag_name == "FocalLength":
+                    value = f"{float(value):.0f}mm"
+                else:
+                    value = float(value)
+            exif[tag_map[tag_name]] = str(value)
+
+    return {"exif": exif}
+
+
 @app.get("/api/stats")
 async def api_stats():
     return await db.get_stats()
