@@ -488,8 +488,13 @@ async def api_rankings(
 
 
 @app.get("/api/export")
-async def export_rankings(format: str = "json"):
-    images = await db.get_rankings(limit=10000)
+async def export_rankings(format: str = "json", ids: str = ""):
+    if ids:
+        id_list = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+        images_dict = await db.get_images_by_ids(id_list)
+        images = [images_dict[i] for i in id_list if i in images_dict]
+    else:
+        images = await db.get_rankings(limit=10000)
     data = [
         {
             "rank": i + 1,

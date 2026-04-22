@@ -911,7 +911,10 @@ const PhotoArchive = (() => {
             card.style.height = rowH + 'px';
             card.style.flexGrow = ar;
             card.style.flexBasis = (rowH * ar) + 'px';
-            card.onclick = () => openLightbox(img);
+            card.onclick = () => {
+                if (batchMode) { toggleBatchSelect(img.id, card); }
+                else { openLightbox(img); }
+            };
 
             const eloLabel = img.comparisons > 0 ? `${img.elo}` : (img.predicted_elo ? `~${img.predicted_elo}` : `${img.elo}`);
             const sourceTag = img.comparisons === 0 && img.predicted_elo ? '<span class="rank-ai-tag">AI</span>' : '';
@@ -923,6 +926,7 @@ const PhotoArchive = (() => {
 
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <div class="select-check">✓</div>
                 ${confDot}
                 <div class="rank-card-info">${infoLine}</div>
             `;
@@ -1075,6 +1079,57 @@ const PhotoArchive = (() => {
         }
     }
 
+    // ==================== BATCH SELECTION ====================
+
+    let batchMode = false;
+    let batchSelected = new Set();
+
+    function toggleBatchMode() {
+        batchMode = !batchMode;
+        batchSelected.clear();
+        document.querySelectorAll('.rank-card').forEach(c => {
+            c.classList.toggle('selectable', batchMode);
+            c.classList.remove('selected');
+        });
+        updateBatchBar();
+    }
+
+    function toggleBatchSelect(imgId, card) {
+        if (batchSelected.has(imgId)) {
+            batchSelected.delete(imgId);
+            card.classList.remove('selected');
+        } else {
+            batchSelected.add(imgId);
+            card.classList.add('selected');
+        }
+        updateBatchBar();
+    }
+
+    function updateBatchBar() {
+        let bar = document.getElementById('batch-bar');
+        if (batchMode) {
+            if (!bar) {
+                bar = document.createElement('div');
+                bar.id = 'batch-bar';
+                bar.className = 'batch-bar';
+                document.body.appendChild(bar);
+            }
+            bar.innerHTML = `
+                <span>${batchSelected.size} selected</span>
+                <button onclick="PhotoArchive.batchExport('json')">Export JSON</button>
+                <button onclick="PhotoArchive.batchExport('csv')">Export CSV</button>
+                <button class="batch-cancel" onclick="PhotoArchive.toggleBatchMode()">Cancel</button>
+            `;
+        } else if (bar) {
+            bar.remove();
+        }
+    }
+
+    function batchExport(format) {
+        const ids = Array.from(batchSelected).join(',');
+        window.open(`/api/export?format=${format}&ids=${ids}`, '_blank');
+    }
+
     function exportRankings(format) {
         window.open(`/api/export?format=${format}`, '_blank');
     }
@@ -1117,6 +1172,8 @@ const PhotoArchive = (() => {
         setThumbSize,
         setFilter,
         findSimilar,
+        toggleBatchMode,
+        batchExport,
         gridSelectAll,
         gridSelectNone,
         gridSubmit,
