@@ -35,6 +35,7 @@ Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edit
 | `settings.py` | Runtime settings with JSON persistence, hot-reload support |
 | `scanner.py` | Recursive folder scan, batch inserts (100 at a time) |
 | `pairing.py` | Elo calculation, Swiss-system pairing with 30% random swap |
+| `elo_propagation.py` | Propagate Elo changes to similar images via embedding cosine similarity |
 | `thumbnails.py` | Three-size thumbnail generation (sm/md/lg), LRU cache, disk cache, background prefetch |
 
 ### Frontend (vanilla HTML/CSS/JS)
@@ -77,6 +78,7 @@ Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edit
 - **Find Similar**: Cosine similarity from a source image to all others
 - **Auto-collections**: K-means clustering on embeddings
 - **Duplicate detection**: Pairwise cosine similarity above threshold
+- **Elo propagation** (`elo_propagation.py`): After each comparison, propagates scaled Elo adjustments to visually similar images (cosine sim > 0.75, max 10 neighbors, decay 0.3). Only affects images with < 8 direct comparisons. Fire-and-forget background task.
 - **Background loop**: Embeds in batches of 4, trains taste model every 5 batches, reports speed/ETA metrics
 
 ### UI Patterns
@@ -84,7 +86,7 @@ Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edit
 - **Bottom bar**: Fixed bar on compare/library/settings pages. Contains mode toggles, filters, stats, AI status, nav links. Wraps on narrow viewports.
 - **Justified flex grid**: Both library and mosaic use `flex-wrap` with `flex-grow: aspectRatio` per card. Library scrolls, mosaic fits viewport via binary-search row height.
 - **Shared filters** (`_filters.html`): Orientation icons, ranked status icons, star rating (hover preview), folder dropdown, thumb size slider. Used on both compare and library pages.
-- **Lightbox**: Arrow key navigation, EXIF metadata, Find Similar button
+- **Loupe view**: Lightroom-style full-screen image view with filmstrip navigation, progressive loading (sm→md→lg), EXIF metadata, Find Similar
 - **Fire-and-forget**: Cull and mosaic picks POST without awaiting response
 - **Infinite scroll**: Library loads more images when within 600px of bottom
 
@@ -92,16 +94,38 @@ Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edit
 
 | Endpoint | Purpose |
 |---|---|
+| **Scan** | |
+| `POST /api/scan` | Start recursive folder scan |
+| `GET /api/scan/status` | Scan progress |
+| **Cull** | |
+| `GET /api/cull/next` | Get unculled images for review |
+| `POST /api/cull` | Submit single cull decision |
+| `POST /api/cull/batch` | Submit batch cull decisions (grid mode) |
+| `POST /api/cull/undo` | Undo last cull |
+| **Compare** | |
 | `GET /api/mosaic/next` | Get images for mosaic grid with strategy/filter params |
-| `POST /api/mosaic/pick` | Record mosaic comparison (winner vs all losers) |
+| `POST /api/mosaic/pick` | Record mosaic comparison (winner vs all losers) + propagate |
+| `GET /api/compare/next` | Get Swiss/Top50 A/B pairs |
+| `POST /api/compare` | Submit A/B comparison + propagate |
+| `POST /api/compare/undo` | Undo last comparison |
+| **Library** | |
 | `GET /api/rankings` | Paginated ranked images with sort/filter params |
 | `GET /api/search?q=` | Text-to-image search via embedding similarity |
 | `GET /api/similar/{id}` | Find visually similar images |
 | `GET /api/duplicates` | Near-duplicate detection |
 | `GET /api/collections` | Auto-grouped collections via k-means |
 | `GET /api/folders` | Folder tree with image counts |
-| `GET /api/ai/status` | Embedding progress, model state, speed metrics, ETA |
+| `GET /api/export` | Export rankings as JSON/CSV (supports id filtering) |
+| **Images** | |
+| `GET /api/thumb/{size}/{id}` | Serve thumbnail (sm/md/lg) with ETag caching |
 | `GET /api/image/{id}/exif` | EXIF metadata from image file |
+| **AI** | |
+| `GET /api/ai/status` | Embedding progress, model state, speed metrics, ETA |
+| `POST /api/ai/model/install` | Trigger model download |
+| **Settings & Cache** | |
 | `GET /api/settings` | Current settings + cache stats + model status |
 | `POST /api/settings` | Save settings (hot-reload) |
-| `POST /api/ai/model/install` | Trigger model download |
+| `POST /api/settings/reset` | Reset to defaults |
+| `GET /api/cache/status` | Thumbnail cache fill stats |
+| `POST /api/cache/clear` | Clear thumbnail caches |
+| `GET /api/stats` | Overall image/comparison counts |
