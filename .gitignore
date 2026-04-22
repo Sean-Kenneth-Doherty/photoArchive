@@ -3,4 +3,6 @@ web/.venv/
 web/.cache/
 web/photoranker.db
 web/photoarchive.db
+web/photoarchive.db-shm
+web/photoarchive.db-wal
 __pycache__/
