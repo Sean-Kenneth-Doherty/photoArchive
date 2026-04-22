@@ -502,6 +502,23 @@ async def api_stats():
     return await db.get_stats()
 
 
+@app.get("/api/ai/status")
+async def ai_status():
+    """CLIP embedding and taste model status for the bottom bar."""
+    embedded = await db.get_embedding_count()
+    stats = await db.get_stats()
+    total_kept = stats["kept"] + stats["maybe"]
+    conn = await db.get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) as c FROM images WHERE predicted_elo IS NOT NULL"
+        )
+        predicted = (await cursor.fetchone())["c"]
+    finally:
+        await conn.close()
+    return {"embedded": embedded, "total_kept": total_kept, "model_trained": predicted > 0}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

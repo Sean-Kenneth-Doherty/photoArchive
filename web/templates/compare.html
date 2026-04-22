@@ -1,20 +1,10 @@
 {% extends "base.html" %}
 {% block title %}PhotoRanker — Compare{% endblock %}
+{% block navbar %}{% endblock %}
 {% block content %}
 <div class="compare-container">
-    <div class="compare-header">
-        <div class="compare-progress">
-            <p id="compare-progress-text">Loading pairs...</p>
-        </div>
-        <div class="compare-mode-toggle toggle-group">
-            <button id="mode-mosaic" class="active" onclick="PhotoRanker.setCompareMode('mosaic')">Mosaic</button>
-            <button id="mode-swiss" onclick="PhotoRanker.setCompareMode('swiss')">Swiss</button>
-            <button id="mode-topn" onclick="PhotoRanker.setCompareMode('topn')">Top 50</button>
-        </div>
-    </div>
-
     <!-- A/B mode -->
-    <div class="compare-images" id="compare-images">
+    <div class="compare-images hidden" id="compare-images">
         <div class="compare-side" id="compare-left">
             <img id="compare-left-img" src="" alt="Left image">
             <div class="compare-info" id="compare-left-info"></div>
@@ -26,29 +16,9 @@
         </div>
     </div>
 
-    <div class="compare-controls">
-        <div class="compare-hint" id="compare-hints">
-            <span class="key">←</span> Left wins &nbsp;
-            <span class="key">→</span> Right wins &nbsp;
-            <span class="key">↑</span> Undo
-        </div>
-    </div>
-
     <!-- Mosaic mode -->
-    <div class="mosaic-container hidden" id="mosaic-container">
+    <div class="mosaic-container" id="mosaic-container">
         <div class="mosaic-grid" id="mosaic-grid"></div>
-        <div class="mosaic-actions">
-            <div class="toggle-group">
-                <button id="strategy-learn" onclick="PhotoRanker.setMosaicStrategy('learn')" title="AI-guided: show most informative images">Learn</button>
-                <button id="strategy-explore" class="active" onclick="PhotoRanker.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
-                <button id="strategy-compete" onclick="PhotoRanker.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
-                <button id="strategy-top" onclick="PhotoRanker.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
-                <button id="strategy-random" onclick="PhotoRanker.setMosaicStrategy('random')" title="Uniform random">Random</button>
-            </div>
-            <div class="mosaic-buttons">
-                <button onclick="PhotoRanker.mosaicShuffle()">Shuffle</button>
-            </div>
-        </div>
     </div>
 
     <div class="compare-empty hidden" id="compare-empty">
@@ -56,8 +26,51 @@
         <p>You need at least 2 kept images. <a href="/cull">Go cull some images first.</a></p>
     </div>
 </div>
+{% endblock %}
+
+{% block bottom_bar %}
+<footer class="bottom-bar" id="compare-bar">
+    <div class="bar-section bar-modes">
+        <div class="toggle-group toggle-group-sm">
+            <button id="mode-mosaic" class="active" onclick="PhotoRanker.setCompareMode('mosaic')">Mosaic</button>
+            <button id="mode-swiss" onclick="PhotoRanker.setCompareMode('swiss')">Swiss</button>
+            <button id="mode-topn" onclick="PhotoRanker.setCompareMode('topn')">Top 50</button>
+        </div>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-strategies" id="bar-strategies">
+        <div class="toggle-group toggle-group-sm">
+            <button id="strategy-learn" onclick="PhotoRanker.setMosaicStrategy('learn')" title="AI-guided: show most informative images">Learn</button>
+            <button id="strategy-explore" class="active" onclick="PhotoRanker.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
+            <button id="strategy-compete" onclick="PhotoRanker.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
+            <button id="strategy-top" onclick="PhotoRanker.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
+            <button id="strategy-random" onclick="PhotoRanker.setMosaicStrategy('random')" title="Uniform random">Random</button>
+        </div>
+        <button class="bar-btn" onclick="PhotoRanker.mosaicShuffle()">Shuffle</button>
+    </div>
+    <div class="bar-section bar-hints hidden" id="bar-hints">
+        <span class="key">←</span> Left
+        <span class="key">→</span> Right
+        <span class="key">↑</span> Undo
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-stats">
+        <span id="compare-stat-comparisons" class="bar-stat-num">0</span> comparisons
+        <span class="bar-dot">&middot;</span>
+        <span id="compare-stat-pool" class="bar-stat-num">0</span> images
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-ai" id="bar-ai">
+        <span class="bar-ai-label">AI</span>
+        <span id="ai-embed-count">—</span>/<span id="ai-embed-total">—</span>
+        <span id="ai-model-state" class="bar-ai-state"></span>
+    </div>
+    <div class="bar-section bar-nav">
+        <a href="/rankings" class="bar-link">Rankings</a>
+    </div>
+</footer>
+{% endblock %}
 
 <script>
     document.addEventListener('DOMContentLoaded', () => PhotoRanker.initCompare());
 </script>
-{% endblock %}

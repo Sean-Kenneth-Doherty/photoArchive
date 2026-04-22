@@ -488,6 +488,36 @@ const PhotoRanker = (() => {
         document.getElementById('compare-right').addEventListener('click', () => submitComparison('right'));
         // Start in mosaic mode by default
         setCompareMode('mosaic');
+        // Poll AI status for the bottom bar
+        pollAIStatus();
+        setInterval(pollAIStatus, 5000);
+    }
+
+    async function pollAIStatus() {
+        try {
+            const res = await fetch('/api/ai/status');
+            const data = await res.json();
+            const countEl = document.getElementById('ai-embed-count');
+            const totalEl = document.getElementById('ai-embed-total');
+            const stateEl = document.getElementById('ai-model-state');
+            if (countEl) countEl.textContent = data.embedded.toLocaleString();
+            if (totalEl) totalEl.textContent = data.total_kept.toLocaleString();
+            if (stateEl) {
+                if (data.embedded < data.total_kept) {
+                    stateEl.textContent = 'Embedding';
+                    stateEl.className = 'bar-ai-state embedding';
+                } else if (data.model_trained) {
+                    stateEl.textContent = 'Trained';
+                    stateEl.className = 'bar-ai-state trained';
+                } else {
+                    stateEl.textContent = '';
+                    stateEl.className = 'bar-ai-state';
+                }
+            }
+        } catch {
+            const aiSection = document.getElementById('bar-ai');
+            if (aiSection) aiSection.style.display = 'none';
+        }
     }
 
     async function fetchComparePairs() {
@@ -546,10 +576,12 @@ const PhotoRanker = (() => {
     }
 
     function updateCompareProgress() {
-        const text = document.getElementById('compare-progress-text');
         const total = compareStats.total_comparisons || 0;
         const kept = compareStats.kept || 0;
-        if (text) text.textContent = `${total} comparisons — ${kept} images in pool — ${compareMode} mode`;
+        const compEl = document.getElementById('compare-stat-comparisons');
+        const poolEl = document.getElementById('compare-stat-pool');
+        if (compEl) compEl.textContent = total.toLocaleString();
+        if (poolEl) poolEl.textContent = kept.toLocaleString();
     }
 
     async function submitComparison(side) {
@@ -617,20 +649,23 @@ const PhotoRanker = (() => {
         }
 
         const abContainer = document.getElementById('compare-images');
-        const abControls = document.querySelector('.compare-controls');
         const mosaicContainer = document.getElementById('mosaic-container');
+        const strategies = document.getElementById('bar-strategies');
+        const hints = document.getElementById('bar-hints');
 
         if (mode === 'mosaic') {
             // Show mosaic, hide A/B
             if (abContainer) abContainer.classList.add('hidden');
-            if (abControls) abControls.classList.add('hidden');
             if (mosaicContainer) mosaicContainer.classList.remove('hidden');
+            if (strategies) strategies.classList.remove('hidden');
+            if (hints) hints.classList.add('hidden');
             loadMosaicBatch();
         } else {
             // Show A/B, hide mosaic
             if (abContainer) abContainer.classList.remove('hidden');
-            if (abControls) abControls.classList.remove('hidden');
             if (mosaicContainer) mosaicContainer.classList.add('hidden');
+            if (strategies) strategies.classList.add('hidden');
+            if (hints) hints.classList.remove('hidden');
             // Reset and fetch new pairs
             comparePairs = [];
             compareIndex = 0;

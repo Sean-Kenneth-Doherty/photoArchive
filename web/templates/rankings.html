@@ -1,25 +1,8 @@
 {% extends "base.html" %}
 {% block title %}PhotoRanker — Rankings{% endblock %}
+{% block navbar %}{% endblock %}
 {% block content %}
 <div class="rankings-container">
-    <div class="rankings-header">
-        <h1>Rankings</h1>
-        <div class="rankings-controls">
-            <div class="toggle-group">
-                <button id="sort-elo" class="active" onclick="PhotoRanker.setRankingsSort('elo')">Top Rated</button>
-                <button id="sort-elo_asc" onclick="PhotoRanker.setRankingsSort('elo_asc')">Lowest</button>
-                <button id="sort-comparisons" onclick="PhotoRanker.setRankingsSort('comparisons')">Most Compared</button>
-                <button id="sort-least_compared" onclick="PhotoRanker.setRankingsSort('least_compared')">Least Compared</button>
-                <button id="sort-newest" onclick="PhotoRanker.setRankingsSort('newest')">Newest</button>
-                <button id="sort-filename" onclick="PhotoRanker.setRankingsSort('filename')">Filename</button>
-            </div>
-            <div class="rankings-actions">
-                <button onclick="PhotoRanker.exportRankings('json')">Export JSON</button>
-                <button onclick="PhotoRanker.exportRankings('csv')">Export CSV</button>
-            </div>
-        </div>
-    </div>
-
     <div class="rankings-grid" id="rankings-grid">
     </div>
 
@@ -33,8 +16,31 @@
         <div class="lightbox-info" id="lightbox-info"></div>
     </div>
 </div>
+{% endblock %}
+
+{% block bottom_bar %}
+<footer class="bottom-bar" id="rankings-bar">
+    <div class="bar-section bar-sorts">
+        <div class="toggle-group toggle-group-sm">
+            <button id="sort-elo" class="active" onclick="PhotoRanker.setRankingsSort('elo')">Top Rated</button>
+            <button id="sort-elo_asc" onclick="PhotoRanker.setRankingsSort('elo_asc')">Lowest</button>
+            <button id="sort-comparisons" onclick="PhotoRanker.setRankingsSort('comparisons')">Most Compared</button>
+            <button id="sort-least_compared" onclick="PhotoRanker.setRankingsSort('least_compared')">Least Compared</button>
+            <button id="sort-newest" onclick="PhotoRanker.setRankingsSort('newest')">Newest</button>
+            <button id="sort-filename" onclick="PhotoRanker.setRankingsSort('filename')">Filename</button>
+        </div>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-export">
+        <button class="bar-btn" onclick="PhotoRanker.exportRankings('json')">JSON</button>
+        <button class="bar-btn" onclick="PhotoRanker.exportRankings('csv')">CSV</button>
+    </div>
+    <div class="bar-section bar-nav">
+        <a href="/compare" class="bar-link">Compare</a>
+    </div>
+</footer>
+{% endblock %}
 
 <script>
     document.addEventListener('DOMContentLoaded', () => PhotoRanker.initRankings());
 </script>
-{% endblock %}

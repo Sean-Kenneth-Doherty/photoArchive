@@ -354,14 +354,15 @@ async def get_top_images(limit: int = 50):
 
 
 async def get_scan_folder():
-    """Get the folder path from the most recently scanned image."""
+    """Get the common root folder from scanned images."""
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT filepath FROM images LIMIT 1")
-        row = await cursor.fetchone()
-        if row:
-            return os.path.dirname(row["filepath"])
-        return None
+        cursor = await db.execute("SELECT filepath FROM images ORDER BY RANDOM() LIMIT 50")
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        dirs = [os.path.dirname(row["filepath"]) for row in rows]
+        return os.path.commonpath(dirs)
     finally:
         await db.close()
 
