@@ -1,4 +1,4 @@
-const PhotoRanker = (() => {
+const PhotoArchive = (() => {
     // --- Cull Mode State ---
     let cullQueue = [];
     let cullIndex = 0;

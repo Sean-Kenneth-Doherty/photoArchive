@@ -2,4 +2,5 @@ elo_ratings.json
 web/.venv/
 web/.cache/
 web/photoranker.db
+web/photoarchive.db
 __pycache__/

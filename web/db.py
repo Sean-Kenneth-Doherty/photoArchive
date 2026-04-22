@@ -1,7 +1,7 @@
 import aiosqlite
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "photoranker.db")
+DB_PATH = os.path.join(os.path.dirname(__file__), "photoarchive.db")
 EXPECTED_EMBEDDING_DIM = 2048  # Qwen3-VL-Embedding-8B (Matryoshka truncated)
 
 SCHEMA = """

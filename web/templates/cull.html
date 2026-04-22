@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% block title %}PhotoRanker — Cull{% endblock %}
+{% block title %}photoArchive — Cull{% endblock %}
 {% block navbar_center %}
 <div class="nav-center">
     <div class="cull-mode-toggle">
-        <button id="mode-single" class="mode-btn active" onclick="PhotoRanker.setCullMode('single')">Single</button>
-        <button id="mode-grid" class="mode-btn" onclick="PhotoRanker.setCullMode('grid')">Grid</button>
+        <button id="mode-single" class="mode-btn active" onclick="PhotoArchive.setCullMode('single')">Single</button>
+        <button id="mode-grid" class="mode-btn" onclick="PhotoArchive.setCullMode('grid')">Grid</button>
     </div>
     <div class="nav-progress">
         <div class="progress-bar">
@@ -46,9 +46,9 @@
             Click images to <strong>keep</strong> them. Unselected images are rejected.
         </div>
         <div class="cull-grid-buttons">
-            <button onclick="PhotoRanker.gridSelectAll()">Select All</button>
-            <button onclick="PhotoRanker.gridSelectNone()">Select None</button>
-            <button class="grid-submit-btn" onclick="PhotoRanker.gridSubmit()">
+            <button onclick="PhotoArchive.gridSelectAll()">Select All</button>
+            <button onclick="PhotoArchive.gridSelectNone()">Select None</button>
+            <button class="grid-submit-btn" onclick="PhotoArchive.gridSubmit()">
                 Reject unselected &amp; next batch
             </button>
         </div>
@@ -61,6 +61,6 @@
 </div>
 
 <script>
-    document.addEventListener('DOMContentLoaded', () => PhotoRanker.initCull());
+    document.addEventListener('DOMContentLoaded', () => PhotoArchive.initCull());
 </script>
 {% endblock %}

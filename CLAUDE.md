@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PhotoRanker is a FastAPI web app that ranks photos using Elo ratings via a three-phase workflow: Cull → Compare → Rankings.
+photoArchive is a FastAPI web app that ranks photos using Elo ratings via a three-phase workflow: Cull → Compare → Rankings.
 
 ## Running
 
@@ -34,7 +34,7 @@ Arch Linux enforces PEP 668 — never use system pip directly.
 
 ### Frontend (vanilla HTML/CSS/JS)
 
-- `static/app.js` — IIFE module pattern returning `PhotoRanker` object. Manages all UI state.
+- `static/app.js` — IIFE module pattern returning `photoArchive` object. Manages all UI state.
 - `static/style.css` — Dark theme, responsive grids
 - `templates/` — Jinja2 templates extending `base.html`
 

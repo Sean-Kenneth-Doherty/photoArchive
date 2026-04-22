@@ -1,23 +1,23 @@
 {% extends "base.html" %}
-{% block title %}PhotoRanker — Library{% endblock %}
+{% block title %}photoArchive — Library{% endblock %}
 {% block navbar %}{% endblock %}
 {% block content %}
 <div class="library-container">
     <div class="library-search">
         <input type="text" id="search-input" placeholder="Search photos... (e.g. sunset, portrait, building)"
                autocomplete="off" spellcheck="false">
-        <button class="search-clear hidden" id="search-clear" onclick="PhotoRanker.clearSearch()">&times;</button>
+        <button class="search-clear hidden" id="search-clear" onclick="PhotoArchive.clearSearch()">&times;</button>
     </div>
 
     <div class="rankings-grid" id="rankings-grid">
     </div>
 
     <div class="rankings-load-more hidden" id="load-more-wrap">
-        <button id="load-more-btn" onclick="PhotoRanker.loadMoreRankings()">Load More</button>
+        <button id="load-more-btn" onclick="PhotoArchive.loadMoreRankings()">Load More</button>
     </div>
 
     <!-- Lightbox overlay -->
-    <div class="lightbox hidden" id="lightbox" onclick="PhotoRanker.closeLightbox()">
+    <div class="lightbox hidden" id="lightbox" onclick="PhotoArchive.closeLightbox()">
         <img id="lightbox-img" src="" alt="">
         <div class="lightbox-info" id="lightbox-info"></div>
     </div>
@@ -28,13 +28,13 @@
 <footer class="bottom-bar" id="library-bar">
     <div class="bar-section bar-sorts">
         <div class="toggle-group toggle-group-sm" id="sort-toggles">
-            <button id="sort-elo" class="active" onclick="PhotoRanker.setRankingsSort('elo')">Top Rated</button>
-            <button id="sort-ai" onclick="PhotoRanker.setRankingsSort('ai')">AI Ranked</button>
-            <button id="sort-elo_asc" onclick="PhotoRanker.setRankingsSort('elo_asc')">Lowest</button>
-            <button id="sort-comparisons" onclick="PhotoRanker.setRankingsSort('comparisons')">Most Compared</button>
-            <button id="sort-least_compared" onclick="PhotoRanker.setRankingsSort('least_compared')">Least Compared</button>
-            <button id="sort-newest" onclick="PhotoRanker.setRankingsSort('newest')">Newest</button>
-            <button id="sort-filename" onclick="PhotoRanker.setRankingsSort('filename')">Filename</button>
+            <button id="sort-elo" class="active" onclick="PhotoArchive.setRankingsSort('elo')">Top Rated</button>
+            <button id="sort-ai" onclick="PhotoArchive.setRankingsSort('ai')">AI Ranked</button>
+            <button id="sort-elo_asc" onclick="PhotoArchive.setRankingsSort('elo_asc')">Lowest</button>
+            <button id="sort-comparisons" onclick="PhotoArchive.setRankingsSort('comparisons')">Most Compared</button>
+            <button id="sort-least_compared" onclick="PhotoArchive.setRankingsSort('least_compared')">Least Compared</button>
+            <button id="sort-newest" onclick="PhotoArchive.setRankingsSort('newest')">Newest</button>
+            <button id="sort-filename" onclick="PhotoArchive.setRankingsSort('filename')">Filename</button>
         </div>
     </div>
     <div class="bar-divider"></div>
@@ -51,8 +51,8 @@
     </div>
     <div class="bar-divider"></div>
     <div class="bar-section bar-export">
-        <button class="bar-btn" onclick="PhotoRanker.exportRankings('json')">JSON</button>
-        <button class="bar-btn" onclick="PhotoRanker.exportRankings('csv')">CSV</button>
+        <button class="bar-btn" onclick="PhotoArchive.exportRankings('json')">JSON</button>
+        <button class="bar-btn" onclick="PhotoArchive.exportRankings('csv')">CSV</button>
     </div>
     <div class="bar-section bar-nav">
         <a href="/compare" class="bar-link">Compare</a>
@@ -62,6 +62,6 @@
 
 {% block scripts %}
 <script>
-    document.addEventListener('DOMContentLoaded', () => PhotoRanker.initLibrary());
+    document.addEventListener('DOMContentLoaded', () => PhotoArchive.initLibrary());
 </script>
 {% endblock %}

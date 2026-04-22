@@ -13,7 +13,7 @@ import scanner
 import thumbnails
 import pairing
 
-app = FastAPI(title="PhotoRanker")
+app = FastAPI(title="photoArchive")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 

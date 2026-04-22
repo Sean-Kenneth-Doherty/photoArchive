@@ -1,5 +1,5 @@
 """
-Qwen3-VL-Embedding + active learning taste model for PhotoRanker.
+Qwen3-VL-Embedding + active learning taste model for photoArchive.
 
 Background worker that:
 1. Embeds kept/maybe images using Qwen3-VL-Embedding-8B (int4 quantized)
