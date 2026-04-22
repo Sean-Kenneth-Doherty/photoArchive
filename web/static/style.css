@@ -1306,88 +1306,167 @@ button:disabled {
     cursor: pointer;
 }
 
-/* Lightbox */
-.lightbox {
+/* Loupe View (Lightroom-style) */
+.loupe {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.95);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    background: #111;
     z-index: 1000;
-}
-
-.lightbox-center {
-    flex: 1;
     display: flex;
     flex-direction: column;
+}
+
+.loupe-main {
+    flex: 1;
+    display: flex;
     align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    min-width: 0;
+    min-height: 0;
+    position: relative;
 }
 
-.lightbox img {
-    max-width: 85vw;
-    max-height: 88vh;
-    object-fit: contain;
-}
-
-.lightbox-info {
-    color: #888;
-    font-size: 13px;
-    margin-top: 12px;
-    text-align: center;
-}
-
-.lightbox-nav {
-    width: 60px;
+.loupe-image-wrap {
+    flex: 1;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 48px;
-    color: #555;
+    min-width: 0;
+    min-height: 0;
+    padding: 8px;
+}
+
+.loupe-image-wrap img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    transition: opacity 0.15s;
+}
+
+.loupe-nav {
+    width: 50px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 36px;
+    color: #333;
     cursor: pointer;
     transition: color 0.15s;
     user-select: none;
     flex-shrink: 0;
 }
 
-.lightbox-nav:hover {
-    color: #fff;
+.loupe-nav:hover {
+    color: #aaa;
 }
 
-.lightbox-meta {
-    text-align: center;
-}
-
-.lightbox-exif {
-    color: #666;
-    font-size: 12px;
-    margin-top: 4px;
-    font-family: monospace;
-}
-
-.lightbox-actions {
-    margin-top: 8px;
+.loupe-info-bar {
+    position: absolute;
+    bottom: 0;
+    left: 50px;
+    right: 50px;
     display: flex;
-    gap: 8px;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 8px 16px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.6));
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.loupe-main:hover .loupe-info-bar {
+    opacity: 1;
+}
+
+.loupe-info {
+    color: #bbb;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.loupe-exif {
+    color: #777;
+    font-size: 11px;
+    font-family: monospace;
+    white-space: nowrap;
+}
+
+.loupe-actions {
+    display: flex;
+    gap: 6px;
 }
 
 .lightbox-btn {
-    padding: 6px 14px;
-    font-size: 12px;
-    background: rgba(255,255,255,0.1);
-    color: #aaa;
-    border: 1px solid rgba(255,255,255,0.15);
+    padding: 5px 12px;
+    font-size: 11px;
+    background: rgba(255,255,255,0.08);
+    color: #999;
+    border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
     cursor: pointer;
     transition: background 0.15s, color 0.15s;
 }
 
 .lightbox-btn:hover {
-    background: rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.18);
     color: #fff;
+}
+
+/* Filmstrip */
+.filmstrip {
+    height: 80px;
+    background: #0a0a0a;
+    border-top: 1px solid #222;
+    flex-shrink: 0;
+    overflow: hidden;
+}
+
+.filmstrip-scroll {
+    display: flex;
+    gap: 2px;
+    height: 100%;
+    padding: 4px 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-behavior: smooth;
+}
+
+.filmstrip-scroll::-webkit-scrollbar {
+    height: 3px;
+}
+
+.filmstrip-scroll::-webkit-scrollbar-track {
+    background: #0a0a0a;
+}
+
+.filmstrip-scroll::-webkit-scrollbar-thumb {
+    background: #333;
+    border-radius: 2px;
+}
+
+.filmstrip-thumb {
+    height: 100%;
+    flex-shrink: 0;
+    cursor: pointer;
+    border: 2px solid transparent;
+    border-radius: 3px;
+    overflow: hidden;
+    opacity: 0.5;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+
+.filmstrip-thumb:hover {
+    opacity: 0.8;
+}
+
+.filmstrip-thumb.active {
+    opacity: 1;
+    border-color: #fff;
+}
+
+.filmstrip-thumb img {
+    height: 100%;
+    width: auto;
+    display: block;
 }
 
 /* Batch selection mode */

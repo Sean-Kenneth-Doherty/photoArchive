@@ -12,20 +12,26 @@
     <div class="rankings-grid" id="rankings-grid">
     </div>
 
-    <!-- Lightbox overlay -->
-    <div class="lightbox hidden" id="lightbox">
-        <div class="lightbox-nav lightbox-prev" onclick="event.stopPropagation(); PhotoArchive.lightboxPrev()">&#8249;</div>
-        <div class="lightbox-center" onclick="PhotoArchive.closeLightbox()">
-            <img id="lightbox-img" src="" alt="">
-            <div class="lightbox-meta">
-                <div class="lightbox-info" id="lightbox-info"></div>
-                <div class="lightbox-exif" id="lightbox-exif"></div>
+    <!-- Loupe view (Lightroom-style full screen + filmstrip) -->
+    <div class="loupe hidden" id="loupe">
+        <div class="loupe-main">
+            <div class="loupe-nav loupe-prev" onclick="PhotoArchive.lightboxPrev()">&#8249;</div>
+            <div class="loupe-image-wrap">
+                <img id="loupe-img" src="" alt="">
             </div>
-            <div class="lightbox-actions">
-                <button class="lightbox-btn" onclick="event.stopPropagation(); PhotoArchive.findSimilar()">Find Similar</button>
+            <div class="loupe-nav loupe-next" onclick="PhotoArchive.lightboxNext()">&#8250;</div>
+            <div class="loupe-info-bar">
+                <div class="loupe-info" id="loupe-info"></div>
+                <div class="loupe-exif" id="loupe-exif"></div>
+                <div class="loupe-actions">
+                    <button class="lightbox-btn" onclick="PhotoArchive.findSimilar()">Find Similar</button>
+                    <button class="lightbox-btn" onclick="PhotoArchive.closeLightbox()">Back to Grid</button>
+                </div>
             </div>
         </div>
-        <div class="lightbox-nav lightbox-next" onclick="event.stopPropagation(); PhotoArchive.lightboxNext()">&#8250;</div>
+        <div class="filmstrip" id="filmstrip">
+            <div class="filmstrip-scroll" id="filmstrip-scroll"></div>
+        </div>
     </div>
 </div>
 {% endblock %}

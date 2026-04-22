@@ -814,10 +814,10 @@ const PhotoArchive = (() => {
             }
         });
 
-        // Lightbox keyboard navigation
+        // Loupe keyboard navigation
         document.addEventListener('keydown', (e) => {
-            const lb = document.getElementById('lightbox');
-            if (!lb || lb.classList.contains('hidden')) return;
+            const loupe = document.getElementById('loupe');
+            if (!loupe || loupe.classList.contains('hidden')) return;
             if (e.key === 'ArrowRight') { e.preventDefault(); lightboxNext(); }
             else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxPrev(); }
             else if (e.key === 'Escape') { closeLightbox(); }
@@ -990,24 +990,73 @@ const PhotoArchive = (() => {
 
     function openLightbox(img) {
         lightboxIndex = libraryImages.findIndex(i => i.id === img.id);
-        showLightboxImage(img);
+        if (lightboxIndex < 0) lightboxIndex = 0;
+        buildFilmstrip();
+        showLoupeImage(libraryImages[lightboxIndex]);
     }
 
-    function showLightboxImage(img) {
-        const lb = document.getElementById('lightbox');
-        const lbImg = document.getElementById('lightbox-img');
-        const lbInfo = document.getElementById('lightbox-info');
-        const lbExif = document.getElementById('lightbox-exif');
-        lbImg.src = `/api/thumb/md/${img.id}`;
+    function buildFilmstrip() {
+        const scroll = document.getElementById('filmstrip-scroll');
+        if (!scroll) return;
+        scroll.innerHTML = '';
+        for (let i = 0; i < libraryImages.length; i++) {
+            const img = libraryImages[i];
+            const thumb = document.createElement('div');
+            thumb.className = 'filmstrip-thumb' + (i === lightboxIndex ? ' active' : '');
+            thumb.dataset.idx = i;
+            thumb.onclick = () => {
+                lightboxIndex = i;
+                showLoupeImage(libraryImages[i]);
+            };
+            thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}">`;
+            scroll.appendChild(thumb);
+        }
+    }
+
+    function updateFilmstripActive() {
+        const scroll = document.getElementById('filmstrip-scroll');
+        if (!scroll) return;
+        scroll.querySelectorAll('.filmstrip-thumb').forEach((el, i) => {
+            el.classList.toggle('active', i === lightboxIndex);
+        });
+        // Scroll active thumb into view
+        const active = scroll.querySelector('.filmstrip-thumb.active');
+        if (active) {
+            active.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+        }
+    }
+
+    function showLoupeImage(img) {
+        const loupe = document.getElementById('loupe');
+        const loupeImg = document.getElementById('loupe-img');
+        const infoEl = document.getElementById('loupe-info');
+        const exifEl = document.getElementById('loupe-exif');
+
+        // Progressive loading: sm (instant) → md (fast) → full
+        loupeImg.src = img.thumb_url; // sm, already cached
+        const md = new Image();
+        md.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = md.src; };
+        md.src = `/api/thumb/md/${img.id}`;
+        const lg = new Image();
+        lg.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = lg.src; };
+        lg.src = `/api/thumb/lg/${img.id}`;
+
+        // Info
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = '★'.repeat(stars) + '☆'.repeat(5 - stars);
-        lbInfo.textContent = `${img.filename}  ·  ${img.elo} Elo  ·  ${starStr}  ·  ${img.comparisons} comparisons`;
-        if (lbExif) lbExif.textContent = '';
-        lb.classList.remove('hidden');
+        if (infoEl) infoEl.textContent = `${img.filename}  ·  ${img.elo} Elo  ·  ${starStr}  ·  ${img.comparisons} cmp`;
+        if (exifEl) exifEl.textContent = '';
 
-        // Load EXIF asynchronously
+        loupe.classList.remove('hidden');
+        updateFilmstripActive();
+
+        // Prefetch neighbors
+        if (lightboxIndex > 0) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex - 1].id}`);
+        if (lightboxIndex < libraryImages.length - 1) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex + 1].id}`);
+
+        // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
-            if (!lbExif || !data.exif) return;
+            if (!exifEl || !data.exif || libraryImages[lightboxIndex]?.id !== img.id) return;
             const e = data.exif;
             const parts = [];
             if (e.camera_model) parts.push(e.camera_model);
@@ -1017,24 +1066,25 @@ const PhotoArchive = (() => {
             if (e.shutter_speed) parts.push(e.shutter_speed + 's');
             if (e.iso) parts.push('ISO ' + e.iso);
             if (e.date) parts.push(e.date);
-            lbExif.textContent = parts.join('  ·  ');
+            exifEl.textContent = parts.join('  ·  ');
         }).catch(() => {});
     }
 
     function lightboxNext() {
         if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length - 1) return;
         lightboxIndex++;
-        showLightboxImage(libraryImages[lightboxIndex]);
+        showLoupeImage(libraryImages[lightboxIndex]);
     }
 
     function lightboxPrev() {
         if (lightboxIndex <= 0) return;
         lightboxIndex--;
-        showLightboxImage(libraryImages[lightboxIndex]);
+        showLoupeImage(libraryImages[lightboxIndex]);
     }
 
     function closeLightbox() {
-        document.getElementById('lightbox').classList.add('hidden');
+        const loupe = document.getElementById('loupe');
+        if (loupe) loupe.classList.add('hidden');
         lightboxIndex = -1;
     }
 
