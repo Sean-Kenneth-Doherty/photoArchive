@@ -9,9 +9,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import db
-import scanner
-import thumbnails
 import pairing
+import scanner
+import settings
+import thumbnails
 
 app = FastAPI(title="photoArchive")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
@@ -24,6 +25,7 @@ _cull_history: list[dict] = []
 @app.on_event("startup")
 async def startup():
     await db.init_db()
+    thumbnails.configure(settings.load_settings())
     asyncio.create_task(thumbnails.run_prefetch_worker())
     asyncio.create_task(classify_orientations_background())
     try:
@@ -101,6 +103,11 @@ async def library_page(request: Request):
     return templates.TemplateResponse(request, "library.html")
 
 
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    return templates.TemplateResponse(request, "settings.html")
+
+
 # --- Scan API ---
 
 @app.post("/api/scan")
@@ -117,7 +124,12 @@ async def start_scan(request: Request):
         # Start prefetching thumbnails for early images
         if count <= 200:
             images = await db.get_unculled_images(limit=50)
-            await thumbnails.prefetch_images([dict(r) for r in images], "lg", limit=20)
+            config = settings.get_settings()
+            await thumbnails.prefetch_images(
+                [dict(r) for r in images],
+                "lg",
+                limit=min(len(images), config["scan_prefetch_limit"]),
+            )
 
     asyncio.create_task(scanner.scan_folder(folder, on_batch=on_batch))
     return {"status": "started", "folder": folder}
@@ -170,6 +182,49 @@ async def cache_status(ahead: int = 100):
     return {"total": total, "cached": cached, "window": ahead}
 
 
+# --- Settings API ---
+
+@app.get("/api/settings")
+async def api_settings():
+    return {
+        "settings": settings.get_settings(),
+        "cache_stats": thumbnails.cache_stats(),
+        **settings.settings_metadata(),
+    }
+
+
+@app.post("/api/settings")
+async def api_save_settings(request: Request):
+    saved = settings.save_settings(await request.json())
+    thumbnails.configure(saved)
+    return {
+        "ok": True,
+        "settings": saved,
+        "cache_stats": thumbnails.cache_stats(),
+    }
+
+
+@app.post("/api/settings/reset")
+async def api_reset_settings():
+    saved = settings.reset_settings()
+    thumbnails.configure(saved)
+    return {
+        "ok": True,
+        "settings": saved,
+        "cache_stats": thumbnails.cache_stats(),
+    }
+
+
+@app.post("/api/cache/clear")
+async def api_clear_thumbnail_cache():
+    result = thumbnails.clear_cache()
+    return {
+        "ok": True,
+        **result,
+        "cache_stats": thumbnails.cache_stats(),
+    }
+
+
 # --- Cull API ---
 
 @app.get("/api/cull/next")
@@ -191,7 +246,12 @@ async def cull_next(n: int = 10, size: str = "lg", orientation: str = ""):
         result.append({"id": d["id"], "filename": d["filename"], "thumb_url": f"/api/thumb/{size}/{d['id']}"})
 
     if prefetch_rows:
-        await thumbnails.prefetch_images(prefetch_rows, size, limit=min(len(prefetch_rows), 24))
+        config = settings.get_settings()
+        await thumbnails.prefetch_images(
+            prefetch_rows,
+            size,
+            limit=min(len(prefetch_rows), config["cull_prefetch_limit"]),
+        )
 
     stats = await db.get_stats()
     return {"images": result, "stats": stats}
@@ -347,11 +407,17 @@ async def mosaic_next(
             "id": img["id"],
             "filename": img["filename"],
             "elo": round(img["effective_elo"], 1),
+            "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img['id']}",
         })
 
     if sample:
-        await thumbnails.prefetch_images(sample, "sm", limit=min(len(sample), 24))
+        config = settings.get_settings()
+        await thumbnails.prefetch_images(
+            sample,
+            "sm",
+            limit=min(len(sample), config["mosaic_prefetch_limit"]),
+        )
 
     stats = await db.get_stats()
     return {"images": result, "total_kept": len(images), "stats": stats}
@@ -437,7 +503,12 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
         })
 
     if prefetch_rows:
-        await thumbnails.prefetch_images(prefetch_rows, "md", limit=min(len(prefetch_rows), 16))
+        config = settings.get_settings()
+        await thumbnails.prefetch_images(
+            prefetch_rows,
+            "md",
+            limit=min(len(prefetch_rows), config["compare_prefetch_limit"]),
+        )
 
     stats = await db.get_stats()
     return {"pairs": result, "total_kept": len(image_dicts), "stats": stats}

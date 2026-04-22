@@ -191,6 +191,11 @@ def configure(config: dict):
         DISK_CACHE_DIR = disk_cache_dir
         _ensure_disk_cache_dirs()
 
+    with _cache_lock:
+        for size, cache in _cache.items():
+            while len(cache) > CACHE_LIMITS[size]:
+                cache.popitem(last=False)
+
     user_workers = int(config.get("user_workers", _executor_workers))
     if user_workers != _executor_workers:
         _executor = _replace_executor(_executor, user_workers, "thumb")

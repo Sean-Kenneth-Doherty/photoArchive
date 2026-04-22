@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}photoArchive — Settings{% endblock %}
+{% block content %}
+<div class="settings-page">
+    <div class="settings-hero">
+        <div>
+            <h1>Performance Settings</h1>
+            <p>Tune thumbnail generation, caching, and prefetch behavior. Changes apply immediately to new requests.</p>
+        </div>
+        <div class="settings-status" id="settings-status">Loading current settings…</div>
+    </div>
+
+    <form class="settings-grid" id="settings-form">
+        <section class="settings-card">
+            <h2>Thumbnail Output</h2>
+            <p class="settings-card-copy">Larger sizes improve fidelity but cost more CPU, disk, and bandwidth.</p>
+            <label class="settings-field">
+                <span>Small width</span>
+                <input id="thumb_size_sm" type="number" min="64" max="4096" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Medium width</span>
+                <input id="thumb_size_md" type="number" min="128" max="8192" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Large width</span>
+                <input id="thumb_size_lg" type="number" min="128" max="8192" step="1">
+            </label>
+            <label class="settings-field">
+                <span>JPEG quality</span>
+                <input id="jpeg_quality" type="number" min="40" max="100" step="1">
+            </label>
+        </section>
+
+        <section class="settings-card">
+            <h2>Memory Cache</h2>
+            <p class="settings-card-copy">These are in-memory thumbnail entry counts. Higher values keep more hot images ready.</p>
+            <label class="settings-field">
+                <span>Small cache entries</span>
+                <input id="cache_limit_sm" type="number" min="0" max="20000" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Medium cache entries</span>
+                <input id="cache_limit_md" type="number" min="0" max="5000" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Large cache entries</span>
+                <input id="cache_limit_lg" type="number" min="0" max="5000" step="1">
+            </label>
+            <div class="settings-metric-list">
+                <div>Current RAM cache: <strong id="cache-stats-inline">—</strong></div>
+            </div>
+        </section>
+
+        <section class="settings-card">
+            <h2>Workers</h2>
+            <p class="settings-card-copy">User workers serve on-demand thumbs. Prefetch workers fill the cache in the background.</p>
+            <label class="settings-field">
+                <span>User request workers</span>
+                <input id="user_workers" type="number" min="1" max="32" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Prefetch workers</span>
+                <input id="prefetch_workers" type="number" min="1" max="16" step="1">
+            </label>
+        </section>
+
+        <section class="settings-card">
+            <h2>Prefetch Depth</h2>
+            <p class="settings-card-copy">These control how aggressively the app warms future thumbnails after a response is sent.</p>
+            <label class="settings-field">
+                <span>Scan warm-up limit</span>
+                <input id="scan_prefetch_limit" type="number" min="0" max="200" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Cull warm-up limit</span>
+                <input id="cull_prefetch_limit" type="number" min="0" max="200" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Compare warm-up limit</span>
+                <input id="compare_prefetch_limit" type="number" min="0" max="200" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Mosaic warm-up limit</span>
+                <input id="mosaic_prefetch_limit" type="number" min="0" max="200" step="1">
+            </label>
+        </section>
+
+        <section class="settings-card">
+            <h2>Browser Cache</h2>
+            <p class="settings-card-copy">These values tune how long browsers can reuse thumbnails before revalidating them.</p>
+            <label class="settings-field">
+                <span>Max age seconds</span>
+                <input id="browser_cache_max_age" type="number" min="0" max="31536000" step="1">
+            </label>
+            <label class="settings-field">
+                <span>Stale-while-revalidate seconds</span>
+                <input id="browser_cache_stale_while_revalidate" type="number" min="0" max="31536000" step="1">
+            </label>
+        </section>
+
+        <section class="settings-card settings-card-wide">
+            <h2>Disk Cache</h2>
+            <p class="settings-card-copy">Point this at fast local storage for the biggest responsiveness gain, especially if originals live on HDD.</p>
+            <label class="settings-field">
+                <span>Cache directory</span>
+                <input id="disk_cache_dir" type="text" spellcheck="false" autocomplete="off">
+            </label>
+            <div class="settings-metric-list">
+                <div>Settings file: <code id="settings-path">—</code></div>
+                <div>Tip: changing output size or JPEG quality creates new cache keys. Use “Clear Cache” if you want to reclaim old files.</div>
+            </div>
+        </section>
+    </form>
+</div>
+{% endblock %}
+
+{% block bottom_bar %}
+<footer class="bottom-bar" id="settings-bar">
+    <div class="bar-section">
+        <button class="bar-btn" type="button" onclick="PhotoArchive.saveSettings()">Save</button>
+        <button class="bar-btn" type="button" onclick="PhotoArchive.resetSettings()">Reset Defaults</button>
+        <button class="bar-btn" type="button" onclick="PhotoArchive.clearThumbnailCache()">Clear Cache</button>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-settings-note">
+        Changes apply immediately to new thumbnail requests.
+    </div>
+    <div class="bar-section bar-nav">
+        <a href="/compare" class="bar-link">Compare</a>
+        <a href="/library" class="bar-link">Library</a>
+    </div>
+</footer>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', () => PhotoArchive.initSettings());
+</script>
+{% endblock %}

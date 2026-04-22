@@ -326,38 +326,43 @@ const PhotoArchive = (() => {
         const grid = document.getElementById('mosaic-grid');
         grid.innerHTML = '';
 
-        // Calculate best cols/rows to minimize dead space for the viewport
+        // Calculate row height to fit all images in the viewport
+        // using the same justified flex layout as the library
+        const gap = 3;
+        const containerW = grid.clientWidth || window.innerWidth;
+        const containerH = grid.clientHeight || (window.innerHeight - 60);
         const n = mosaicImages.length;
-        const barHeight = 40;
-        const vw = window.innerWidth;
-        const vh = window.innerHeight - barHeight;
-        const aspect = vw / vh;
 
-        // Try different column counts and pick the one whose cell aspect ratio
-        // is closest to 3:2 (typical photo aspect ratio)
-        const targetAspect = 3 / 2;
-        let bestCols = 4;
-        let bestScore = Infinity;
-        for (let c = 2; c <= 6; c++) {
-            const r = Math.ceil(n / c);
-            const cellW = vw / c;
-            const cellH = vh / r;
-            const cellAspect = cellW / cellH;
-            const score = Math.abs(cellAspect - targetAspect);
-            if (score < bestScore) {
-                bestScore = score;
-                bestCols = c;
+        // Simulate row packing to find the right row height
+        // Binary search for the height that fits all images in the container
+        let lo = 60, hi = containerH;
+        for (let iter = 0; iter < 20; iter++) {
+            const mid = (lo + hi) / 2;
+            let rows = 1, rowW = 0;
+            for (const img of mosaicImages) {
+                const ar = img.aspect_ratio || 1.5;
+                const w = mid * ar + gap;
+                if (rowW + w > containerW + gap && rowW > 0) {
+                    rows++;
+                    rowW = w;
+                } else {
+                    rowW += w;
+                }
             }
+            const totalH = rows * (mid + gap);
+            if (totalH > containerH) hi = mid;
+            else lo = mid;
         }
-        const cols = bestCols;
-        const rows = Math.ceil(n / cols);
-        grid.style.setProperty('--mosaic-cols', cols);
-        grid.style.setProperty('--mosaic-rows', rows);
+        const rowH = Math.floor(lo);
 
         for (const img of mosaicImages) {
+            const ar = img.aspect_ratio || 1.5;
             const cell = document.createElement('div');
             cell.className = 'mosaic-cell';
             cell.dataset.id = img.id;
+            cell.style.height = rowH + 'px';
+            cell.style.flexGrow = ar;
+            cell.style.flexBasis = (rowH * ar) + 'px';
             cell.onclick = () => mosaicClick(img.id);
             cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}">`;
             preloadImage(img.thumb_url);
@@ -1228,6 +1233,146 @@ const PhotoArchive = (() => {
         window.open(`/api/export?format=${format}`, '_blank');
     }
 
+    // ==================== SETTINGS ====================
+
+    const SETTINGS_FIELDS = [
+        'thumb_size_sm',
+        'thumb_size_md',
+        'thumb_size_lg',
+        'jpeg_quality',
+        'cache_limit_sm',
+        'cache_limit_md',
+        'cache_limit_lg',
+        'disk_cache_dir',
+        'user_workers',
+        'prefetch_workers',
+        'browser_cache_max_age',
+        'browser_cache_stale_while_revalidate',
+        'scan_prefetch_limit',
+        'cull_prefetch_limit',
+        'compare_prefetch_limit',
+        'mosaic_prefetch_limit',
+    ];
+
+    function setSettingsStatus(message, tone = '') {
+        const el = document.getElementById('settings-status');
+        if (!el) return;
+        el.textContent = message;
+        el.className = 'settings-status' + (tone ? ' ' + tone : '');
+    }
+
+    function renderSettingsMeta(data) {
+        const cacheEl = document.getElementById('cache-stats-inline');
+        const pathEl = document.getElementById('settings-path');
+        if (cacheEl && data.cache_stats) {
+            const stats = data.cache_stats;
+            cacheEl.textContent = `sm ${stats.sm || 0} · md ${stats.md || 0} · lg ${stats.lg || 0}`;
+        }
+        if (pathEl && data.settings_path) {
+            pathEl.textContent = data.settings_path;
+        }
+    }
+
+    function populateSettingsForm(settings) {
+        for (const field of SETTINGS_FIELDS) {
+            const input = document.getElementById(field);
+            if (!input || settings[field] === undefined || settings[field] === null) continue;
+            input.value = settings[field];
+        }
+    }
+
+    function collectSettingsForm() {
+        const payload = {};
+        for (const field of SETTINGS_FIELDS) {
+            const input = document.getElementById(field);
+            if (!input) continue;
+            payload[field] = input.type === 'number' ? parseInt(input.value || '0', 10) : input.value;
+        }
+        return payload;
+    }
+
+    async function loadSettingsPage(showStatus = true) {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        populateSettingsForm(data.settings || {});
+        renderSettingsMeta(data);
+        if (showStatus) {
+            setSettingsStatus('Loaded current settings.', 'muted');
+        }
+        return data;
+    }
+
+    async function initSettings() {
+        const form = document.getElementById('settings-form');
+        if (form) {
+            form.addEventListener('submit', (e) => {
+                e.preventDefault();
+                saveSettings();
+            });
+        }
+
+        try {
+            await loadSettingsPage(false);
+            setSettingsStatus('Ready. Save to apply changes immediately.', 'muted');
+        } catch (err) {
+            setSettingsStatus(`Could not load settings: ${err.message}`, 'error');
+        }
+    }
+
+    async function saveSettings() {
+        setSettingsStatus('Saving settings…', 'muted');
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectSettingsForm()),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Save failed');
+            }
+            populateSettingsForm(data.settings || {});
+            renderSettingsMeta(data);
+            setSettingsStatus('Saved. New requests are using the updated runtime settings.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Save failed: ${err.message}`, 'error');
+        }
+    }
+
+    async function resetSettings() {
+        setSettingsStatus('Resetting to defaults…', 'muted');
+        try {
+            const res = await fetch('/api/settings/reset', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Reset failed');
+            }
+            populateSettingsForm(data.settings || {});
+            renderSettingsMeta(data);
+            setSettingsStatus('Defaults restored. Runtime settings were updated.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Reset failed: ${err.message}`, 'error');
+        }
+    }
+
+    async function clearThumbnailCache() {
+        setSettingsStatus('Clearing in-memory and disk thumbnail cache…', 'muted');
+        try {
+            const res = await fetch('/api/cache/clear', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Cache clear failed');
+            }
+            renderSettingsMeta(data);
+            setSettingsStatus(
+                `Cleared ${data.memory_entries_cleared || 0} RAM entries and ${data.disk_files_removed || 0} disk files.`,
+                'success'
+            );
+        } catch (err) {
+            setSettingsStatus(`Cache clear failed: ${err.message}`, 'error');
+        }
+    }
+
     // ==================== UTILITIES ====================
 
     const PRELOAD_LIMIT = 200;
@@ -1255,6 +1400,7 @@ const PhotoArchive = (() => {
         initCompare,
         initLibrary,
         initRankings,
+        initSettings,
         clearSearch,
         setCullMode,
         setCompareMode,
@@ -1278,5 +1424,8 @@ const PhotoArchive = (() => {
         mosaicShuffle,
         setMosaicStrategy,
         toggleAIPanel,
+        saveSettings,
+        resetSettings,
+        clearThumbnailCache,
     };
 })();
