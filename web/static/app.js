@@ -1323,14 +1323,6 @@ const PhotoArchive = (() => {
         'ssd_cache_dir',
         'ssd_cache_gb',
         'pregenerate_on_idle',
-        'user_workers',
-        'prefetch_workers',
-        'browser_cache_max_age',
-        'browser_cache_stale_while_revalidate',
-        'scan_prefetch_limit',
-        'cull_prefetch_limit',
-        'compare_prefetch_limit',
-        'mosaic_prefetch_limit',
     ];
     let settingsPoller = null;
 
@@ -1412,12 +1404,44 @@ const PhotoArchive = (() => {
         }
     }
 
+    function renderAutoTuningStatus(settings) {
+        if (!settings) return;
+
+        const workersEl = document.getElementById('cache-auto-workers');
+        const prefetchEl = document.getElementById('cache-auto-prefetch');
+        const browserEl = document.getElementById('cache-browser-policy');
+
+        if (workersEl) {
+            const cpu = Number(settings.cpu_count || 0);
+            const ram = settings.system_memory_gb ? `${settings.system_memory_gb} GB system RAM` : 'system RAM unknown';
+            workersEl.textContent =
+                `${Number(settings.user_workers || 0)} request · ${Number(settings.prefetch_workers || 0)} background` +
+                (cpu > 0 ? ` on ${cpu} CPU threads` : '') +
+                ` · ${ram}`;
+        }
+
+        if (prefetchEl) {
+            prefetchEl.textContent =
+                `scan ${Number(settings.scan_prefetch_limit || 0)} · ` +
+                `cull ${Number(settings.cull_prefetch_limit || 0)} · ` +
+                `compare ${Number(settings.compare_prefetch_limit || 0)} · ` +
+                `mosaic ${Number(settings.mosaic_prefetch_limit || 0)}`;
+        }
+
+        if (browserEl) {
+            const maxAge = Number(settings.browser_cache_max_age || 0);
+            const stale = Number(settings.browser_cache_stale_while_revalidate || 0);
+            browserEl.textContent = `${maxAge.toLocaleString()}s max-age · ${stale.toLocaleString()}s stale-while-revalidate`;
+        }
+    }
+
     function renderSettingsMeta(data) {
         const pathEl = document.getElementById('settings-path');
         renderCacheSettingsStatus(data.cache_stats);
         if (pathEl && data.settings_path) {
             pathEl.textContent = data.settings_path;
         }
+        renderAutoTuningStatus(data.settings);
         renderModelStatus(data.model_status);
         renderAISettingsStatus(data.ai_status);
     }

@@ -62,43 +62,9 @@
             </label>
         </section>
 
-        <section class="settings-card">
-            <h2>Workers</h2>
-            <p class="settings-card-copy">User workers serve on-demand thumbs. Prefetch workers fill the cache in the background.</p>
-            <label class="settings-field">
-                <span>User request workers</span>
-                <input id="user_workers" type="number" min="1" max="32" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Prefetch workers</span>
-                <input id="prefetch_workers" type="number" min="1" max="16" step="1">
-            </label>
-        </section>
-
-        <section class="settings-card">
-            <h2>Prefetch Depth</h2>
-            <p class="settings-card-copy">These control how aggressively the app warms future thumbnails after a response is sent.</p>
-            <label class="settings-field">
-                <span>Scan warm-up limit</span>
-                <input id="scan_prefetch_limit" type="number" min="0" max="200" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Cull warm-up limit</span>
-                <input id="cull_prefetch_limit" type="number" min="0" max="200" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Compare warm-up limit</span>
-                <input id="compare_prefetch_limit" type="number" min="0" max="200" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Mosaic warm-up limit</span>
-                <input id="mosaic_prefetch_limit" type="number" min="0" max="200" step="1">
-            </label>
-        </section>
-
         <section class="settings-card settings-card-wide">
             <h2>Cache</h2>
-            <p class="settings-card-copy">RAM, SSD, and browser thumbnail caching all live here. The SSD budget is split automatically across `sm`, `md`, `lg`, and full originals.</p>
+            <p class="settings-card-copy">RAM and SSD budgets live here. Worker counts, warm-up depth, and browser cache policy are tuned automatically for this desktop.</p>
             <label class="settings-field">
                 <span>RAM budget (GB)</span>
                 <input id="memory_cache_gb" type="number" min="0" max="64" step="0.25">
@@ -115,14 +81,6 @@
                 <input id="pregenerate_on_idle" type="checkbox">
                 <span>Pre-generate thumbnails while the app is idle</span>
             </label>
-            <label class="settings-field">
-                <span>Browser max age (seconds)</span>
-                <input id="browser_cache_max_age" type="number" min="0" max="31536000" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Browser stale-while-revalidate (seconds)</span>
-                <input id="browser_cache_stale_while_revalidate" type="number" min="0" max="31536000" step="1">
-            </label>
             <div class="settings-metric-list">
                 <div>RAM cache: <strong id="cache-stats-inline">—</strong></div>
                 <div>RAM tiers: <strong id="cache-ram-usage">—</strong></div>
@@ -132,6 +90,9 @@
                 <div id="cache-tier-lg">lg: —</div>
                 <div id="cache-tier-full">full: —</div>
                 <div>Pre-generation: <strong id="cache-pregen-summary">—</strong></div>
+                <div>Auto workers: <strong id="cache-auto-workers">—</strong></div>
+                <div>Auto warm-up: <strong id="cache-auto-prefetch">—</strong></div>
+                <div>Browser policy: <strong id="cache-browser-policy">—</strong></div>
                 <div>Settings file: <code id="settings-path">—</code></div>
                 <div>Tip: changing output size or JPEG quality creates new cache keys. Use “Clear Cache” if you want to reclaim old files.</div>
             </div>
