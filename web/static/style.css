@@ -66,12 +66,14 @@ a:hover {
     bottom: 0;
     left: 0;
     right: 0;
-    height: var(--bar-height);
+    min-height: var(--bar-height);
     background: #222;
     border-top: 1px solid #333;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    padding: 0 8px;
+    padding: 4px 8px;
+    gap: 2px 0;
     z-index: 100;
     font-size: 12px;
 }
@@ -165,11 +167,21 @@ a:hover {
 
 .toggle-group-sm {
     padding: 1px;
+    flex-wrap: wrap;
 }
 
 .toggle-group-sm button {
     padding: 4px 10px;
     font-size: 11px;
+    color: #999;
+}
+
+.toggle-group-sm button:hover {
+    color: #ddd;
+}
+
+.toggle-group-sm button.active {
+    color: #e0e0e0;
 }
 
 /* AI Info Panel */
