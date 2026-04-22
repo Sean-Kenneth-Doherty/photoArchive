@@ -464,20 +464,6 @@ async def store_embeddings_batch(rows: list[tuple[int, bytes]]):
         await db.close()
 
 
-async def get_training_data():
-    """Get embeddings + Elo for images with direct comparisons (training set)."""
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "SELECT e.image_id, e.embedding, i.elo FROM embeddings e "
-            "JOIN images i ON e.image_id = i.id "
-            "WHERE i.comparisons > 0"
-        )
-        return await cursor.fetchall()
-    finally:
-        await db.close()
-
-
 async def get_all_embeddings():
     """Get all embeddings for prediction pass."""
     db = await get_db()
@@ -488,28 +474,6 @@ async def get_all_embeddings():
             "WHERE i.status IN ('kept', 'maybe')"
         )
         return await cursor.fetchall()
-    finally:
-        await db.close()
-
-
-async def bulk_update_predictions(rows: list[tuple[float, float, int]]):
-    """Update predicted_elo and uncertainty. Each row: (predicted_elo, uncertainty, image_id)."""
-    db = await get_db()
-    try:
-        await db.executemany(
-            "UPDATE images SET predicted_elo = ?, uncertainty = ? WHERE id = ?",
-            rows,
-        )
-        await db.commit()
-    finally:
-        await db.close()
-
-
-async def get_comparison_count() -> int:
-    db = await get_db()
-    try:
-        cursor = await db.execute("SELECT COUNT(*) as c FROM comparisons")
-        return (await cursor.fetchone())["c"]
     finally:
         await db.close()
 

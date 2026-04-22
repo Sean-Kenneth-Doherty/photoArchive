@@ -1,11 +1,9 @@
 """
-Qwen3-VL-Embedding + active learning taste model for photoArchive.
+Embedding worker for photoArchive.
 
-Background worker that:
-1. Embeds kept/maybe images using Qwen3-VL-Embedding-8B (int4 quantized)
-2. Trains a Ridge regression (embedding -> predicted Elo) on comparison data
-3. Computes per-image uncertainty for smart mosaic selection
-4. Provides text-to-image search via shared embedding space
+Background worker that embeds images using Qwen3-VL-Embedding-2B (int4).
+Embeddings power: text search, find similar, Elo propagation, duplicate
+detection, and auto-collections.
 """
 
 import asyncio
@@ -22,19 +20,18 @@ import db
 import settings
 import thumbnails
 
-log = logging.getLogger("clip_worker")
+log = logging.getLogger("embedding_worker")
 log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
 EMBEDDING_DIM = 2048  # Native output dimension for Qwen3-VL-Embedding-2B
 BATCH_SIZE = 4  # Small batches for VL model
-RETRAIN_EVERY = 50
 EMBED_SPEED_WINDOW_SECONDS = 300
 EMBED_CANDIDATE_MULTIPLIER = 16
 EMBED_RETRY_SECONDS = 600
 
-# Module-level reference for text search (set by run_clip_worker on startup)
+# Module-level reference for text search (set by run_embedding_worker on startup)
 _model = None
 _loaded_model_dir = None
 _loaded_model_id = None
@@ -249,42 +246,12 @@ def blob_to_vec(blob: bytes) -> np.ndarray:
     return np.array(struct.unpack(f"{EMBEDDING_DIM}f", blob), dtype=np.float32)
 
 
-def _train_taste_model(training_rows):
-    """Train Ridge regression on (embedding, elo) pairs. Returns model params."""
-    from sklearn.linear_model import Ridge
-
-    X = np.array([blob_to_vec(row["embedding"]) for row in training_rows])
-    y = np.array([row["elo"] for row in training_rows])
-
-    model = Ridge(alpha=1.0)
-    model.fit(X, y)
-
-    # Precompute (X^T X + alpha*I)^{-1} for uncertainty estimation
-    XtX = X.T @ X + model.alpha * np.eye(EMBEDDING_DIM)
-    XtX_inv = np.linalg.inv(XtX)
-
-    return model.coef_, model.intercept_, XtX_inv
-
-
-def _predict_all(all_rows, coef, intercept, XtX_inv):
-    """Predict Elo and uncertainty for all embedded images."""
-    results = []
-    for row in all_rows:
-        vec = blob_to_vec(row["embedding"])
-        predicted_elo = float(vec @ coef + intercept)
-        uncertainty = float(vec @ XtX_inv @ vec)
-        results.append((predicted_elo, uncertainty, row["image_id"]))
-    return results
-
-
-async def run_clip_worker():
-    """Main background loop: embed, train, predict."""
+async def run_embedding_worker():
+    """Main background loop: embed images for search, similarity, and Elo propagation."""
     loop = asyncio.get_running_loop()
 
     global _model, _loaded_model_dir, _loaded_model_id, _loaded_model_revision
 
-    last_train_count = 0
-    has_model = False
 
     while True:
         try:
@@ -319,8 +286,6 @@ async def run_clip_worker():
                 _loaded_model_dir = model_dir
                 _loaded_model_id = model_id
                 _loaded_model_revision = model_revision
-                last_train_count = await db.get_comparison_count()
-                has_model = False
                 _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
 
             # Phase 1: Embed unembedded images
@@ -350,7 +315,6 @@ async def run_clip_worker():
                     _record_embedding_batch(len(batch), time.perf_counter() - embed_started)
                     embedded_count = await db.get_embedding_count()
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")
-                    has_model = False
 
                 if failed and not batch:
                     sample_error = failed[0][1]
@@ -372,32 +336,7 @@ async def run_clip_worker():
                 await asyncio.sleep(min(wait_for, 10))
                 continue
 
-            # Phase 2: Train/retrain the taste model
-            current_count = await db.get_comparison_count()
-            if not has_model or current_count - last_train_count >= RETRAIN_EVERY:
-                _set_worker_status("training", "Updating taste model predictions…", ready=True)
-                training_data = await db.get_training_data()
-                if len(training_data) >= 20:
-                    coef, intercept, XtX_inv = await loop.run_in_executor(
-                        None, _train_taste_model, training_data
-                    )
-
-                    all_embeddings = await db.get_all_embeddings()
-                    predictions = await loop.run_in_executor(
-                        None, _predict_all, all_embeddings, coef, intercept, XtX_inv
-                    )
-
-                    if predictions:
-                        await db.bulk_update_predictions(predictions)
-
-                    last_train_count = current_count
-                    has_model = True
-                    log.info(
-                        f"Taste model trained on {len(training_data)} images, "
-                        f"predicted {len(predictions)} ratings"
-                    )
-
-            _set_worker_status("idle", "Waiting for new images or comparisons…", ready=True)
+            _set_worker_status("idle", "Waiting for new images…", ready=True)
             await asyncio.sleep(5)
 
         except Exception as e:

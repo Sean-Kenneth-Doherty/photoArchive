@@ -47,10 +47,10 @@ async def startup():
     asyncio.create_task(thumbnails.run_prefetch_worker())
     asyncio.create_task(classify_orientations_background())
     try:
-        import clip_worker
-        asyncio.create_task(clip_worker.run_clip_worker())
+        import embedding_worker
+        asyncio.create_task(embedding_worker.run_embedding_worker())
     except ImportError:
-        pass  # CLIP features disabled — missing open-clip-torch or scikit-learn
+        pass  # AI features disabled — missing dependencies
 
 
 async def classify_orientations_background():
@@ -759,12 +759,12 @@ async def api_search(q: str = "", limit: int = 50):
         return {"images": [], "query": q}
 
     try:
-        import clip_worker
+        import embedding_worker
         import numpy as np
     except ImportError:
         return JSONResponse({"error": "CLIP not available"}, status_code=503)
 
-    text_vec = await asyncio.get_event_loop().run_in_executor(None, clip_worker.encode_text, q)
+    text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, q)
     if text_vec is None:
         return JSONResponse({"error": "CLIP model still loading"}, status_code=503)
 
@@ -774,7 +774,7 @@ async def api_search(q: str = "", limit: int = 50):
 
     # Compute cosine similarity against all image embeddings
     image_ids = [row["image_id"] for row in all_embeddings]
-    matrix = np.array([clip_worker.blob_to_vec(row["embedding"]) for row in all_embeddings])
+    matrix = np.array([embedding_worker.blob_to_vec(row["embedding"]) for row in all_embeddings])
     similarities = matrix @ text_vec  # already L2-normalized, so dot product = cosine sim
 
     # Get top results
@@ -807,7 +807,7 @@ async def api_search(q: str = "", limit: int = 50):
 async def api_similar(image_id: int, limit: int = 50):
     """Find visually similar images using embedding cosine similarity."""
     try:
-        import clip_worker
+        import embedding_worker
         import numpy as np
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
@@ -823,7 +823,7 @@ async def api_similar(image_id: int, limit: int = 50):
     if not row:
         return JSONResponse({"error": "Image not embedded yet"}, status_code=404)
 
-    source_vec = clip_worker.blob_to_vec(row["embedding"])
+    source_vec = embedding_worker.blob_to_vec(row["embedding"])
 
     all_embeddings = await db.get_all_embeddings()
     if not all_embeddings:
@@ -832,7 +832,7 @@ async def api_similar(image_id: int, limit: int = 50):
     # Compute cosine similarity against all other images
     image_ids = [r["image_id"] for r in all_embeddings]
     import numpy as np
-    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
     similarities = matrix @ source_vec
 
     # Exclude the source image and get top results
@@ -865,7 +865,7 @@ async def api_similar(image_id: int, limit: int = 50):
 async def api_duplicates(threshold: float = 0.95, limit: int = 100):
     """Find near-duplicate image pairs using embedding similarity."""
     try:
-        import clip_worker
+        import embedding_worker
         import numpy as np
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
@@ -875,7 +875,7 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
         return {"pairs": []}
 
     image_ids = [r["image_id"] for r in all_embeddings]
-    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
 
     # Compute pairwise similarities (upper triangle only)
     sim_matrix = matrix @ matrix.T
@@ -954,7 +954,7 @@ async def api_exif(image_id: int):
 async def api_collections(n_clusters: int = 20):
     """Auto-group images into collections using embedding clustering."""
     try:
-        import clip_worker
+        import embedding_worker
         import numpy as np
         from sklearn.cluster import KMeans
     except ImportError:
@@ -965,7 +965,7 @@ async def api_collections(n_clusters: int = 20):
         return {"collections": []}
 
     image_ids = [r["image_id"] for r in all_embeddings]
-    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
 
     kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
     labels = kmeans.fit_predict(matrix)
@@ -1051,8 +1051,8 @@ async def build_ai_status():
 
     worker_status = {}
     try:
-        import clip_worker
-        worker_status = clip_worker.get_worker_status()
+        import embedding_worker
+        worker_status = embedding_worker.get_worker_status()
     except Exception:
         worker_status = {
             "state": "unavailable",

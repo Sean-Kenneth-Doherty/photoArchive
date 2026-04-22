@@ -42,7 +42,7 @@ async def _ensure_embed_cache():
         return None, None
 
     try:
-        from clip_worker import blob_to_vec
+        from embedding_worker import blob_to_vec
     except ImportError:
         return None, None
 
