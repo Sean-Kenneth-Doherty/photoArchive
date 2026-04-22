@@ -27,7 +27,7 @@ log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
+EMBEDDING_DIM = 4096  # Full native dimension
 BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
 EMBED_SPEED_WINDOW_SECONDS = 300
@@ -167,7 +167,6 @@ def _load_model(model_dir: str, model_id: str):
         trust_remote_code=True,
         local_files_only=True,
     )
-    model.truncate_dim = EMBEDDING_DIM
     log.info(f"{model_id} loaded from {model_dir} (int4, {EMBEDDING_DIM}-dim)")
     return model
 
