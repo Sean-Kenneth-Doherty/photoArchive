@@ -16,11 +16,11 @@ DEFAULT_SETTINGS = {
     "thumb_size_sm": 400,
     "thumb_size_md": 1920,
     "thumb_size_lg": 3840,
-    "jpeg_quality": 92,
-    "cache_limit_sm": 2000,
-    "cache_limit_md": 300,
-    "cache_limit_lg": 500,
-    "disk_cache_dir": os.path.join(WEB_DIR, ".thumbcache"),
+    "thumb_quality": 92,
+    "ssd_cache_dir": os.path.join(WEB_DIR, ".thumbcache"),
+    "ssd_cache_gb": 10,
+    "memory_cache_mb": 512,
+    "pregenerate_on_idle": True,
     "user_workers": 4,
     "prefetch_workers": 2,
     "browser_cache_max_age": 86400,
@@ -38,10 +38,9 @@ INT_RANGES = {
     "thumb_size_sm": (64, 4096),
     "thumb_size_md": (128, 8192),
     "thumb_size_lg": (128, 8192),
-    "jpeg_quality": (40, 100),
-    "cache_limit_sm": (0, 20000),
-    "cache_limit_md": (0, 5000),
-    "cache_limit_lg": (0, 5000),
+    "thumb_quality": (40, 100),
+    "ssd_cache_gb": (0, 4096),
+    "memory_cache_mb": (0, 16384),
     "user_workers": (1, 32),
     "prefetch_workers": (1, 16),
     "browser_cache_max_age": (0, 31536000),
@@ -72,6 +71,26 @@ def normalize_settings(raw: dict | None) -> dict:
     if not isinstance(raw, dict):
         return normalized
 
+    if "thumb_quality" not in raw and "jpeg_quality" in raw:
+        raw = {**raw, "thumb_quality": raw.get("jpeg_quality")}
+    if "ssd_cache_dir" not in raw and "disk_cache_dir" in raw:
+        raw = {**raw, "ssd_cache_dir": raw.get("disk_cache_dir")}
+    if "memory_cache_mb" not in raw:
+        cache_limit_values = [
+            raw.get("cache_limit_sm"),
+            raw.get("cache_limit_md"),
+            raw.get("cache_limit_lg"),
+        ]
+        if any(value is not None for value in cache_limit_values):
+            try:
+                approx_entries = sum(int(value or 0) for value in cache_limit_values)
+                raw = {
+                    **raw,
+                    "memory_cache_mb": max(64, min(16384, approx_entries // 8 or 512)),
+                }
+            except (TypeError, ValueError):
+                pass
+
     model_id = (raw.get("embed_model_id") or normalized["embed_model_id"]).strip()
     if not model_id:
         model_id = normalized["embed_model_id"]
@@ -80,9 +99,9 @@ def normalize_settings(raw: dict | None) -> dict:
     revision = (raw.get("embed_model_revision") or normalized["embed_model_revision"]).strip()
     normalized["embed_model_revision"] = revision or "main"
 
-    normalized["disk_cache_dir"] = _resolve_cache_dir(
-        raw.get("disk_cache_dir", normalized["disk_cache_dir"]),
-        DEFAULT_SETTINGS["disk_cache_dir"],
+    normalized["ssd_cache_dir"] = _resolve_cache_dir(
+        raw.get("ssd_cache_dir", normalized["ssd_cache_dir"]),
+        DEFAULT_SETTINGS["ssd_cache_dir"],
     )
     normalized["embed_model_dir"] = _resolve_cache_dir(
         raw.get("embed_model_dir", _default_model_dir(model_id)),
@@ -101,6 +120,8 @@ def normalize_settings(raw: dict | None) -> dict:
         normalized["thumb_size_md"] = normalized["thumb_size_sm"]
     if normalized["thumb_size_md"] > normalized["thumb_size_lg"]:
         normalized["thumb_size_lg"] = normalized["thumb_size_md"]
+
+    normalized["pregenerate_on_idle"] = bool(raw.get("pregenerate_on_idle", normalized["pregenerate_on_idle"]))
 
     return normalized
 

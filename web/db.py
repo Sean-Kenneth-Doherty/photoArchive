@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS embeddings (
     embedding BLOB NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS cache_entries (
+    cache_root TEXT NOT NULL,
+    size TEXT NOT NULL,
+    image_id INTEGER NOT NULL REFERENCES images(id),
+    path TEXT NOT NULL,
+    source_signature TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    last_accessed REAL NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (cache_root, size, image_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_entries_root_size_access
+ON cache_entries(cache_root, size, last_accessed);
 """
 
 
