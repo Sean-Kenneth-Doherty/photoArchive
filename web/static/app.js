@@ -1545,6 +1545,13 @@ const PhotoArchive = (() => {
         return data;
     }
 
+    async function refreshSettingsMeta() {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        renderSettingsMeta(data);
+        return data;
+    }
+
     async function initSettings() {
         const form = document.getElementById('settings-form');
         if (form) {
@@ -1558,7 +1565,7 @@ const PhotoArchive = (() => {
             await loadSettingsPage(false);
             setSettingsStatus('Ready. Save to apply changes immediately.', 'muted');
             if (settingsPoller) clearInterval(settingsPoller);
-            settingsPoller = setInterval(() => loadSettingsPage(false).catch(() => {}), 5000);
+            settingsPoller = setInterval(() => refreshSettingsMeta().catch(() => {}), 5000);
         } catch (err) {
             setSettingsStatus(`Could not load settings: ${err.message}`, 'error');
         }
