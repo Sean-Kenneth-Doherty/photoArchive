@@ -45,24 +45,35 @@
     </div>
     <div class="bar-divider"></div>
     <div class="bar-section bar-filters">
-        <select id="filter-orientation" class="bar-select" onchange="PhotoArchive.setFilter('orientation', this.value)">
-            <option value="">All</option>
-            <option value="landscape">Landscape</option>
-            <option value="portrait">Portrait</option>
-        </select>
-        <select id="filter-compared" class="bar-select" onchange="PhotoArchive.setFilter('compared', this.value)">
-            <option value="">All</option>
-            <option value="compared">Compared</option>
-            <option value="uncompared">Uncompared</option>
-            <option value="confident">Confident (10+)</option>
-        </select>
-        <select id="filter-rating" class="bar-select" onchange="PhotoArchive.setFilter('rating', this.value)">
-            <option value="">All Ratings</option>
-            <option value="5">5 Stars (Top 5%)</option>
-            <option value="4">4+ Stars (Top 15%)</option>
-            <option value="3">3+ Stars (Top 40%)</option>
-            <option value="2">2+ Stars (Top 70%)</option>
-        </select>
+        <div class="filter-group" title="Orientation">
+            <button class="filter-icon" data-filter="orientation" data-value="landscape" onclick="PhotoArchive.toggleFilter('orientation','landscape',this)" title="Landscape">
+                <svg width="16" height="12" viewBox="0 0 16 12"><rect x="1" y="1" width="14" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+            </button>
+            <button class="filter-icon" data-filter="orientation" data-value="portrait" onclick="PhotoArchive.toggleFilter('orientation','portrait',this)" title="Portrait">
+                <svg width="12" height="16" viewBox="0 0 12 16"><rect x="1" y="1" width="10" height="14" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+            </button>
+        </div>
+        <div class="filter-sep"></div>
+        <div class="filter-group" title="Comparison status">
+            <button class="filter-icon" data-filter="compared" data-value="compared" onclick="PhotoArchive.toggleFilter('compared','compared',this)" title="Compared">
+                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 7l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="filter-icon" data-filter="compared" data-value="uncompared" onclick="PhotoArchive.toggleFilter('compared','uncompared',this)" title="Uncompared">
+                <svg width="14" height="14" viewBox="0 0 14 14"><circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 5.5a1.5 1.5 0 0 1 2.5 1c0 1-1.5 1-1.5 2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="7" cy="10.5" r="0.5" fill="currentColor"/></svg>
+            </button>
+            <button class="filter-icon" data-filter="compared" data-value="confident" onclick="PhotoArchive.toggleFilter('compared','confident',this)" title="Confident (10+ comparisons)">
+                <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 7l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 4l3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+        </div>
+        <div class="filter-sep"></div>
+        <div class="filter-group filter-stars" title="Minimum star rating">
+            <button class="filter-star" data-star="1" onclick="PhotoArchive.toggleStar(1)">★</button>
+            <button class="filter-star" data-star="2" onclick="PhotoArchive.toggleStar(2)">★</button>
+            <button class="filter-star" data-star="3" onclick="PhotoArchive.toggleStar(3)">★</button>
+            <button class="filter-star" data-star="4" onclick="PhotoArchive.toggleStar(4)">★</button>
+            <button class="filter-star" data-star="5" onclick="PhotoArchive.toggleStar(5)">★</button>
+        </div>
+        <div class="filter-sep"></div>
         <select id="filter-folder" class="bar-select" onchange="PhotoArchive.setFilter('folder', this.value)">
             <option value="">All Folders</option>
         </select>

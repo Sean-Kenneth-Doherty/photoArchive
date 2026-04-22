@@ -1010,6 +1010,39 @@ const PhotoArchive = (() => {
         loadRankings();
     }
 
+    function toggleFilter(key, value, btn) {
+        // Toggle: click active filter to clear it
+        if (filters[key] === value) {
+            filters[key] = '';
+            btn.classList.remove('active');
+        } else {
+            // Deactivate siblings in same group
+            btn.parentElement.querySelectorAll('.filter-icon').forEach(b => b.classList.remove('active'));
+            filters[key] = value;
+            btn.classList.add('active');
+        }
+        rankingsOffset = 0;
+        rankingsExhausted = false;
+        libraryImages = [];
+        document.getElementById('rankings-grid').innerHTML = '';
+        loadRankings();
+    }
+
+    function toggleStar(level) {
+        // Click same star to clear, otherwise set minimum
+        const newValue = filters.rating == level ? '' : level;
+        filters.rating = newValue;
+        document.querySelectorAll('.filter-star').forEach(s => {
+            const star = parseInt(s.dataset.star);
+            s.classList.toggle('lit', newValue && star <= newValue);
+        });
+        rankingsOffset = 0;
+        rankingsExhausted = false;
+        libraryImages = [];
+        document.getElementById('rankings-grid').innerHTML = '';
+        loadRankings();
+    }
+
     function eloToStars(elo, comparisons) {
         if (comparisons === 0) return 0;
         if (elo >= 1500) return 5;
@@ -1171,6 +1204,8 @@ const PhotoArchive = (() => {
         lightboxPrev,
         setThumbSize,
         setFilter,
+        toggleFilter,
+        toggleStar,
         findSimilar,
         toggleBatchMode,
         batchExport,
