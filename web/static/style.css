@@ -1025,34 +1025,110 @@ button:disabled {
     vertical-align: middle;
 }
 
-.rankings-load-more {
-    text-align: center;
-    padding: 24px;
+/* Elo tier borders */
+.rank-card.tier-gold { box-shadow: inset 0 0 0 2px rgba(255, 215, 0, 0.5); }
+.rank-card.tier-silver { box-shadow: inset 0 0 0 2px rgba(192, 192, 192, 0.4); }
+.rank-card.tier-bronze { box-shadow: inset 0 0 0 2px rgba(205, 127, 50, 0.3); }
+
+/* Comparison confidence dot */
+.rank-confidence {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    opacity: 0.7;
+}
+.rank-confidence.high { background: #4a9; }
+.rank-confidence.medium { background: #c9a84c; }
+.rank-confidence.low { background: #666; }
+
+/* Bar filter selects */
+.bar-select {
+    padding: 3px 6px;
+    font-size: 11px;
+    background: #333;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 4px;
+    outline: none;
+    cursor: pointer;
+}
+
+.bar-select:hover { border-color: #555; }
+.bar-select:focus { border-color: #6cb4ee; }
+
+/* Thumbnail size slider */
+.bar-slider {
+    width: 80px;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: #444;
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+}
+
+.bar-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #6cb4ee;
+    cursor: pointer;
 }
 
 /* Lightbox */
 .lightbox {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.92);
+    background: rgba(0, 0, 0, 0.95);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.lightbox-center {
+    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    z-index: 1000;
     cursor: pointer;
+    min-width: 0;
 }
 
 .lightbox img {
-    max-width: 90vw;
-    max-height: 85vh;
+    max-width: 85vw;
+    max-height: 88vh;
     object-fit: contain;
 }
 
 .lightbox-info {
     color: #888;
-    font-size: 14px;
-    margin-top: 16px;
+    font-size: 13px;
+    margin-top: 12px;
+    text-align: center;
+}
+
+.lightbox-nav {
+    width: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 48px;
+    color: #555;
+    cursor: pointer;
+    transition: color 0.15s;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.lightbox-nav:hover {
+    color: #fff;
 }
 
 /* Toast notification */

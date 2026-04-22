@@ -286,14 +286,37 @@ RANKING_SORTS = {
     "newest": "id DESC",
 }
 
-async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
+STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
+
+async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
+                       orientation: str = "", compared: str = "", min_stars: int = 0):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
+        conditions = ["status IN ('kept', 'maybe')"]
+        params = []
+
+        if orientation in ("landscape", "portrait"):
+            conditions.append("orientation = ?")
+            params.append(orientation)
+
+        if compared == "compared":
+            conditions.append("comparisons > 0")
+        elif compared == "uncompared":
+            conditions.append("comparisons = 0")
+        elif compared == "confident":
+            conditions.append("comparisons >= 10")
+
+        if min_stars > 0 and min_stars in STAR_THRESHOLDS:
+            conditions.append("elo >= ?")
+            params.append(STAR_THRESHOLDS[min_stars])
+
+        where = " AND ".join(conditions)
+        params.extend([limit, offset])
         cursor = await db.execute(
             f"SELECT id, filename, filepath, elo, comparisons, status, predicted_elo, aspect_ratio FROM images "
-            f"WHERE status IN ('kept', 'maybe') ORDER BY {order} LIMIT ? OFFSET ?",
-            (limit, offset),
+            f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+            params,
         )
         return await cursor.fetchall()
     finally:

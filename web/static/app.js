@@ -738,9 +738,12 @@ const PhotoArchive = (() => {
     let rankingsSort = 'elo';
     let searchQuery = '';
     let searchDebounce = null;
-
     let rankingsLoading = false;
     let rankingsExhausted = false;
+    let thumbHeight = 220;
+    let libraryImages = []; // all loaded images for lightbox navigation
+    let lightboxIndex = -1;
+    let filters = { orientation: '', compared: '', rating: '' };
 
     async function initLibrary() {
         rankingsOffset = 0;
@@ -762,6 +765,15 @@ const PhotoArchive = (() => {
             if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) {
                 loadRankings();
             }
+        });
+
+        // Lightbox keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            const lb = document.getElementById('lightbox');
+            if (!lb || lb.classList.contains('hidden')) return;
+            if (e.key === 'ArrowRight') { e.preventDefault(); lightboxNext(); }
+            else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxPrev(); }
+            else if (e.key === 'Escape') { closeLightbox(); }
         });
 
         // Set up search input
@@ -803,24 +815,26 @@ const PhotoArchive = (() => {
         if (sortToggles) sortToggles.style.opacity = '1';
         rankingsOffset = 0;
         rankingsExhausted = false;
+        libraryImages = [];
         document.getElementById('rankings-grid').innerHTML = '';
         loadRankings();
     }
 
     async function loadSearchResults() {
+        libraryImages = [];
         const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&limit=100`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
-        const rowH = getRowHeight();
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
             const ar = img.aspect_ratio || 1.5;
             const card = document.createElement('div');
             card.className = 'rank-card';
-            card.style.height = rowH + 'px';
+            card.dataset.ar = ar;
+            card.style.height = thumbHeight + 'px';
             card.style.flexGrow = ar;
-            card.style.flexBasis = (rowH * ar) + 'px';
+            card.style.flexBasis = (thumbHeight * ar) + 'px';
             card.onclick = () => openLightbox(img);
 
             const simPct = (img.similarity * 100).toFixed(0);
@@ -833,6 +847,7 @@ const PhotoArchive = (() => {
                 </div>
             `;
             grid.appendChild(card);
+            libraryImages.push(img);
         }
 
         const loadMoreWrap = document.getElementById('load-more-wrap');
@@ -844,6 +859,7 @@ const PhotoArchive = (() => {
         rankingsSort = sort;
         rankingsOffset = 0;
         rankingsExhausted = false;
+        libraryImages = [];
         document.getElementById('rankings-grid').innerHTML = '';
         const btn = document.getElementById('sort-' + sort);
         if (btn) {
@@ -853,26 +869,29 @@ const PhotoArchive = (() => {
         loadRankings();
     }
 
-    function getRowHeight() {
-        return Math.max(160, Math.min(280, window.innerHeight * 0.25));
-    }
-
     async function loadRankings() {
         if (rankingsLoading) return;
         rankingsLoading = true;
-        const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`);
+        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`;
+        if (filters.orientation) url += `&orientation=${filters.orientation}`;
+        if (filters.compared) url += `&compared=${filters.compared}`;
+        if (filters.rating) url += `&min_stars=${filters.rating}`;
+        const res = await fetch(url);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc' || rankingsSort === 'ai');
-        const rowH = getRowHeight();
+        const rowH = thumbHeight;
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
             const rank = rankingsOffset + i + 1;
             const ar = img.aspect_ratio || 1.5;
+            const tier = getTierClass(img.elo, img.comparisons);
+            const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
 
             const card = document.createElement('div');
-            card.className = 'rank-card';
+            card.className = 'rank-card' + (tier ? ' ' + tier : '');
+            card.dataset.ar = ar;
             card.style.height = rowH + 'px';
             card.style.flexGrow = ar;
             card.style.flexBasis = (rowH * ar) + 'px';
@@ -880,6 +899,7 @@ const PhotoArchive = (() => {
 
             const eloLabel = img.comparisons > 0 ? `${img.elo}` : (img.predicted_elo ? `~${img.predicted_elo}` : `${img.elo}`);
             const sourceTag = img.comparisons === 0 && img.predicted_elo ? '<span class="rank-ai-tag">AI</span>' : '';
+            const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
 
             const infoLine = showRank
                 ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${eloLabel} ${sourceTag}</span>`
@@ -887,9 +907,11 @@ const PhotoArchive = (() => {
 
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                ${confDot}
                 <div class="rank-card-info">${infoLine}</div>
             `;
             grid.appendChild(card);
+            libraryImages.push(img);
         }
 
         rankingsOffset += data.images.length;
@@ -900,16 +922,78 @@ const PhotoArchive = (() => {
     }
 
     function openLightbox(img) {
+        lightboxIndex = libraryImages.findIndex(i => i.id === img.id);
+        showLightboxImage(img);
+    }
+
+    function showLightboxImage(img) {
         const lb = document.getElementById('lightbox');
         const lbImg = document.getElementById('lightbox-img');
         const lbInfo = document.getElementById('lightbox-info');
         lbImg.src = `/api/thumb/md/${img.id}`;
-        lbInfo.textContent = `${img.filename} — ${img.elo} Elo — ${img.comparisons} comparisons`;
+        const stars = eloToStars(img.elo, img.comparisons);
+        const starStr = '★'.repeat(stars) + '☆'.repeat(5 - stars);
+        lbInfo.textContent = `${img.filename}  ·  ${img.elo} Elo  ·  ${starStr}  ·  ${img.comparisons} comparisons`;
         lb.classList.remove('hidden');
+    }
+
+    function lightboxNext() {
+        if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length - 1) return;
+        lightboxIndex++;
+        showLightboxImage(libraryImages[lightboxIndex]);
+    }
+
+    function lightboxPrev() {
+        if (lightboxIndex <= 0) return;
+        lightboxIndex--;
+        showLightboxImage(libraryImages[lightboxIndex]);
     }
 
     function closeLightbox() {
         document.getElementById('lightbox').classList.add('hidden');
+        lightboxIndex = -1;
+    }
+
+    function setThumbSize(value) {
+        thumbHeight = parseInt(value);
+        // Update all existing cards
+        document.querySelectorAll('.rank-card').forEach(card => {
+            const ar = parseFloat(card.dataset.ar) || 1.5;
+            card.style.height = thumbHeight + 'px';
+            card.style.flexBasis = (thumbHeight * ar) + 'px';
+        });
+    }
+
+    function setFilter(key, value) {
+        filters[key] = value;
+        rankingsOffset = 0;
+        rankingsExhausted = false;
+        libraryImages = [];
+        document.getElementById('rankings-grid').innerHTML = '';
+        loadRankings();
+    }
+
+    function eloToStars(elo, comparisons) {
+        if (comparisons === 0) return 0;
+        if (elo >= 1500) return 5;
+        if (elo >= 1350) return 4;
+        if (elo >= 1250) return 3;
+        if (elo >= 1150) return 2;
+        return 1;
+    }
+
+    function getConfidenceClass(comparisons) {
+        if (comparisons >= 10) return 'high';
+        if (comparisons >= 3) return 'medium';
+        return 'low';
+    }
+
+    function getTierClass(elo, comparisons) {
+        if (comparisons < 5) return '';
+        if (elo >= 1500) return 'tier-gold';
+        if (elo >= 1350) return 'tier-silver';
+        if (elo >= 1250) return 'tier-bronze';
+        return '';
     }
 
     function exportRankings(format) {
@@ -949,6 +1033,10 @@ const PhotoArchive = (() => {
         setRankingsSort,
         exportRankings,
         closeLightbox,
+        lightboxNext,
+        lightboxPrev,
+        setThumbSize,
+        setFilter,
         gridSelectAll,
         gridSelectNone,
         gridSubmit,

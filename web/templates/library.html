@@ -13,9 +13,13 @@
     </div>
 
     <!-- Lightbox overlay -->
-    <div class="lightbox hidden" id="lightbox" onclick="PhotoArchive.closeLightbox()">
-        <img id="lightbox-img" src="" alt="">
-        <div class="lightbox-info" id="lightbox-info"></div>
+    <div class="lightbox hidden" id="lightbox">
+        <div class="lightbox-nav lightbox-prev" onclick="event.stopPropagation(); PhotoArchive.lightboxPrev()">&#8249;</div>
+        <div class="lightbox-center" onclick="PhotoArchive.closeLightbox()">
+            <img id="lightbox-img" src="" alt="">
+            <div class="lightbox-info" id="lightbox-info"></div>
+        </div>
+        <div class="lightbox-nav lightbox-next" onclick="event.stopPropagation(); PhotoArchive.lightboxNext()">&#8250;</div>
     </div>
 </div>
 {% endblock %}
@@ -32,6 +36,32 @@
             <button id="sort-newest" onclick="PhotoArchive.setRankingsSort('newest')">Newest</button>
             <button id="sort-filename" onclick="PhotoArchive.setRankingsSort('filename')">Filename</button>
         </div>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-filters">
+        <select id="filter-orientation" class="bar-select" onchange="PhotoArchive.setFilter('orientation', this.value)">
+            <option value="">All</option>
+            <option value="landscape">Landscape</option>
+            <option value="portrait">Portrait</option>
+        </select>
+        <select id="filter-compared" class="bar-select" onchange="PhotoArchive.setFilter('compared', this.value)">
+            <option value="">All</option>
+            <option value="compared">Compared</option>
+            <option value="uncompared">Uncompared</option>
+            <option value="confident">Confident (10+)</option>
+        </select>
+        <select id="filter-rating" class="bar-select" onchange="PhotoArchive.setFilter('rating', this.value)">
+            <option value="">All Ratings</option>
+            <option value="5">5 Stars (Top 5%)</option>
+            <option value="4">4+ Stars (Top 15%)</option>
+            <option value="3">3+ Stars (Top 40%)</option>
+            <option value="2">2+ Stars (Top 70%)</option>
+        </select>
+    </div>
+    <div class="bar-divider"></div>
+    <div class="bar-section bar-size">
+        <input type="range" id="thumb-size" class="bar-slider" min="120" max="400" value="220"
+               oninput="PhotoArchive.setThumbSize(this.value)" title="Thumbnail size">
     </div>
     <div class="bar-divider"></div>
     <div class="bar-section bar-stats">

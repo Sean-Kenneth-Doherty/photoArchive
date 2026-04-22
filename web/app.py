@@ -460,8 +460,14 @@ async def compare_undo():
 # --- Rankings API ---
 
 @app.get("/api/rankings")
-async def api_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
-    images = await db.get_rankings(limit=limit, offset=offset, sort=sort)
+async def api_rankings(
+    limit: int = 100, offset: int = 0, sort: str = "elo",
+    orientation: str = "", compared: str = "", min_stars: int = 0,
+):
+    images = await db.get_rankings(
+        limit=limit, offset=offset, sort=sort,
+        orientation=orientation, compared=compared, min_stars=min_stars,
+    )
     result = []
     for img in images:
         d = dict(img)
