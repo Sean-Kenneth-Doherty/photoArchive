@@ -89,8 +89,6 @@ def _install_model_sync(model_id: str, revision: str, model_dir: str):
             repo_id=model_id,
             revision=revision or "main",
             local_dir=model_dir,
-            local_dir_use_symlinks=False,
-            resume_download=True,
         )
         _set_state(
             running=False,

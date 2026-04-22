@@ -4,8 +4,8 @@
 <div class="settings-page">
     <div class="settings-hero">
         <div>
-            <h1>Performance Settings</h1>
-            <p>Tune thumbnail generation, caching, and prefetch behavior. Changes apply immediately to new requests.</p>
+            <h1>Settings</h1>
+            <p>Configure thumbnail performance, caching, prefetch behavior, and the local AI model. Runtime changes apply immediately to new requests.</p>
         </div>
         <div class="settings-status" id="settings-status">Loading current settings…</div>
     </div>
@@ -13,7 +13,7 @@
     <form class="settings-grid" id="settings-form">
         <section class="settings-card">
             <h2>AI Model</h2>
-            <p class="settings-card-copy">The app runs embeddings locally, but this model is installed once from Hugging Face through the button below.</p>
+            <p class="settings-card-copy">Install the model once from Hugging Face here, then the app will load it locally from disk for offline embeddings and search.</p>
             <label class="settings-field">
                 <span>Model ID</span>
                 <input id="embed_model_id" type="text" spellcheck="false" autocomplete="off">

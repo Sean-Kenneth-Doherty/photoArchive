@@ -31,6 +31,8 @@ RETRAIN_EVERY = 50
 # Module-level reference for text search (set by run_clip_worker on startup)
 _model = None
 _loaded_model_dir = None
+_loaded_model_id = None
+_loaded_model_revision = None
 _worker_status = {
     "state": "idle",
     "message": "",
@@ -163,7 +165,7 @@ async def run_clip_worker():
     """Main background loop: embed, train, predict."""
     loop = asyncio.get_running_loop()
 
-    global _model, _loaded_model_dir
+    global _model, _loaded_model_dir, _loaded_model_id, _loaded_model_revision
 
     last_train_count = 0
     has_model = False
@@ -174,12 +176,15 @@ async def run_clip_worker():
         try:
             config = settings.get_settings()
             model_id = config["embed_model_id"]
+            model_revision = config["embed_model_revision"]
             model_dir = config["embed_model_dir"]
             model_installed = ai_models.model_files_present(model_dir)
 
             if not model_installed:
                 _model = None
                 _loaded_model_dir = None
+                _loaded_model_id = None
+                _loaded_model_revision = None
                 has_model = False
                 batches_since_train = 0
                 _set_worker_status(
@@ -190,10 +195,17 @@ async def run_clip_worker():
                 await asyncio.sleep(10)
                 continue
 
-            if _model is None or _loaded_model_dir != model_dir:
+            if (
+                _model is None
+                or _loaded_model_dir != model_dir
+                or _loaded_model_id != model_id
+                or _loaded_model_revision != model_revision
+            ):
                 _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
                 _model = await loop.run_in_executor(None, _load_model, model_dir, model_id)
                 _loaded_model_dir = model_dir
+                _loaded_model_id = model_id
+                _loaded_model_revision = model_revision
                 last_train_count = await db.get_comparison_count()
                 has_model = False
                 batches_since_train = 0
