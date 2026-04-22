@@ -736,14 +736,24 @@ const PhotoArchive = (() => {
     // ==================== LIBRARY ====================
 
     let rankingsSort = 'elo';
+    let sortField = 'elo';
+    let sortDesc = true;
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
     let rankingsExhausted = false;
     let thumbHeight = 220;
-    let libraryImages = []; // all loaded images for lightbox navigation
+    let libraryImages = [];
     let lightboxIndex = -1;
     let filters = { orientation: '', compared: '', rating: '', folder: '' };
+
+    const SORT_KEYS = {
+        'elo':         { desc: 'elo',           asc: 'elo_asc' },
+        'ai':          { desc: 'ai',            asc: 'ai_asc' },
+        'comparisons': { desc: 'comparisons',   asc: 'least_compared' },
+        'newest':      { desc: 'newest',        asc: 'oldest' },
+        'filename':    { desc: 'filename_desc', asc: 'filename' },
+    };
 
     async function initLibrary() {
         rankingsOffset = 0;
@@ -870,18 +880,37 @@ const PhotoArchive = (() => {
     }
 
     function setRankingsSort(sort) {
-        if (searchQuery) return; // ignore sort changes during search
+        if (searchQuery) return;
         rankingsSort = sort;
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
         document.getElementById('rankings-grid').innerHTML = '';
-        const btn = document.getElementById('sort-' + sort);
-        if (btn) {
-            btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-        }
         loadRankings();
+    }
+
+    function setSortField(field) {
+        if (searchQuery) return;
+        sortField = field;
+        sortDesc = true; // reset to desc when changing field
+        updateSortDirIcon();
+        const key = SORT_KEYS[field];
+        setRankingsSort(key ? key.desc : field);
+    }
+
+    function toggleSortDir() {
+        if (searchQuery) return;
+        sortDesc = !sortDesc;
+        updateSortDirIcon();
+        const key = SORT_KEYS[sortField];
+        if (key) {
+            setRankingsSort(sortDesc ? key.desc : key.asc);
+        }
+    }
+
+    function updateSortDirIcon() {
+        const btn = document.getElementById('sort-dir-btn');
+        if (btn) btn.classList.toggle('active', !sortDesc);
     }
 
     async function loadRankings() {
@@ -1198,6 +1227,8 @@ const PhotoArchive = (() => {
         setCullMode,
         setCompareMode,
         setRankingsSort,
+        setSortField,
+        toggleSortDir,
         exportRankings,
         closeLightbox,
         lightboxNext,

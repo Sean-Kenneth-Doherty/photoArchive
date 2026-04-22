@@ -280,10 +280,13 @@ RANKING_SORTS = {
     "elo": "elo DESC",
     "elo_asc": "elo ASC",
     "ai": "COALESCE(CASE WHEN comparisons > 0 THEN elo ELSE predicted_elo END, elo) DESC",
+    "ai_asc": "COALESCE(CASE WHEN comparisons > 0 THEN elo ELSE predicted_elo END, elo) ASC",
     "comparisons": "comparisons DESC",
     "least_compared": "comparisons ASC",
     "filename": "filename ASC",
+    "filename_desc": "filename DESC",
     "newest": "id DESC",
+    "oldest": "id ASC",
 }
 
 STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
