@@ -624,6 +624,50 @@ async def api_similar(image_id: int, limit: int = 50):
     return {"images": results, "source_id": image_id}
 
 
+@app.get("/api/duplicates")
+async def api_duplicates(threshold: float = 0.95, limit: int = 100):
+    """Find near-duplicate image pairs using embedding similarity."""
+    try:
+        import clip_worker
+        import numpy as np
+    except ImportError:
+        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
+
+    all_embeddings = await db.get_all_embeddings()
+    if len(all_embeddings) < 2:
+        return {"pairs": []}
+
+    image_ids = [r["image_id"] for r in all_embeddings]
+    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+
+    # Compute pairwise similarities (upper triangle only)
+    sim_matrix = matrix @ matrix.T
+    pairs = []
+    for i in range(len(image_ids)):
+        for j in range(i + 1, len(image_ids)):
+            if sim_matrix[i, j] >= threshold:
+                pairs.append((image_ids[i], image_ids[j], float(sim_matrix[i, j])))
+        if len(pairs) >= limit:
+            break
+
+    # Fetch image details
+    all_ids = list({p[0] for p in pairs} | {p[1] for p in pairs})
+    images = await db.get_images_by_ids(all_ids) if all_ids else {}
+
+    result = []
+    for id_a, id_b, sim in pairs[:limit]:
+        a, b = images.get(id_a), images.get(id_b)
+        if not a or not b:
+            continue
+        result.append({
+            "similarity": round(sim, 4),
+            "a": {"id": id_a, "filename": a["filename"], "elo": round(a["elo"], 1), "thumb_url": f"/api/thumb/sm/{id_a}"},
+            "b": {"id": id_b, "filename": b["filename"], "elo": round(b["elo"], 1), "thumb_url": f"/api/thumb/sm/{id_b}"},
+        })
+
+    return {"pairs": result}
+
+
 @app.get("/api/stats")
 async def api_stats():
     return await db.get_stats()
