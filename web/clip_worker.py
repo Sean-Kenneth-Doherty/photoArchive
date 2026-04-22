@@ -27,7 +27,7 @@ log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-EMBEDDING_DIM = 4096  # Full native dimension
+EMBEDDING_DIM = 2048  # Native output dimension for Qwen3-VL-Embedding-2B
 BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
 EMBED_SPEED_WINDOW_SECONDS = 300

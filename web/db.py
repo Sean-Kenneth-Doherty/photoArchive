@@ -2,7 +2,7 @@ import aiosqlite
 import os
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoarchive.db")
-EXPECTED_EMBEDDING_DIM = 4096  # Qwen3-VL-Embedding full native dimension
+EXPECTED_EMBEDDING_DIM = 2048  # Qwen3-VL-Embedding-2B native dimension
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS images (
