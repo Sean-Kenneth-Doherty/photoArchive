@@ -769,6 +769,27 @@ const PhotoArchive = (() => {
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
 
+        // Star hover preview
+        document.querySelectorAll('.filter-star').forEach(star => {
+            star.addEventListener('mouseenter', () => {
+                const level = parseInt(star.dataset.star);
+                document.querySelectorAll('.filter-star').forEach(s => {
+                    s.classList.toggle('hovered', parseInt(s.dataset.star) <= level);
+                    if (!s.classList.contains('lit')) {
+                        s.textContent = parseInt(s.dataset.star) <= level ? '★' : '☆';
+                    }
+                });
+            });
+            star.addEventListener('mouseleave', () => {
+                document.querySelectorAll('.filter-star').forEach(s => {
+                    s.classList.remove('hovered');
+                    if (!s.classList.contains('lit')) {
+                        s.textContent = '☆';
+                    }
+                });
+            });
+        });
+
         // Load folder list
         fetch('/api/folders').then(r => r.json()).then(data => {
             const sel = document.getElementById('filter-folder');

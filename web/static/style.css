@@ -1112,12 +1112,17 @@ button:disabled {
     transition: color 0.1s;
 }
 
-.filter-star:hover {
-    color: #aaa;
-}
-
 .filter-star.lit {
     color: #fff;
+}
+
+/* Hover preview: highlight all stars up to the hovered one */
+.filter-stars:hover .filter-star {
+    color: #555;
+}
+
+.filter-stars:hover .filter-star.hovered {
+    color: #aaa;
 }
 
 /* Bar filter selects */
