@@ -18,6 +18,74 @@ const PhotoArchive = (() => {
     // --- Rankings State ---
     let rankingsOffset = 0;
     const RANKINGS_PAGE_SIZE = 100;
+    const BACKGROUND_WARM_DELAY_MS = 250;
+    const LIBRARY_NEIGHBOR_LIMIT = 24;
+    const MOSAIC_NEIGHBOR_LIMIT = 8;
+    const COMPARE_NEIGHBOR_PAIRS = 4;
+    const backgroundWarmTimers = new Map();
+    const backgroundWarmTokens = new Map();
+
+    function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
+        const token = (backgroundWarmTokens.get(key) || 0) + 1;
+        backgroundWarmTokens.set(key, token);
+
+        const existingTimer = backgroundWarmTimers.get(key);
+        if (existingTimer) clearTimeout(existingTimer);
+
+        const timer = setTimeout(() => {
+            backgroundWarmTimers.delete(key);
+            const run = () => Promise.resolve(task(token)).catch(() => {});
+            if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+                window.requestIdleCallback(run, { timeout: 1500 });
+            } else {
+                run();
+            }
+        }, delay);
+
+        backgroundWarmTimers.set(key, timer);
+    }
+
+    function isWarmTokenCurrent(key, token) {
+        return backgroundWarmTokens.get(key) === token;
+    }
+
+    async function fetchWarmJson(url) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) return null;
+            return await res.json();
+        } catch {
+            return null;
+        }
+    }
+
+    function warmImageUrls(urls) {
+        for (const url of urls || []) {
+            preloadImage(url);
+        }
+    }
+
+    async function warmRequests(key, token, requests) {
+        for (const request of requests) {
+            if (!isWarmTokenCurrent(key, token)) return;
+            const data = await fetchWarmJson(request.url);
+            if (!data || !isWarmTokenCurrent(key, token)) return;
+            warmImageUrls(request.extract(data));
+        }
+    }
+
+    function imageThumbUrls(data) {
+        return (data.images || []).map((img) => img.thumb_url).filter(Boolean);
+    }
+
+    function compareThumbUrls(data) {
+        const urls = [];
+        for (const pair of data.pairs || []) {
+            if (pair.left?.thumb_url) urls.push(pair.left.thumb_url);
+            if (pair.right?.thumb_url) urls.push(pair.right.thumb_url);
+        }
+        return urls;
+    }
 
     // ==================== CULL MODE ====================
 
@@ -320,6 +388,7 @@ const PhotoArchive = (() => {
         mosaicBusy = false;
         renderMosaic();
         mosaicFillReplacements();
+        scheduleCompareNeighborWarmup('mosaic');
     }
 
     function renderMosaic() {
@@ -612,6 +681,10 @@ const PhotoArchive = (() => {
             preloadImage(pair.left.thumb_url);
             preloadImage(pair.right.thumb_url);
         }
+
+        if (compareIndex === 0) {
+            scheduleCompareNeighborWarmup(compareMode);
+        }
     }
 
     function showComparePair() {
@@ -772,13 +845,135 @@ const PhotoArchive = (() => {
     let lightboxIndex = -1;
     let filters = { orientation: '', compared: '', rating: '', folder: '' };
 
-    function filterParams() {
+    function filterParams(state = filters) {
         let p = '';
-        if (filters.orientation) p += `&orientation=${filters.orientation}`;
-        if (filters.compared) p += `&compared=${filters.compared}`;
-        if (filters.rating) p += `&min_stars=${filters.rating}`;
-        if (filters.folder) p += `&folder=${encodeURIComponent(filters.folder)}`;
+        if (state.orientation) p += `&orientation=${state.orientation}`;
+        if (state.compared) p += `&compared=${state.compared}`;
+        if (state.rating) p += `&min_stars=${state.rating}`;
+        if (state.folder) p += `&folder=${encodeURIComponent(state.folder)}`;
         return p;
+    }
+
+    function currentFilterState() {
+        return {
+            orientation: filters.orientation || '',
+            compared: filters.compared || '',
+            rating: filters.rating || '',
+            folder: filters.folder || '',
+        };
+    }
+
+    function buildFilterNeighborStates(baseState = currentFilterState()) {
+        const states = [];
+        const seen = new Set();
+        const currentKey = JSON.stringify(baseState);
+
+        function pushState(patch) {
+            const state = { ...baseState, ...patch };
+            const key = JSON.stringify(state);
+            if (key === currentKey || seen.has(key)) return;
+            seen.add(key);
+            states.push(state);
+        }
+
+        if (!baseState.orientation) {
+            pushState({ orientation: 'landscape' });
+            pushState({ orientation: 'portrait' });
+        } else {
+            pushState({ orientation: '' });
+        }
+
+        if (!baseState.compared) {
+            pushState({ compared: 'compared' });
+            pushState({ compared: 'uncompared' });
+        } else {
+            pushState({ compared: '' });
+        }
+
+        if (baseState.folder) {
+            pushState({ folder: '' });
+        }
+
+        const rating = Number(baseState.rating || 0);
+        if (rating > 0) {
+            pushState({ rating: rating > 1 ? String(rating - 1) : '' });
+            if (rating < 5) pushState({ rating: String(rating + 1) });
+        }
+
+        return states;
+    }
+
+    function buildRankingsUrl({ sort = rankingsSort, filterState = currentFilterState(), limit = LIBRARY_NEIGHBOR_LIMIT, offset = 0 } = {}) {
+        return `/api/rankings?limit=${limit}&offset=${offset}&sort=${sort}${filterParams(filterState)}`;
+    }
+
+    function buildMosaicUrl({
+        strategy = mosaicStrategy,
+        filterState = currentFilterState(),
+        gridElo = mosaicGridElo(),
+        n = MOSAIC_NEIGHBOR_LIMIT,
+        exclude = '',
+    } = {}) {
+        let url = `/api/mosaic/next?n=${n}&strategy=${strategy}&grid_elo=${gridElo}${filterParams(filterState)}`;
+        if (exclude) url += `&exclude=${exclude}`;
+        return url;
+    }
+
+    function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS) {
+        return `/api/compare/next?n=${n}&mode=${mode}`;
+    }
+
+    function scheduleLibraryNeighborWarmup() {
+        if (searchQuery) return;
+
+        const requests = [];
+        const seen = new Set();
+        const addRequest = (url) => {
+            if (seen.has(url)) return;
+            seen.add(url);
+            requests.push({ url, extract: imageThumbUrls });
+        };
+
+        const sortKey = SORT_KEYS[sortField];
+        if (sortKey) {
+            addRequest(buildRankingsUrl({ sort: sortDesc ? sortKey.asc : sortKey.desc }));
+        }
+
+        addRequest(buildRankingsUrl({ sort: rankingsSort.startsWith('ai') ? 'elo' : 'ai' }));
+
+        for (const neighborState of buildFilterNeighborStates().slice(0, 3)) {
+            addRequest(buildRankingsUrl({ filterState: neighborState }));
+        }
+
+        if (!requests.length) return;
+        scheduleBackgroundWarm('library-neighbors', (token) => warmRequests('library-neighbors', token, requests));
+    }
+
+    function scheduleCompareNeighborWarmup(mode = compareMode) {
+        const requests = [];
+
+        if (mode === 'mosaic') {
+            requests.push({ url: buildCompareUrl('swiss'), extract: compareThumbUrls });
+            requests.push({ url: buildCompareUrl('topn'), extract: compareThumbUrls });
+
+            for (const neighborState of buildFilterNeighborStates().slice(0, 2)) {
+                requests.push({
+                    url: buildMosaicUrl({ filterState: neighborState, gridElo: 0 }),
+                    extract: imageThumbUrls,
+                });
+            }
+        } else {
+            requests.push({
+                url: buildCompareUrl(mode === 'topn' ? 'swiss' : 'topn'),
+                extract: compareThumbUrls,
+            });
+            requests.push({
+                url: buildMosaicUrl({ gridElo: 0 }),
+                extract: imageThumbUrls,
+            });
+        }
+
+        scheduleBackgroundWarm('compare-neighbors', (token) => warmRequests('compare-neighbors', token, requests), 350);
     }
 
     const SORT_KEYS = {
@@ -938,7 +1133,8 @@ const PhotoArchive = (() => {
     async function loadRankings() {
         if (rankingsLoading) return;
         rankingsLoading = true;
-        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}${filterParams()}`;
+        const requestOffset = rankingsOffset;
+        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
         const res = await fetch(url);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
@@ -985,6 +1181,9 @@ const PhotoArchive = (() => {
         rankingsLoading = false;
         if (data.images.length < RANKINGS_PAGE_SIZE) {
             rankingsExhausted = true;
+        }
+        if (requestOffset === 0 && data.images.length > 0) {
+            scheduleLibraryNeighborWarmup();
         }
     }
 
