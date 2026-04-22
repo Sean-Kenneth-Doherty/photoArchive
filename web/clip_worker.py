@@ -8,35 +8,62 @@ Background worker that:
 4. Provides text-to-image search via shared embedding space
 """
 
-import asyncio
-import struct
 import logging
+import os
+import struct
+import asyncio
+
 import numpy as np
 
+import ai_models
 import db
-import thumbnails
+import settings
 
 log = logging.getLogger("clip_worker")
 log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
 EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
 BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
 
 # Module-level reference for text search (set by run_clip_worker on startup)
 _model = None
+_loaded_model_dir = None
+_worker_status = {
+    "state": "idle",
+    "message": "",
+    "ready": False,
+    "model_id": "",
+    "model_dir": "",
+    "last_error": "",
+}
 
 
-def _load_model():
-    """Load Qwen3-VL-Embedding-2B with int4 quantization to fit alongside other GPU apps."""
+def _set_worker_status(state: str, message: str = "", ready: bool = False, last_error: str = ""):
+    config = settings.get_settings()
+    _worker_status.update({
+        "state": state,
+        "message": message,
+        "ready": ready,
+        "model_id": config["embed_model_id"],
+        "model_dir": config["embed_model_dir"],
+        "last_error": last_error,
+    })
+
+
+def get_worker_status() -> dict:
+    return dict(_worker_status)
+
+
+def _load_model(model_dir: str, model_id: str):
+    """Load the embedding model strictly from the local filesystem."""
     import torch
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(
-        MODEL_NAME,
+        model_dir,
         model_kwargs={
             "quantization_config": {
                 "load_in_4bit": True,
@@ -47,9 +74,10 @@ def _load_model():
             "torch_dtype": torch.float16,
         },
         trust_remote_code=True,
+        local_files_only=True,
     )
     model.truncate_dim = EMBEDDING_DIM
-    log.info(f"Qwen3-VL-Embedding-2B loaded (int4, {EMBEDDING_DIM}-dim)")
+    log.info(f"{model_id} loaded from {model_dir} (int4, {EMBEDDING_DIM}-dim)")
     return model
 
 
@@ -133,23 +161,48 @@ def _predict_all(all_rows, coef, intercept, XtX_inv):
 
 async def run_clip_worker():
     """Main background loop: embed, train, predict."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    global _model
+    global _model, _loaded_model_dir
 
-    log.info("Loading Qwen3-VL-Embedding-2B...")
-    _model = await loop.run_in_executor(None, _load_model)
-
-    last_train_count = await db.get_comparison_count()
+    last_train_count = 0
     has_model = False
     batches_since_train = 0
     TRAIN_EVERY_N_BATCHES = 5  # train more frequently since batches are small
 
     while True:
         try:
+            config = settings.get_settings()
+            model_id = config["embed_model_id"]
+            model_dir = config["embed_model_dir"]
+            model_installed = ai_models.model_files_present(model_dir)
+
+            if not model_installed:
+                _model = None
+                _loaded_model_dir = None
+                has_model = False
+                batches_since_train = 0
+                _set_worker_status(
+                    "waiting_for_model",
+                    f"Install {model_id} from Settings to enable AI features.",
+                    ready=False,
+                )
+                await asyncio.sleep(10)
+                continue
+
+            if _model is None or _loaded_model_dir != model_dir:
+                _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
+                _model = await loop.run_in_executor(None, _load_model, model_dir, model_id)
+                _loaded_model_dir = model_dir
+                last_train_count = await db.get_comparison_count()
+                has_model = False
+                batches_since_train = 0
+                _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
+
             # Phase 1: Embed unembedded images
             unembedded = await db.get_unembedded_images(limit=BATCH_SIZE)
             if unembedded:
+                _set_worker_status("embedding", f"Embedding {len(unembedded)} images…", ready=True)
                 image_paths = [row["filepath"] for row in unembedded]
 
                 vectors = await loop.run_in_executor(
@@ -176,6 +229,7 @@ async def run_clip_worker():
             batches_since_train = 0
             current_count = await db.get_comparison_count()
             if not has_model or current_count - last_train_count >= RETRAIN_EVERY or unembedded:
+                _set_worker_status("training", "Updating taste model predictions…", ready=True)
                 training_data = await db.get_training_data()
                 if len(training_data) >= 20:
                     coef, intercept, XtX_inv = await loop.run_in_executor(
@@ -197,8 +251,10 @@ async def run_clip_worker():
                         f"predicted {len(predictions)} ratings"
                     )
 
+            _set_worker_status("idle", "Waiting for new images or comparisons…", ready=True)
             await asyncio.sleep(5)
 
         except Exception as e:
+            _set_worker_status("error", str(e), ready=False, last_error=str(e))
             log.error(f"Embedding worker error: {e}", exc_info=True)
             await asyncio.sleep(10)

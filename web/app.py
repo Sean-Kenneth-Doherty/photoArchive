@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+import ai_models
 import db
 import pairing
 import scanner
@@ -186,9 +187,11 @@ async def cache_status(ahead: int = 100):
 
 @app.get("/api/settings")
 async def api_settings():
+    model_status = ai_models.get_model_status()
     return {
         "settings": settings.get_settings(),
         "cache_stats": thumbnails.cache_stats(),
+        "model_status": model_status,
         **settings.settings_metadata(),
     }
 
@@ -201,6 +204,7 @@ async def api_save_settings(request: Request):
         "ok": True,
         "settings": saved,
         "cache_stats": thumbnails.cache_stats(),
+        "model_status": ai_models.get_model_status(),
     }
 
 
@@ -212,6 +216,7 @@ async def api_reset_settings():
         "ok": True,
         "settings": saved,
         "cache_stats": thumbnails.cache_stats(),
+        "model_status": ai_models.get_model_status(),
     }
 
 
@@ -222,6 +227,16 @@ async def api_clear_thumbnail_cache():
         "ok": True,
         **result,
         "cache_stats": thumbnails.cache_stats(),
+    }
+
+
+@app.post("/api/ai/model/install")
+async def api_install_ai_model():
+    state = ai_models.start_model_install()
+    return {
+        "ok": True,
+        "install": state,
+        "model_status": ai_models.get_model_status(),
     }
 
 
@@ -912,6 +927,20 @@ async def ai_status():
     embedded = await db.get_embedding_count()
     stats = await db.get_stats()
     total_kept = stats["kept"] + stats["maybe"]
+    worker_status = {}
+    try:
+        import clip_worker
+        worker_status = clip_worker.get_worker_status()
+    except Exception:
+        worker_status = {
+            "state": "unavailable",
+            "message": "AI worker unavailable",
+            "ready": False,
+            "model_id": "",
+            "model_dir": "",
+            "last_error": "",
+        }
+    model_status = ai_models.get_model_status()
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
@@ -930,6 +959,16 @@ async def ai_status():
         "model_trained": predicted > 0,
         "predicted": predicted,
         "compared": compared,
+        "model_installed": model_status["installed"],
+        "installing": model_status["install"]["running"],
+        "install_status": model_status["install"]["status"],
+        "install_message": model_status["install"]["message"],
+        "model_id": model_status["model_id"],
+        "model_dir": model_status["model_dir"],
+        "worker_state": worker_status["state"],
+        "worker_message": worker_status["message"],
+        "worker_ready": worker_status["ready"],
+        "worker_error": worker_status["last_error"],
     }
 
 

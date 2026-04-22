@@ -6,6 +6,12 @@ import threading
 WEB_DIR = os.path.dirname(__file__)
 SETTINGS_PATH = os.path.join(WEB_DIR, "settings.local.json")
 
+
+def _default_model_dir(model_id: str) -> str:
+    safe = model_id.replace("/", "--").replace("\\", "--").replace(":", "-")
+    return os.path.join(WEB_DIR, ".models", safe)
+
+
 DEFAULT_SETTINGS = {
     "thumb_size_sm": 400,
     "thumb_size_md": 1920,
@@ -23,6 +29,9 @@ DEFAULT_SETTINGS = {
     "cull_prefetch_limit": 24,
     "compare_prefetch_limit": 16,
     "mosaic_prefetch_limit": 24,
+    "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
+    "embed_model_revision": "main",
+    "embed_model_dir": _default_model_dir("Qwen/Qwen3-VL-Embedding-2B"),
 }
 
 INT_RANGES = {
@@ -47,14 +56,14 @@ _lock = threading.Lock()
 _settings = None
 
 
-def _resolve_cache_dir(path: str) -> str:
+def _resolve_cache_dir(path: str, default: str) -> str:
     value = (path or "").strip()
     if not value:
-        return DEFAULT_SETTINGS["disk_cache_dir"]
+        return default
     if not os.path.isabs(value):
         value = os.path.abspath(os.path.join(WEB_DIR, value))
     if value == os.path.sep:
-        return DEFAULT_SETTINGS["disk_cache_dir"]
+        return default
     return value
 
 
@@ -63,8 +72,21 @@ def normalize_settings(raw: dict | None) -> dict:
     if not isinstance(raw, dict):
         return normalized
 
+    model_id = (raw.get("embed_model_id") or normalized["embed_model_id"]).strip()
+    if not model_id:
+        model_id = normalized["embed_model_id"]
+    normalized["embed_model_id"] = model_id
+
+    revision = (raw.get("embed_model_revision") or normalized["embed_model_revision"]).strip()
+    normalized["embed_model_revision"] = revision or "main"
+
     normalized["disk_cache_dir"] = _resolve_cache_dir(
-        raw.get("disk_cache_dir", normalized["disk_cache_dir"])
+        raw.get("disk_cache_dir", normalized["disk_cache_dir"]),
+        DEFAULT_SETTINGS["disk_cache_dir"],
+    )
+    normalized["embed_model_dir"] = _resolve_cache_dir(
+        raw.get("embed_model_dir", _default_model_dir(model_id)),
+        _default_model_dir(model_id),
     )
 
     for key, (min_value, max_value) in INT_RANGES.items():

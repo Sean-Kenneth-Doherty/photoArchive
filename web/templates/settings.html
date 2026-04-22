@@ -12,6 +12,30 @@
 
     <form class="settings-grid" id="settings-form">
         <section class="settings-card">
+            <h2>AI Model</h2>
+            <p class="settings-card-copy">The app runs embeddings locally, but this model is installed once from Hugging Face through the button below.</p>
+            <label class="settings-field">
+                <span>Model ID</span>
+                <input id="embed_model_id" type="text" spellcheck="false" autocomplete="off">
+            </label>
+            <label class="settings-field">
+                <span>Revision</span>
+                <input id="embed_model_revision" type="text" spellcheck="false" autocomplete="off">
+            </label>
+            <label class="settings-field">
+                <span>Local model directory</span>
+                <input id="embed_model_dir" type="text" spellcheck="false" autocomplete="off">
+            </label>
+            <div class="settings-metric-list">
+                <div>Install status: <strong id="model-install-status">—</strong></div>
+                <div id="model-install-message">—</div>
+            </div>
+            <div class="settings-actions">
+                <button class="bar-btn" type="button" id="install-model-btn" onclick="PhotoArchive.installAIModel()">Save + Install Model</button>
+            </div>
+        </section>
+
+        <section class="settings-card">
             <h2>Thumbnail Output</h2>
             <p class="settings-card-copy">Larger sizes improve fidelity but cost more CPU, disk, and bandwidth.</p>
             <label class="settings-field">

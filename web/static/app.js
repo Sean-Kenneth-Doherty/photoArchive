@@ -527,7 +527,16 @@ const PhotoArchive = (() => {
             if (countEl) countEl.textContent = data.embedded.toLocaleString();
             if (totalEl) totalEl.textContent = data.total_kept.toLocaleString();
             if (stateEl) {
-                if (data.embedded < data.total_kept) {
+                if (data.installing) {
+                    stateEl.textContent = 'Installing';
+                    stateEl.className = 'bar-ai-state embedding';
+                } else if (!data.model_installed) {
+                    stateEl.textContent = 'Install';
+                    stateEl.className = 'bar-ai-state';
+                } else if (!data.worker_ready && data.worker_state === 'loading_model') {
+                    stateEl.textContent = 'Loading';
+                    stateEl.className = 'bar-ai-state embedding';
+                } else if (data.embedded < data.total_kept) {
                     stateEl.textContent = 'Embedding';
                     stateEl.className = 'bar-ai-state embedding';
                 } else if (data.model_trained) {
@@ -549,7 +558,16 @@ const PhotoArchive = (() => {
             }
             if (embedText) embedText.textContent = `${data.embedded.toLocaleString()} / ${data.total_kept.toLocaleString()} images`;
             if (modelText) {
-                if (data.model_trained) {
+                if (data.installing) {
+                    modelText.textContent = data.install_message || `Installing ${data.model_id}`;
+                    modelText.className = 'ai-panel-value';
+                } else if (!data.model_installed) {
+                    modelText.textContent = `Model not installed. Open Settings to install ${data.model_id}.`;
+                    modelText.className = 'ai-panel-value';
+                } else if (data.worker_state === 'loading_model') {
+                    modelText.textContent = data.worker_message || `Loading ${data.model_id}`;
+                    modelText.className = 'ai-panel-value';
+                } else if (data.model_trained) {
                     modelText.textContent = `Trained on ${data.compared.toLocaleString()} compared images`;
                     modelText.className = 'ai-panel-value trained';
                 } else if (data.embedded > 0) {
@@ -1236,6 +1254,9 @@ const PhotoArchive = (() => {
     // ==================== SETTINGS ====================
 
     const SETTINGS_FIELDS = [
+        'embed_model_id',
+        'embed_model_revision',
+        'embed_model_dir',
         'thumb_size_sm',
         'thumb_size_md',
         'thumb_size_lg',
@@ -1253,6 +1274,7 @@ const PhotoArchive = (() => {
         'compare_prefetch_limit',
         'mosaic_prefetch_limit',
     ];
+    let settingsPoller = null;
 
     function setSettingsStatus(message, tone = '') {
         const el = document.getElementById('settings-status');
@@ -1270,6 +1292,37 @@ const PhotoArchive = (() => {
         }
         if (pathEl && data.settings_path) {
             pathEl.textContent = data.settings_path;
+        }
+        renderModelStatus(data.model_status);
+    }
+
+    function renderModelStatus(modelStatus) {
+        const statusEl = document.getElementById('model-install-status');
+        const messageEl = document.getElementById('model-install-message');
+        const buttonEl = document.getElementById('install-model-btn');
+        if (!statusEl || !messageEl || !buttonEl || !modelStatus) return;
+
+        const install = modelStatus.install || {};
+        if (install.running) {
+            statusEl.textContent = 'Downloading';
+            messageEl.textContent = install.message || `Downloading ${modelStatus.model_id}…`;
+            buttonEl.disabled = true;
+            buttonEl.textContent = 'Installing…';
+        } else if (modelStatus.installed) {
+            statusEl.textContent = 'Installed';
+            messageEl.textContent = `${modelStatus.model_id} is available locally at ${modelStatus.model_dir}`;
+            buttonEl.disabled = false;
+            buttonEl.textContent = 'Reinstall Model';
+        } else if (install.status === 'error') {
+            statusEl.textContent = 'Error';
+            messageEl.textContent = install.message || 'Model install failed.';
+            buttonEl.disabled = false;
+            buttonEl.textContent = 'Retry Install';
+        } else {
+            statusEl.textContent = 'Not installed';
+            messageEl.textContent = `Install ${modelStatus.model_id} to enable offline embeddings.`;
+            buttonEl.disabled = false;
+            buttonEl.textContent = 'Save + Install Model';
         }
     }
 
@@ -1314,6 +1367,8 @@ const PhotoArchive = (() => {
         try {
             await loadSettingsPage(false);
             setSettingsStatus('Ready. Save to apply changes immediately.', 'muted');
+            if (settingsPoller) clearInterval(settingsPoller);
+            settingsPoller = setInterval(() => loadSettingsPage(false).catch(() => {}), 5000);
         } catch (err) {
             setSettingsStatus(`Could not load settings: ${err.message}`, 'error');
         }
@@ -1373,6 +1428,33 @@ const PhotoArchive = (() => {
         }
     }
 
+    async function installAIModel() {
+        setSettingsStatus('Saving settings and starting model install…', 'muted');
+        try {
+            const saveRes = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectSettingsForm()),
+            });
+            const saveData = await saveRes.json();
+            if (!saveRes.ok || !saveData.ok) {
+                throw new Error(saveData.error || 'Could not save settings');
+            }
+            populateSettingsForm(saveData.settings || {});
+            renderSettingsMeta(saveData);
+
+            const installRes = await fetch('/api/ai/model/install', { method: 'POST' });
+            const installData = await installRes.json();
+            if (!installRes.ok || !installData.ok) {
+                throw new Error(installData.error || 'Install could not be started');
+            }
+            renderModelStatus(installData.model_status);
+            setSettingsStatus('Model install started. The AI worker will pick it up automatically when the download finishes.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Model install failed to start: ${err.message}`, 'error');
+        }
+    }
+
     // ==================== UTILITIES ====================
 
     const PRELOAD_LIMIT = 200;
@@ -1427,5 +1509,6 @@ const PhotoArchive = (() => {
         saveSettings,
         resetSettings,
         clearThumbnailCache,
+        installAIModel,
     };
 })();

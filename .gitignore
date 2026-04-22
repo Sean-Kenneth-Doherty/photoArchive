@@ -2,6 +2,7 @@ elo_ratings.json
 web/.venv/
 web/.cache/
 web/.thumbcache/
+web/.models/
 web/settings.local.json
 web/photoranker.db
 web/photoarchive.db

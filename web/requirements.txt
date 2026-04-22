@@ -8,6 +8,7 @@ python-multipart
 scikit-learn
 sentence-transformers
 transformers
+huggingface_hub
 bitsandbytes
 accelerate
 qwen-vl-utils
