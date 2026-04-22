@@ -1063,7 +1063,9 @@ const PhotoArchive = (() => {
         filters.rating = newValue;
         document.querySelectorAll('.filter-star').forEach(s => {
             const star = parseInt(s.dataset.star);
-            s.classList.toggle('lit', newValue && star <= newValue);
+            const lit = newValue && star <= newValue;
+            s.classList.toggle('lit', lit);
+            s.textContent = lit ? '★' : '☆';
         });
         rankingsOffset = 0;
         rankingsExhausted = false;
