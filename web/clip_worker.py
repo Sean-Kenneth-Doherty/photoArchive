@@ -20,6 +20,7 @@ import numpy as np
 import ai_models
 import db
 import settings
+import thumbnails
 
 log = logging.getLogger("clip_worker")
 log.setLevel(logging.INFO)
@@ -171,37 +172,25 @@ def _load_model(model_dir: str, model_id: str):
     return model
 
 
-def _load_image_for_embedding(path: str):
-    from PIL import Image as PILImage, ImageOps
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".dng", ".cr3"):
-        import rawpy
-
-        with rawpy.imread(path) as raw:
-            rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True)
-        return PILImage.fromarray(rgb)
-
-    with PILImage.open(path) as source:
-        source.load()
-        img = ImageOps.exif_transpose(source)
-        if img is source:
-            img = source.copy()
-    return img
+def _load_image_for_embedding(image_id: int, path: str):
+    return thumbnails.load_embedding_image(path, image_id)
 
 
-def _embed_images(model, image_paths: list[str]) -> tuple[list[np.ndarray | None], list[str | None]]:
+def _embed_images(
+    model,
+    image_refs: list[tuple[int, str]],
+) -> tuple[list[np.ndarray | None], list[str | None]]:
     """Embed images from file paths. Returns vectors plus per-image error strings."""
     from PIL import Image as PILImage
 
-    results = [None] * len(image_paths)
-    errors = [None] * len(image_paths)
+    results = [None] * len(image_refs)
+    errors = [None] * len(image_refs)
     valid = []
     valid_indices = []
-    for i, path in enumerate(image_paths):
+    for i, (image_id, path) in enumerate(image_refs):
         img = None
         try:
-            img = _load_image_for_embedding(path)
+            img = _load_image_for_embedding(image_id, path)
             # Resize to max 1024px on long side to keep VRAM reasonable
             max_side = max(img.size)
             if max_side > 1024:
@@ -340,11 +329,11 @@ async def run_clip_worker():
             unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
                 _set_worker_status("embedding", f"Embedding {len(unembedded)} images…", ready=True)
-                image_paths = [row["filepath"] for row in unembedded]
+                image_refs = [(row["id"], row["filepath"]) for row in unembedded]
                 embed_started = time.perf_counter()
 
                 vectors, errors = await loop.run_in_executor(
-                    None, _embed_images, _model, image_paths
+                    None, _embed_images, _model, image_refs
                 )
 
                 batch = []

@@ -4,7 +4,7 @@ import io
 import os
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -21,6 +21,21 @@ templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "t
 
 # Track cull history for undo (in-memory stack of {image_id, previous_status})
 _cull_history: list[dict] = []
+_IDLE_ACTIVITY_EXCLUDED_PATHS = {
+    "/api/ai/status",
+    "/api/cache/status",
+    "/api/cache/pregen/status",
+    "/api/scan/status",
+    "/api/settings",
+}
+
+
+@app.middleware("http")
+async def track_idle_activity(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/static") and path not in _IDLE_ACTIVITY_EXCLUDED_PATHS:
+        thumbnails.note_user_activity()
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -163,24 +178,99 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
     return Response(content=data, media_type="image/jpeg", headers=headers)
 
 
+@app.get("/api/full/{image_id}")
+async def serve_full_image(request: Request, image_id: int):
+    image = await db.get_image_by_id(image_id)
+    if not image:
+        return JSONResponse({"error": "Image not found"}, status_code=404)
+
+    headers = thumbnails.response_headers(image["filepath"], thumbnails.FULL_TIER, image_id)
+    if request.headers.get("if-none-match") == headers["ETag"]:
+        return Response(status_code=304, headers=headers)
+
+    path = await thumbnails.get_full_image_path(image["filepath"], image_id)
+    if not path or not os.path.exists(path):
+        return JSONResponse({"error": "Full image unavailable"}, status_code=404)
+
+    return FileResponse(path, headers=headers)
+
+
 # --- Cache Status ---
+
+async def build_cache_status(ahead: int = 100):
+    stats = await db.get_stats()
+    target_total = stats["kept"] + stats["maybe"]
+    cache = thumbnails.cache_stats()
+
+    memory = cache["memory"]
+    disk = cache["disk"]
+    memory["utilization_pct"] = round(
+        (memory["used_bytes"] / memory["limit_bytes"]) * 100,
+        1,
+    ) if memory["limit_bytes"] > 0 else 0.0
+    disk["utilization_pct"] = round(
+        (disk["used_bytes"] / disk["limit_bytes"]) * 100,
+        1,
+    ) if disk["limit_bytes"] > 0 else 0.0
+
+    for tier_name, tier in disk["tiers"].items():
+        progress_total = target_total if tier_name in thumbnails.THUMB_TIERS else stats["total_images"]
+        tier["progress_total"] = progress_total
+        tier["progress_pct"] = round((tier["count"] / progress_total) * 100, 1) if progress_total > 0 else 0.0
+        tier["utilization_pct"] = round(
+            (tier["bytes"] / tier["budget_bytes"]) * 100,
+            1,
+        ) if tier["budget_bytes"] > 0 else 0.0
+
+    result = {
+        **cache,
+        "eligible_images": target_total,
+        "pregen": thumbnails.get_pregen_status(target_total),
+    }
+
+    if ahead > 0:
+        conn = await db.get_db()
+        try:
+            cursor = await conn.execute(
+                "SELECT id, filepath FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
+                (ahead,),
+            )
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+
+        result["total"] = len(rows)
+        result["cached"] = sum(
+            1 for row in rows if thumbnails.has_cached("lg", row["filepath"], row["id"])
+        )
+    else:
+        result["total"] = 0
+        result["cached"] = 0
+    result["window"] = ahead
+    return result
+
 
 @app.get("/api/cache/status")
 async def cache_status(ahead: int = 100):
-    """How many of the next N unculled images have thumbnails ready."""
-    conn = await db.get_db()
-    try:
-        cursor = await conn.execute(
-            "SELECT id, filepath FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
-            (ahead,),
-        )
-        rows = await cursor.fetchall()
-    finally:
-        await conn.close()
+    return await build_cache_status(ahead=ahead)
 
-    total = len(rows)
-    cached = sum(1 for r in rows if thumbnails.has_cached("lg", r["filepath"], r["id"]))
-    return {"total": total, "cached": cached, "window": ahead}
+
+@app.post("/api/cache/pregen/start")
+async def cache_pregen_start():
+    thumbnails.start_pregeneration()
+    return {"ok": True, "cache": await build_cache_status(ahead=0)}
+
+
+@app.post("/api/cache/pregen/stop")
+async def cache_pregen_stop():
+    thumbnails.stop_pregeneration()
+    return {"ok": True, "cache": await build_cache_status(ahead=0)}
+
+
+@app.get("/api/cache/pregen/status")
+async def cache_pregen_status():
+    stats = await db.get_stats()
+    return thumbnails.get_pregen_status(stats["kept"] + stats["maybe"])
 
 
 # --- Settings API ---
@@ -191,7 +281,7 @@ async def api_settings():
     ai_status = await build_ai_status()
     return {
         "settings": settings.get_settings(),
-        "cache_stats": thumbnails.cache_stats(),
+        "cache_stats": await build_cache_status(ahead=0),
         "model_status": model_status,
         "ai_status": ai_status,
         **settings.settings_metadata(),
@@ -205,7 +295,7 @@ async def api_save_settings(request: Request):
     return {
         "ok": True,
         "settings": saved,
-        "cache_stats": thumbnails.cache_stats(),
+        "cache_stats": await build_cache_status(ahead=0),
         "model_status": ai_models.get_model_status(),
         "ai_status": await build_ai_status(),
     }
@@ -218,7 +308,7 @@ async def api_reset_settings():
     return {
         "ok": True,
         "settings": saved,
-        "cache_stats": thumbnails.cache_stats(),
+        "cache_stats": await build_cache_status(ahead=0),
         "model_status": ai_models.get_model_status(),
         "ai_status": await build_ai_status(),
     }
@@ -230,7 +320,7 @@ async def api_clear_thumbnail_cache():
     return {
         "ok": True,
         **result,
-        "cache_stats": thumbnails.cache_stats(),
+        "cache_stats": await build_cache_status(ahead=0),
         "ai_status": await build_ai_status(),
     }
 
