@@ -713,6 +713,59 @@ async def api_exif(image_id: int):
     return {"exif": exif}
 
 
+@app.get("/api/collections")
+async def api_collections(n_clusters: int = 20):
+    """Auto-group images into collections using embedding clustering."""
+    try:
+        import clip_worker
+        import numpy as np
+        from sklearn.cluster import KMeans
+    except ImportError:
+        return JSONResponse({"error": "Dependencies not available"}, status_code=503)
+
+    all_embeddings = await db.get_all_embeddings()
+    if len(all_embeddings) < n_clusters:
+        return {"collections": []}
+
+    image_ids = [r["image_id"] for r in all_embeddings]
+    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+
+    kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
+    labels = kmeans.fit_predict(matrix)
+
+    # Group images by cluster and pick a representative (closest to centroid)
+    images_data = await db.get_images_by_ids(image_ids)
+    collections = []
+    for c in range(n_clusters):
+        cluster_indices = [i for i, l in enumerate(labels) if l == c]
+        if not cluster_indices:
+            continue
+
+        # Find representative: closest to centroid
+        centroid = kmeans.cluster_centers_[c]
+        cluster_vecs = matrix[cluster_indices]
+        dists = np.linalg.norm(cluster_vecs - centroid, axis=1)
+        rep_idx = cluster_indices[np.argmin(dists)]
+        rep_id = image_ids[rep_idx]
+        rep_img = images_data.get(rep_id, {})
+
+        member_ids = [image_ids[i] for i in cluster_indices]
+        collections.append({
+            "id": c,
+            "count": len(cluster_indices),
+            "representative": {
+                "id": rep_id,
+                "filename": rep_img.get("filename", ""),
+                "thumb_url": f"/api/thumb/sm/{rep_id}",
+            },
+            "image_ids": member_ids[:50],  # first 50 for preview
+        })
+
+    # Sort by size descending
+    collections.sort(key=lambda c: c["count"], reverse=True)
+    return {"collections": collections}
+
+
 @app.get("/api/stats")
 async def api_stats():
     return await db.get_stats()
