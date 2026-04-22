@@ -83,10 +83,11 @@ def _generate_thumbnail_sync(filepath: str, size: str, image_id: int) -> bytes:
             img = Image.open(filepath)
             img.load()  # Force read from disk
 
-        # Detect orientation from original dimensions
+        # Detect orientation and aspect ratio from original dimensions
         orientation = 'landscape' if img.width >= img.height else 'portrait'
+        aspect_ratio = round(img.width / img.height, 4) if img.height > 0 else 1.5
         with _orientation_lock:
-            _orientation_queue[image_id] = orientation
+            _orientation_queue[image_id] = (orientation, aspect_ratio)
 
         # Don't upscale — only downscale
         if img.width > target_width:
@@ -166,10 +167,10 @@ async def run_prefetch_worker():
             if pending:
                 conn = await db.get_db()
                 try:
-                    for img_id, orient in pending.items():
+                    for img_id, (orient, ar) in pending.items():
                         await conn.execute(
-                            "UPDATE images SET orientation = ? WHERE id = ? AND orientation IS NULL",
-                            (orient, img_id),
+                            "UPDATE images SET orientation = ?, aspect_ratio = ? WHERE id = ? AND orientation IS NULL",
+                            (orient, ar, img_id),
                         )
                     await conn.commit()
                 finally:

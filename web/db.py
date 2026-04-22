@@ -2,6 +2,7 @@ import aiosqlite
 import os
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoranker.db")
+EXPECTED_EMBEDDING_DIM = 768  # ViT-L/14
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS images (
@@ -55,11 +56,28 @@ async def init_db():
             ("orientation", "TEXT DEFAULT NULL"),
             ("predicted_elo", "REAL DEFAULT NULL"),
             ("uncertainty", "REAL DEFAULT NULL"),
+            ("aspect_ratio", "REAL DEFAULT NULL"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
             except Exception:
                 pass  # Column already exists
+        # Backfill aspect_ratio from orientation for images that don't have it yet
+        await db.execute(
+            "UPDATE images SET aspect_ratio = 1.5 WHERE orientation = 'landscape' AND aspect_ratio IS NULL"
+        )
+        await db.execute(
+            "UPDATE images SET aspect_ratio = 0.6667 WHERE orientation = 'portrait' AND aspect_ratio IS NULL"
+        )
+        # Check embedding dimension — if it changed (model upgrade), clear old embeddings
+        cursor = await db.execute("SELECT embedding FROM embeddings LIMIT 1")
+        row = await cursor.fetchone()
+        if row:
+            import struct
+            expected_bytes = EXPECTED_EMBEDDING_DIM * 4  # 4 bytes per float32
+            if len(row["embedding"]) != expected_bytes:
+                await db.execute("DELETE FROM embeddings")
+                await db.execute("UPDATE images SET predicted_elo = NULL, uncertainty = NULL")
         await db.commit()
     finally:
         await db.close()
@@ -98,12 +116,12 @@ async def get_unclassified_images(limit: int = 200):
         await db.close()
 
 
-async def batch_set_orientations(updates: list[tuple[str, int]]):
-    """Set orientation for multiple images. Each tuple: (orientation, image_id)."""
+async def batch_set_orientations(updates: list[tuple[str, float, int]]):
+    """Set orientation and aspect_ratio for multiple images. Each tuple: (orientation, aspect_ratio, image_id)."""
     db = await get_db()
     try:
         await db.executemany(
-            "UPDATE images SET orientation = ? WHERE id = ?",
+            "UPDATE images SET orientation = ?, aspect_ratio = ? WHERE id = ?",
             updates,
         )
         await db.commit()
@@ -273,7 +291,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
         cursor = await db.execute(
-            f"SELECT id, filename, filepath, elo, comparisons, status, predicted_elo FROM images "
+            f"SELECT id, filename, filepath, elo, comparisons, status, predicted_elo, aspect_ratio FROM images "
             f"WHERE status IN ('kept', 'maybe') ORDER BY {order} LIMIT ? OFFSET ?",
             (limit, offset),
         )

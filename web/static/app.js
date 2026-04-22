@@ -733,16 +733,101 @@ const PhotoRanker = (() => {
         if (empty) empty.classList.remove('hidden');
     }
 
-    // ==================== RANKINGS ====================
+    // ==================== LIBRARY ====================
 
     let rankingsSort = 'elo';
+    let searchQuery = '';
+    let searchDebounce = null;
 
-    async function initRankings() {
+    async function initLibrary() {
         rankingsOffset = 0;
         await loadRankings();
+
+        // Load stats and AI status for the bottom bar
+        try {
+            const stats = await (await fetch('/api/stats')).json();
+            compareStats = stats;
+            updateCompareProgress();
+        } catch {}
+        pollAIStatus();
+        setInterval(pollAIStatus, 5000);
+
+        // Set up search input
+        const input = document.getElementById('search-input');
+        if (input) {
+            input.addEventListener('input', (e) => {
+                clearTimeout(searchDebounce);
+                searchDebounce = setTimeout(() => {
+                    searchQuery = e.target.value.trim();
+                    const clearBtn = document.getElementById('search-clear');
+                    if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
+                    // Switch to search mode or back to sort mode
+                    rankingsOffset = 0;
+                    document.getElementById('rankings-grid').innerHTML = '';
+                    const sortToggles = document.getElementById('sort-toggles');
+                    if (sortToggles) sortToggles.style.opacity = searchQuery ? '0.3' : '1';
+                    if (searchQuery) {
+                        loadSearchResults();
+                    } else {
+                        loadRankings();
+                    }
+                }, 300);
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') clearSearch();
+            });
+        }
+    }
+
+    function initRankings() { initLibrary(); }
+
+    function clearSearch() {
+        searchQuery = '';
+        const input = document.getElementById('search-input');
+        const clearBtn = document.getElementById('search-clear');
+        const sortToggles = document.getElementById('sort-toggles');
+        if (input) input.value = '';
+        if (clearBtn) clearBtn.classList.add('hidden');
+        if (sortToggles) sortToggles.style.opacity = '1';
+        rankingsOffset = 0;
+        document.getElementById('rankings-grid').innerHTML = '';
+        loadRankings();
+    }
+
+    async function loadSearchResults() {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&limit=100`);
+        const data = await res.json();
+        const grid = document.getElementById('rankings-grid');
+        const rowH = getRowHeight();
+
+        for (let i = 0; i < data.images.length; i++) {
+            const img = data.images[i];
+            const ar = img.aspect_ratio || 1.5;
+            const card = document.createElement('div');
+            card.className = 'rank-card';
+            card.style.height = rowH + 'px';
+            card.style.flexGrow = ar;
+            card.style.flexBasis = (rowH * ar) + 'px';
+            card.onclick = () => openLightbox(img);
+
+            const simPct = (img.similarity * 100).toFixed(0);
+
+            card.innerHTML = `
+                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <div class="rank-card-info">
+                    <span class="rank-elo">${img.elo} Elo</span>
+                    <span class="rank-similarity">${simPct}% match</span>
+                </div>
+            `;
+            grid.appendChild(card);
+        }
+
+        const loadMoreWrap = document.getElementById('load-more-wrap');
+        if (loadMoreWrap) loadMoreWrap.classList.add('hidden');
     }
 
     function setRankingsSort(sort) {
+        if (searchQuery) return; // ignore sort changes during search
         rankingsSort = sort;
         rankingsOffset = 0;
         document.getElementById('rankings-grid').innerHTML = '';
@@ -754,22 +839,29 @@ const PhotoRanker = (() => {
         loadRankings();
     }
 
+    function getRowHeight() {
+        return Math.max(160, Math.min(280, window.innerHeight * 0.25));
+    }
+
     async function loadRankings() {
         const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc' || rankingsSort === 'ai');
+        const rowH = getRowHeight();
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
             const rank = rankingsOffset + i + 1;
+            const ar = img.aspect_ratio || 1.5;
 
             const card = document.createElement('div');
             card.className = 'rank-card';
+            card.style.height = rowH + 'px';
+            card.style.flexGrow = ar;
+            card.style.flexBasis = (rowH * ar) + 'px';
             card.onclick = () => openLightbox(img);
 
-            // Show effective elo: direct if compared, predicted if not
-            const effectiveElo = img.comparisons > 0 ? img.elo : (img.predicted_elo || img.elo);
             const eloLabel = img.comparisons > 0 ? `${img.elo}` : (img.predicted_elo ? `~${img.predicted_elo}` : `${img.elo}`);
             const sourceTag = img.comparisons === 0 && img.predicted_elo ? '<span class="rank-ai-tag">AI</span>' : '';
 
@@ -778,9 +870,8 @@ const PhotoRanker = (() => {
                 : `<span class="rank-elo">${eloLabel} ${sourceTag}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
 
             card.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">
+                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
                 <div class="rank-card-info">${infoLine}</div>
-                <div class="rank-filename">${img.filename}</div>
             `;
             grid.appendChild(card);
         }
@@ -803,7 +894,6 @@ const PhotoRanker = (() => {
         const lb = document.getElementById('lightbox');
         const lbImg = document.getElementById('lightbox-img');
         const lbInfo = document.getElementById('lightbox-info');
-        // Use md size for lightbox
         lbImg.src = `/api/thumb/md/${img.id}`;
         lbInfo.textContent = `${img.filename} — ${img.elo} Elo — ${img.comparisons} comparisons`;
         lb.classList.remove('hidden');
@@ -842,7 +932,9 @@ const PhotoRanker = (() => {
     return {
         initCull,
         initCompare,
+        initLibrary,
         initRankings,
+        clearSearch,
         setCullMode,
         setCompareMode,
         loadMoreRankings,

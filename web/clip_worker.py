@@ -20,9 +20,14 @@ log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-EMBEDDING_DIM = 512
+EMBEDDING_DIM = 768
 BATCH_SIZE = 64
 RETRAIN_EVERY = 50  # retrain after this many new comparisons
+
+# Module-level references for text search (set by run_clip_worker on startup)
+_clip_model = None
+_clip_device = None
+_clip_tokenizer = None
 
 
 def _load_clip_model():
@@ -32,11 +37,12 @@ def _load_clip_model():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="laion2b_s34b_b79k", device=device
+        "ViT-L-14", pretrained="datacomp_xl_s13b_b90k", device=device
     )
     model.eval()
+    tokenizer = open_clip.get_tokenizer("ViT-L-14")
     log.info(f"CLIP model loaded on {device}")
-    return model, preprocess, device
+    return model, preprocess, device, tokenizer
 
 
 def _embed_batch(model, preprocess, device, jpeg_bytes_list: list[bytes]) -> list[np.ndarray]:
@@ -70,6 +76,18 @@ def _embed_batch(model, preprocess, device, jpeg_bytes_list: list[bytes]) -> lis
     for idx, valid_i in enumerate(valid_indices):
         results[valid_i] = features[idx]
     return results
+
+
+def encode_text(query: str) -> np.ndarray | None:
+    """Encode a text query into a CLIP embedding. Returns None if model not loaded."""
+    if _clip_model is None or _clip_tokenizer is None:
+        return None
+    import torch
+    tokens = _clip_tokenizer([query]).to(_clip_device)
+    with torch.no_grad():
+        text_features = _clip_model.encode_text(tokens)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        return text_features.cpu().numpy().astype(np.float32)[0]
 
 
 def vec_to_blob(vec: np.ndarray) -> bytes:
@@ -112,8 +130,13 @@ async def run_clip_worker():
     """Main background loop: embed, train, predict."""
     loop = asyncio.get_event_loop()
 
+    global _clip_model, _clip_device, _clip_tokenizer
+
     log.info("CLIP worker starting — loading model...")
-    model, preprocess, device = await loop.run_in_executor(None, _load_clip_model)
+    model, preprocess, device, tokenizer = await loop.run_in_executor(None, _load_clip_model)
+    _clip_model = model
+    _clip_device = device
+    _clip_tokenizer = tokenizer
 
     last_train_count = await db.get_comparison_count()
     has_model = False

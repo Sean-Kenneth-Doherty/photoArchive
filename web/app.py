@@ -46,9 +46,10 @@ async def classify_orientations_background():
                 w, h = img.size
                 img.close()
                 orient = "landscape" if w >= h else "portrait"
-                results.append((orient, row["id"]))
+                ar = round(w / h, 4) if h > 0 else 1.5
+                results.append((orient, ar, row["id"]))
             except Exception:
-                results.append(("landscape", row["id"]))
+                results.append(("landscape", 1.5, row["id"]))
         return results
 
     while True:
@@ -92,7 +93,12 @@ async def compare_page(request: Request):
 
 @app.get("/rankings", response_class=HTMLResponse)
 async def rankings_page(request: Request):
-    return templates.TemplateResponse(request, "rankings.html")
+    return templates.TemplateResponse(request, "library.html")
+
+
+@app.get("/library", response_class=HTMLResponse)
+async def library_page(request: Request):
+    return templates.TemplateResponse(request, "library.html")
 
 
 # --- Scan API ---
@@ -467,6 +473,7 @@ async def api_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
             "predicted_elo": round(predicted, 1) if predicted is not None else None,
             "comparisons": d["comparisons"],
             "status": d["status"],
+            "aspect_ratio": d.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{d['id']}",
         })
     return {"images": result}
@@ -500,6 +507,57 @@ async def export_rankings(format: str = "json"):
         )
 
     return data
+
+
+@app.get("/api/search")
+async def api_search(q: str = "", limit: int = 50):
+    """Search images by text query using CLIP text-image similarity."""
+    if not q.strip():
+        return {"images": [], "query": q}
+
+    try:
+        import clip_worker
+        import numpy as np
+    except ImportError:
+        return JSONResponse({"error": "CLIP not available"}, status_code=503)
+
+    text_vec = await asyncio.get_event_loop().run_in_executor(None, clip_worker.encode_text, q)
+    if text_vec is None:
+        return JSONResponse({"error": "CLIP model still loading"}, status_code=503)
+
+    all_embeddings = await db.get_all_embeddings()
+    if not all_embeddings:
+        return {"images": [], "query": q}
+
+    # Compute cosine similarity against all image embeddings
+    image_ids = [row["image_id"] for row in all_embeddings]
+    matrix = np.array([clip_worker.blob_to_vec(row["embedding"]) for row in all_embeddings])
+    similarities = matrix @ text_vec  # already L2-normalized, so dot product = cosine sim
+
+    # Get top results
+    top_indices = np.argsort(similarities)[::-1][:limit]
+    top_ids = [image_ids[i] for i in top_indices]
+    top_scores = [float(similarities[i]) for i in top_indices]
+
+    # Fetch image details
+    images = await db.get_images_by_ids(top_ids)
+
+    result = []
+    for img_id, score in zip(top_ids, top_scores):
+        img = images.get(img_id)
+        if not img:
+            continue
+        result.append({
+            "id": img_id,
+            "filename": img["filename"],
+            "elo": round(img["elo"], 1),
+            "comparisons": img["comparisons"],
+            "similarity": round(score, 4),
+            "aspect_ratio": img.get("aspect_ratio") or 1.5,
+            "thumb_url": f"/api/thumb/sm/{img_id}",
+        })
+
+    return {"images": result, "query": q}
 
 
 @app.get("/api/stats")
