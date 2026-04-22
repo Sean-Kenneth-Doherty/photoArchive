@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-photoArchive is a FastAPI web app that ranks photos using Elo ratings via a three-phase workflow: Cull → Compare → Rankings.
+photoArchive is a FastAPI web app for managing, ranking, and searching a large photo archive using AI-powered embeddings and Elo-based ranking. The workflow: Cull bad images, Compare/rank keepers via mosaic grid, Browse/search in the Library.
 
 ## Running
 
@@ -20,46 +20,88 @@ cd web && python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Arch Linux enforces PEP 668 — never use system pip directly.
 
-## Web App Architecture
+Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edits`. The HDD is slow, so prefetching and caching are critical throughout.
+
+## Architecture
 
 ### Backend (FastAPI + aiosqlite)
 
 | File | Purpose |
 |---|---|
-| `app.py` | Routes, startup tasks (prefetch worker, orientation classifier) |
-| `db.py` | SQLite schema, queries, WAL mode. Tables: `images`, `comparisons` |
+| `app.py` | Routes, startup tasks, API endpoints for all features |
+| `db.py` | SQLite schema, queries, WAL mode. Tables: `images`, `comparisons`, `embeddings` |
+| `clip_worker.py` | Background AI worker: Qwen3-VL-Embedding-2B (int4), taste model training, text search encoding |
+| `ai_models.py` | Model installation/management, download state tracking |
+| `settings.py` | Runtime settings with JSON persistence, hot-reload support |
 | `scanner.py` | Recursive folder scan, batch inserts (100 at a time) |
 | `pairing.py` | Elo calculation, Swiss-system pairing with 30% random swap |
-| `thumbnails.py` | Three-size thumbnail generation (sm/md/lg), in-memory LRU cache, background prefetch |
+| `thumbnails.py` | Three-size thumbnail generation (sm/md/lg), LRU cache, disk cache, background prefetch |
 
 ### Frontend (vanilla HTML/CSS/JS)
 
-- `static/app.js` — IIFE module pattern returning `photoArchive` object. Manages all UI state.
-- `static/style.css` — Dark theme, responsive grids
-- `templates/` — Jinja2 templates extending `base.html`
+| File | Purpose |
+|---|---|
+| `static/app.js` | IIFE module (`PhotoArchive`). All UI state for cull, compare, library, settings |
+| `static/style.css` | Dark theme, justified flex grids, bottom bar, lightbox, filters |
+| `templates/base.html` | Base layout with navbar/bottom_bar blocks |
+| `templates/_filters.html` | Shared filter partial (orientation, ranked status, stars, folder, thumb slider) |
+| `templates/compare.html` | Mosaic/Swiss/Top50 compare modes with AI panel |
+| `templates/library.html` | Justified photo grid with search, filters, lightbox, batch select |
+| `templates/cull.html` | Single-image and grid cull modes |
+| `templates/settings.html` | Thumbnail, cache, and AI model configuration |
+| `templates/index.html` | Landing page with folder scan |
 
 ### Database Schema
 
-**images**: id, filename, filepath (UNIQUE), elo (default 1200), comparisons, status (unculled|kept|maybe|rejected), orientation (landscape|portrait|null)
+**images**: id, filename, filepath (UNIQUE), elo (default 1200), comparisons, status (unculled|kept|maybe|rejected), orientation, predicted_elo, uncertainty, aspect_ratio
 
-**comparisons**: winner_id, loser_id, mode (swiss|topn|mosaic), elo_before_winner, elo_before_loser (for undo support)
+**comparisons**: winner_id, loser_id, mode (swiss|topn|mosaic), elo_before_winner, elo_before_loser (for undo)
 
-### Three-Phase Workflow
+**embeddings**: image_id (PK), embedding (BLOB, 2048-dim float32), created_at
 
-1. **Cull** — Filter bad images quickly. Single-image (arrow keys) or grid mode (batch click). Status transitions: unculled → kept/maybe/rejected.
-2. **Compare** — Rank kept/maybe images via:
-   - **Mosaic mode**: Pick best from 4x3 grid → records 11 comparisons per click (K=12)
-   - **Swiss mode**: A/B pairs sorted by Elo (K=20 swiss, K=16 top-N refinement)
-3. **Rankings** — View sorted results, export JSON/CSV, lightbox viewer
+### Pages
 
-### Thumbnail System
+1. **/** — Landing page, folder scan
+2. **/cull** — Filter bad images. Single (arrow keys) or grid mode (batch click)
+3. **/compare** — Rank via mosaic (pick best from justified grid) or Swiss A/B pairs
+4. **/library** — Browse, search, filter, export. Justified flex grid with infinite scroll
+5. **/settings** — Thumbnail sizes, cache config, AI model install/status
 
-Three sizes: sm (400px, grids), md (1920px, A/B compare), lg (3840px, cull single view). All cached in-memory via LRU (OrderedDict with locks). Background prefetch worker generates sm thumbnails for kept images continuously with 50ms yields to avoid starving user requests. Photos are expected to be on a slow HDD, so prefetching is critical.
+### AI System (`clip_worker.py`)
 
-### Key Patterns
+- **Model**: Qwen3-VL-Embedding-2B, int4 quantized via bitsandbytes, ~3.4GB VRAM
+- **Embeddings**: 2048-dim (Matryoshka truncated from 4096), stored as BLOB in `embeddings` table
+- **Taste model**: Ridge regression trained on (embedding, elo) pairs. Predicts elo for uncompared images. Computes per-image uncertainty via leverage for active learning.
+- **Effective Elo**: `elo if comparisons > 0 else predicted_elo`. Used for mosaic pairing, never overwrites direct elo.
+- **Text search**: Encodes query text via same model, cosine similarity against all image embeddings
+- **Find Similar**: Cosine similarity from a source image to all others
+- **Auto-collections**: K-means clustering on embeddings
+- **Duplicate detection**: Pairwise cosine similarity above threshold
+- **Background loop**: Embeds in batches of 4, trains taste model every 5 batches, reports speed/ETA metrics
 
-- **Fire-and-forget**: Cull and mosaic picks POST without awaiting response for instant feel
-- **Undo**: Cull uses in-memory stack; Compare uses DB-backed elo_before values
-- **Prefetch**: Separate ThreadPoolExecutor (2 workers) for background work vs 4 workers for user requests
-- **Swiss pairing**: Sort by Elo, 30% chance to swap adjacent, look ahead 5 positions to avoid repeat matchups
+### UI Patterns
 
+- **Bottom bar**: Fixed bar on compare/library/settings pages. Contains mode toggles, filters, stats, AI status, nav links. Wraps on narrow viewports.
+- **Justified flex grid**: Both library and mosaic use `flex-wrap` with `flex-grow: aspectRatio` per card. Library scrolls, mosaic fits viewport via binary-search row height.
+- **Shared filters** (`_filters.html`): Orientation icons, ranked status icons, star rating (hover preview), folder dropdown, thumb size slider. Used on both compare and library pages.
+- **Lightbox**: Arrow key navigation, EXIF metadata, Find Similar button
+- **Fire-and-forget**: Cull and mosaic picks POST without awaiting response
+- **Infinite scroll**: Library loads more images when within 600px of bottom
+
+### Key API Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/mosaic/next` | Get images for mosaic grid with strategy/filter params |
+| `POST /api/mosaic/pick` | Record mosaic comparison (winner vs all losers) |
+| `GET /api/rankings` | Paginated ranked images with sort/filter params |
+| `GET /api/search?q=` | Text-to-image search via embedding similarity |
+| `GET /api/similar/{id}` | Find visually similar images |
+| `GET /api/duplicates` | Near-duplicate detection |
+| `GET /api/collections` | Auto-grouped collections via k-means |
+| `GET /api/folders` | Folder tree with image counts |
+| `GET /api/ai/status` | Embedding progress, model state, speed metrics, ETA |
+| `GET /api/image/{id}/exif` | EXIF metadata from image file |
+| `GET /api/settings` | Current settings + cache stats + model status |
+| `POST /api/settings` | Save settings (hot-reload) |
+| `POST /api/ai/model/install` | Trigger model download |
