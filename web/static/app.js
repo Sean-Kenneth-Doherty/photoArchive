@@ -17,6 +17,7 @@ const PhotoArchive = (() => {
 
     // --- Rankings State ---
     let rankingsOffset = 0;
+    const INITIAL_RANKINGS_PAGE_SIZE = 48;
     const RANKINGS_PAGE_SIZE = 100;
     const BACKGROUND_WARM_DELAY_MS = 250;
     const LIBRARY_NEIGHBOR_LIMIT = 24;
@@ -24,6 +25,8 @@ const PhotoArchive = (() => {
     const COMPARE_NEIGHBOR_PAIRS = 4;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
+    const WARM_CACHE_PREFIX = 'photoarchive:warm:';
+    const WARM_CACHE_MAX_AGE_MS = 30000;
 
     function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
         const token = (backgroundWarmTokens.get(key) || 0) + 1;
@@ -59,6 +62,36 @@ const PhotoArchive = (() => {
         }
     }
 
+    function warmCacheKey(key) {
+        return `${WARM_CACHE_PREFIX}${key}`;
+    }
+
+    function saveWarmCache(key, data) {
+        if (typeof sessionStorage === 'undefined' || !data) return;
+        try {
+            sessionStorage.setItem(
+                warmCacheKey(key),
+                JSON.stringify({ savedAt: Date.now(), data }),
+            );
+        } catch {}
+    }
+
+    function takeWarmCache(key) {
+        if (typeof sessionStorage === 'undefined') return null;
+        try {
+            const storageKey = warmCacheKey(key);
+            const raw = sessionStorage.getItem(storageKey);
+            if (!raw) return null;
+            sessionStorage.removeItem(storageKey);
+            const parsed = JSON.parse(raw);
+            if (!parsed?.data) return null;
+            if (Date.now() - Number(parsed.savedAt || 0) > WARM_CACHE_MAX_AGE_MS) return null;
+            return parsed.data;
+        } catch {
+            return null;
+        }
+    }
+
     function warmImageUrls(urls) {
         for (const url of urls || []) {
             preloadImage(url);
@@ -70,6 +103,7 @@ const PhotoArchive = (() => {
             if (!isWarmTokenCurrent(key, token)) return;
             const data = await fetchWarmJson(request.url);
             if (!data || !isWarmTokenCurrent(key, token)) return;
+            if (request.cacheKey) saveWarmCache(request.cacheKey, data);
             warmImageUrls(request.extract(data));
         }
     }
@@ -370,8 +404,9 @@ const PhotoArchive = (() => {
     }
 
     async function loadMosaicBatch() {
-        const res = await fetch(`/api/mosaic/next?n=${MOSAIC_SIZE}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}${filterParams()}`);
-        const data = await res.json();
+        const url = buildMosaicUrl({ n: MOSAIC_SIZE });
+        const data = takeWarmCache(`compare:${url}`) || await fetchWarmJson(url);
+        if (!data) return;
         compareStats = data.stats || {};
         updateCompareProgress();
 
@@ -389,6 +424,7 @@ const PhotoArchive = (() => {
         renderMosaic();
         mosaicFillReplacements();
         scheduleCompareNeighborWarmup('mosaic');
+        scheduleCrossViewWarmup('compare');
     }
 
     function renderMosaic() {
@@ -666,8 +702,10 @@ const PhotoArchive = (() => {
     }
 
     async function fetchComparePairs() {
-        const res = await fetch(`/api/compare/next?n=8&mode=${compareMode}`);
-        const data = await res.json();
+        const url = buildCompareUrl(compareMode, 8);
+        const useCache = compareIndex === 0 && comparePairs.length === 0;
+        const data = (useCache ? takeWarmCache(`compare:${url}`) : null) || await fetchWarmJson(url);
+        if (!data) return;
         compareStats = data.stats || {};
 
         if (data.pairs.length === 0 && comparePairs.length === 0) {
@@ -685,6 +723,7 @@ const PhotoArchive = (() => {
         if (compareIndex === 0) {
             scheduleCompareNeighborWarmup(compareMode);
         }
+        scheduleCrossViewWarmup('compare');
     }
 
     function showComparePair() {
@@ -923,6 +962,48 @@ const PhotoArchive = (() => {
         return `/api/compare/next?n=${n}&mode=${mode}`;
     }
 
+    function currentLibraryPageSize() {
+        return rankingsOffset === 0 ? INITIAL_RANKINGS_PAGE_SIZE : RANKINGS_PAGE_SIZE;
+    }
+
+    function scheduleCrossViewWarmup(fromView) {
+        if (fromView === 'compare') {
+            const libraryUrl = buildRankingsUrl({
+                sort: 'elo',
+                filterState: { orientation: '', compared: '', rating: '', folder: '' },
+                limit: INITIAL_RANKINGS_PAGE_SIZE,
+                offset: 0,
+            });
+            const requests = [{
+                url: libraryUrl,
+                cacheKey: `library:${libraryUrl}`,
+                extract: imageThumbUrls,
+            }];
+            scheduleBackgroundWarm(
+                'crossview-library',
+                (token) => warmRequests('crossview-library', token, requests),
+                200,
+            );
+        } else if (fromView === 'library') {
+            const compareUrl = buildMosaicUrl({
+                strategy: 'explore',
+                filterState: { orientation: '', compared: '', rating: '', folder: '' },
+                gridElo: 0,
+                n: MOSAIC_SIZE,
+            });
+            const requests = [{
+                url: compareUrl,
+                cacheKey: `compare:${compareUrl}`,
+                extract: imageThumbUrls,
+            }];
+            scheduleBackgroundWarm(
+                'crossview-compare',
+                (token) => warmRequests('crossview-compare', token, requests),
+                200,
+            );
+        }
+    }
+
     function scheduleLibraryNeighborWarmup() {
         if (searchQuery) return;
 
@@ -1134,9 +1215,13 @@ const PhotoArchive = (() => {
         if (rankingsLoading) return;
         rankingsLoading = true;
         const requestOffset = rankingsOffset;
-        let url = `/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
-        const res = await fetch(url);
-        const data = await res.json();
+        const limit = currentLibraryPageSize();
+        let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
+        const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
+        if (!data) {
+            rankingsLoading = false;
+            return;
+        }
         const grid = document.getElementById('rankings-grid');
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc' || rankingsSort === 'ai');
         const rowH = thumbHeight;
@@ -1179,11 +1264,12 @@ const PhotoArchive = (() => {
 
         rankingsOffset += data.images.length;
         rankingsLoading = false;
-        if (data.images.length < RANKINGS_PAGE_SIZE) {
+        if (data.images.length < limit) {
             rankingsExhausted = true;
         }
         if (requestOffset === 0 && data.images.length > 0) {
             scheduleLibraryNeighborWarmup();
+            scheduleCrossViewWarmup('library');
         }
     }
 

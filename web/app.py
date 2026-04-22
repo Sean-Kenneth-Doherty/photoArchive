@@ -694,6 +694,12 @@ async def api_rankings(
         orientation=orientation, compared=compared, min_stars=min_stars,
         folder=folder,
     )
+    if images:
+        await thumbnails.prefetch_images(
+            [dict(img) for img in images],
+            "sm",
+            limit=min(len(images), 48),
+        )
     result = []
     for img in images:
         d = dict(img)
