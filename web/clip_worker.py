@@ -12,6 +12,8 @@ import logging
 import os
 import struct
 import asyncio
+import time
+from collections import deque
 
 import numpy as np
 
@@ -27,6 +29,7 @@ if not log.handlers:
 EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
 BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
+EMBED_SPEED_WINDOW_SECONDS = 300
 
 # Module-level reference for text search (set by run_clip_worker on startup)
 _model = None
@@ -40,7 +43,16 @@ _worker_status = {
     "model_id": "",
     "model_dir": "",
     "last_error": "",
+    "last_batch_size": 0,
+    "last_batch_seconds": 0.0,
+    "last_embedded_at": None,
+    "session_embedded": 0,
+    "session_started_at": None,
+    "session_embed_seconds": 0.0,
+    "recent_images_per_min": 0.0,
+    "overall_images_per_min": 0.0,
 }
+_embedding_history = deque()
 
 
 def _set_worker_status(state: str, message: str = "", ready: bool = False, last_error: str = ""):
@@ -55,7 +67,49 @@ def _set_worker_status(state: str, message: str = "", ready: bool = False, last_
     })
 
 
+def _recompute_speed_metrics(now: float | None = None):
+    now = now or time.time()
+    cutoff = now - EMBED_SPEED_WINDOW_SECONDS
+    while _embedding_history and _embedding_history[0]["ended_at"] < cutoff:
+        _embedding_history.popleft()
+
+    recent_images = sum(item["count"] for item in _embedding_history)
+    recent_seconds = sum(item["seconds"] for item in _embedding_history)
+    overall_images = _worker_status["session_embedded"]
+    overall_seconds = _worker_status["session_embed_seconds"]
+
+    _worker_status["recent_images_per_min"] = (
+        round((recent_images / recent_seconds) * 60, 2) if recent_seconds > 0 else 0.0
+    )
+    _worker_status["overall_images_per_min"] = (
+        round((overall_images / overall_seconds) * 60, 2) if overall_seconds > 0 else 0.0
+    )
+
+
+def _record_embedding_batch(count: int, seconds: float):
+    if count <= 0:
+        return
+
+    now = time.time()
+    if not _worker_status["session_started_at"]:
+        _worker_status["session_started_at"] = now
+
+    seconds = max(float(seconds), 0.001)
+    _worker_status["last_batch_size"] = count
+    _worker_status["last_batch_seconds"] = round(seconds, 3)
+    _worker_status["last_embedded_at"] = now
+    _worker_status["session_embedded"] += count
+    _worker_status["session_embed_seconds"] += seconds
+    _embedding_history.append({
+        "ended_at": now,
+        "count": count,
+        "seconds": seconds,
+    })
+    _recompute_speed_metrics(now)
+
+
 def get_worker_status() -> dict:
+    _recompute_speed_metrics()
     return dict(_worker_status)
 
 
@@ -216,6 +270,7 @@ async def run_clip_worker():
             if unembedded:
                 _set_worker_status("embedding", f"Embedding {len(unembedded)} images…", ready=True)
                 image_paths = [row["filepath"] for row in unembedded]
+                embed_started = time.perf_counter()
 
                 vectors = await loop.run_in_executor(
                     None, _embed_images, _model, image_paths
@@ -228,6 +283,7 @@ async def run_clip_worker():
 
                 if batch:
                     await db.store_embeddings_batch(batch)
+                    _record_embedding_batch(len(batch), time.perf_counter() - embed_started)
                     embedded_count = await db.get_embedding_count()
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")
 

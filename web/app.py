@@ -188,10 +188,12 @@ async def cache_status(ahead: int = 100):
 @app.get("/api/settings")
 async def api_settings():
     model_status = ai_models.get_model_status()
+    ai_status = await build_ai_status()
     return {
         "settings": settings.get_settings(),
         "cache_stats": thumbnails.cache_stats(),
         "model_status": model_status,
+        "ai_status": ai_status,
         **settings.settings_metadata(),
     }
 
@@ -205,6 +207,7 @@ async def api_save_settings(request: Request):
         "settings": saved,
         "cache_stats": thumbnails.cache_stats(),
         "model_status": ai_models.get_model_status(),
+        "ai_status": await build_ai_status(),
     }
 
 
@@ -217,6 +220,7 @@ async def api_reset_settings():
         "settings": saved,
         "cache_stats": thumbnails.cache_stats(),
         "model_status": ai_models.get_model_status(),
+        "ai_status": await build_ai_status(),
     }
 
 
@@ -227,6 +231,7 @@ async def api_clear_thumbnail_cache():
         "ok": True,
         **result,
         "cache_stats": thumbnails.cache_stats(),
+        "ai_status": await build_ai_status(),
     }
 
 
@@ -237,6 +242,7 @@ async def api_install_ai_model():
         "ok": True,
         "install": state,
         "model_status": ai_models.get_model_status(),
+        "ai_status": await build_ai_status(),
     }
 
 
@@ -921,12 +927,13 @@ async def api_stats():
     return await db.get_stats()
 
 
-@app.get("/api/ai/status")
-async def ai_status():
-    """CLIP embedding and taste model status for the bottom bar."""
+async def build_ai_status():
+    """Embedding worker + model install status for UI surfaces."""
     embedded = await db.get_embedding_count()
     stats = await db.get_stats()
     total_kept = stats["kept"] + stats["maybe"]
+    remaining = max(total_kept - embedded, 0)
+
     worker_status = {}
     try:
         import clip_worker
@@ -939,8 +946,18 @@ async def ai_status():
             "model_id": "",
             "model_dir": "",
             "last_error": "",
+            "last_batch_size": 0,
+            "last_batch_seconds": 0.0,
+            "last_embedded_at": None,
+            "session_embedded": 0,
+            "session_started_at": None,
+            "session_embed_seconds": 0.0,
+            "recent_images_per_min": 0.0,
+            "overall_images_per_min": 0.0,
         }
+
     model_status = ai_models.get_model_status()
+
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
@@ -953,9 +970,18 @@ async def ai_status():
         compared = (await cursor.fetchone())["c"]
     finally:
         await conn.close()
+
+    recent_rate = float(worker_status.get("recent_images_per_min") or 0.0)
+    overall_rate = float(worker_status.get("overall_images_per_min") or 0.0)
+    effective_rate = recent_rate if recent_rate > 0 else overall_rate
+    eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
+    progress_pct = round((embedded / total_kept) * 100, 1) if total_kept > 0 else 0.0
+
     return {
         "embedded": embedded,
         "total_kept": total_kept,
+        "remaining": remaining,
+        "progress_pct": progress_pct,
         "model_trained": predicted > 0,
         "predicted": predicted,
         "compared": compared,
@@ -969,7 +995,22 @@ async def ai_status():
         "worker_message": worker_status["message"],
         "worker_ready": worker_status["ready"],
         "worker_error": worker_status["last_error"],
+        "last_batch_size": worker_status.get("last_batch_size", 0),
+        "last_batch_seconds": worker_status.get("last_batch_seconds", 0.0),
+        "last_embedded_at": worker_status.get("last_embedded_at"),
+        "session_embedded": worker_status.get("session_embedded", 0),
+        "session_started_at": worker_status.get("session_started_at"),
+        "session_embed_seconds": worker_status.get("session_embed_seconds", 0.0),
+        "recent_images_per_min": recent_rate,
+        "overall_images_per_min": overall_rate,
+        "eta_seconds": eta_seconds,
     }
+
+
+@app.get("/api/ai/status")
+async def ai_status():
+    """CLIP embedding and taste model status for the bottom bar."""
+    return await build_ai_status()
 
 
 if __name__ == "__main__":

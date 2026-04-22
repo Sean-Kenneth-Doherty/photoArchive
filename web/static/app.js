@@ -1294,6 +1294,7 @@ const PhotoArchive = (() => {
             pathEl.textContent = data.settings_path;
         }
         renderModelStatus(data.model_status);
+        renderAISettingsStatus(data.ai_status);
     }
 
     function renderModelStatus(modelStatus) {
@@ -1324,6 +1325,67 @@ const PhotoArchive = (() => {
             buttonEl.disabled = false;
             buttonEl.textContent = 'Save + Install Model';
         }
+    }
+
+    function formatRatePerMinute(rate) {
+        const value = Number(rate || 0);
+        if (value <= 0) return 'Waiting for data';
+        return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} images/min`;
+    }
+
+    function formatEta(seconds) {
+        const totalSeconds = Math.max(0, Math.round(Number(seconds || 0)));
+        if (!totalSeconds) return 'Calculating…';
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        if (hours > 0) return `~${hours}h ${minutes}m`;
+        if (minutes > 0) return `~${minutes}m`;
+        return `~${totalSeconds}s`;
+    }
+
+    function renderAISettingsStatus(aiStatus) {
+        const progressEl = document.getElementById('ai-settings-embed-progress');
+        const remainingEl = document.getElementById('ai-settings-embed-remaining');
+        const speedEl = document.getElementById('ai-settings-embed-speed');
+        const etaEl = document.getElementById('ai-settings-embed-eta');
+        const predictionsEl = document.getElementById('ai-settings-predictions');
+        const workerEl = document.getElementById('ai-settings-worker-message');
+        if (!progressEl || !remainingEl || !speedEl || !etaEl || !predictionsEl || !workerEl || !aiStatus) return;
+
+        const embedded = Number(aiStatus.embedded || 0);
+        const total = Number(aiStatus.total_kept || 0);
+        const remaining = Number(aiStatus.remaining || 0);
+        const progressPct = Number(aiStatus.progress_pct || 0);
+        const recentRate = Number(aiStatus.recent_images_per_min || 0);
+        const overallRate = Number(aiStatus.overall_images_per_min || 0);
+
+        progressEl.textContent = `${embedded.toLocaleString()} / ${total.toLocaleString()} (${progressPct.toFixed(1)}%)`;
+        remainingEl.textContent = remaining.toLocaleString();
+
+        if (recentRate > 0 && overallRate > 0) {
+            speedEl.textContent = `${formatRatePerMinute(recentRate)} recent · ${formatRatePerMinute(overallRate)} avg`;
+        } else if (recentRate > 0) {
+            speedEl.textContent = `${formatRatePerMinute(recentRate)} recent`;
+        } else if (overallRate > 0) {
+            speedEl.textContent = `${formatRatePerMinute(overallRate)} avg`;
+        } else if (embedded >= total && total > 0) {
+            speedEl.textContent = 'Complete';
+        } else {
+            speedEl.textContent = 'Waiting for embedding activity';
+        }
+
+        if (remaining <= 0 && total > 0) {
+            etaEl.textContent = 'Done';
+        } else if (aiStatus.eta_seconds) {
+            etaEl.textContent = formatEta(aiStatus.eta_seconds);
+        } else if (aiStatus.worker_state === 'embedding') {
+            etaEl.textContent = 'Measuring…';
+        } else {
+            etaEl.textContent = 'Waiting for speed data';
+        }
+
+        predictionsEl.textContent = `${Number(aiStatus.predicted || 0).toLocaleString()} predicted · ${Number(aiStatus.compared || 0).toLocaleString()} compared`;
+        workerEl.textContent = aiStatus.worker_message || 'Waiting for worker activity';
     }
 
     function populateSettingsForm(settings) {
