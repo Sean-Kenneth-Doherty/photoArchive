@@ -1131,6 +1131,28 @@ button:disabled {
     color: #fff;
 }
 
+.lightbox-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+}
+
+.lightbox-btn {
+    padding: 6px 14px;
+    font-size: 12px;
+    background: rgba(255,255,255,0.1);
+    color: #aaa;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.lightbox-btn:hover {
+    background: rgba(255,255,255,0.2);
+    color: #fff;
+}
+
 /* Toast notification */
 .toast {
     position: fixed;

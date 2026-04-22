@@ -996,6 +996,52 @@ const PhotoArchive = (() => {
         return '';
     }
 
+    async function findSimilar() {
+        if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length) return;
+        const img = libraryImages[lightboxIndex];
+        closeLightbox();
+
+        // Clear grid and show similar images
+        searchQuery = '__similar__';
+        const input = document.getElementById('search-input');
+        if (input) input.value = `Similar to: ${img.filename}`;
+        const clearBtn = document.getElementById('search-clear');
+        if (clearBtn) clearBtn.classList.remove('hidden');
+        const sortToggles = document.getElementById('sort-toggles');
+        if (sortToggles) sortToggles.style.opacity = '0.3';
+
+        libraryImages = [];
+        const grid = document.getElementById('rankings-grid');
+        grid.innerHTML = '';
+
+        const res = await fetch(`/api/similar/${img.id}?limit=100`);
+        const data = await res.json();
+
+        for (let i = 0; i < data.images.length; i++) {
+            const simg = data.images[i];
+            const ar = simg.aspect_ratio || 1.5;
+            const simPct = (simg.similarity * 100).toFixed(0);
+
+            const card = document.createElement('div');
+            card.className = 'rank-card';
+            card.dataset.ar = ar;
+            card.style.height = thumbHeight + 'px';
+            card.style.flexGrow = ar;
+            card.style.flexBasis = (thumbHeight * ar) + 'px';
+            card.onclick = () => openLightbox(simg);
+
+            card.innerHTML = `
+                <img src="${simg.thumb_url}" alt="${simg.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <div class="rank-card-info">
+                    <span class="rank-elo">${simg.elo} Elo</span>
+                    <span class="rank-similarity">${simPct}% match</span>
+                </div>
+            `;
+            grid.appendChild(card);
+            libraryImages.push(simg);
+        }
+    }
+
     function exportRankings(format) {
         window.open(`/api/export?format=${format}`, '_blank');
     }
@@ -1037,6 +1083,7 @@ const PhotoArchive = (() => {
         lightboxPrev,
         setThumbSize,
         setFilter,
+        findSimilar,
         gridSelectAll,
         gridSelectNone,
         gridSubmit,

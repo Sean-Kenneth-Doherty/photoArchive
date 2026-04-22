@@ -566,6 +566,64 @@ async def api_search(q: str = "", limit: int = 50):
     return {"images": result, "query": q}
 
 
+@app.get("/api/similar/{image_id}")
+async def api_similar(image_id: int, limit: int = 50):
+    """Find visually similar images using embedding cosine similarity."""
+    try:
+        import clip_worker
+        import numpy as np
+    except ImportError:
+        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
+
+    # Get the source image's embedding
+    conn = await db.get_db()
+    try:
+        cursor = await conn.execute("SELECT embedding FROM embeddings WHERE image_id = ?", (image_id,))
+        row = await cursor.fetchone()
+    finally:
+        await conn.close()
+
+    if not row:
+        return JSONResponse({"error": "Image not embedded yet"}, status_code=404)
+
+    source_vec = clip_worker.blob_to_vec(row["embedding"])
+
+    all_embeddings = await db.get_all_embeddings()
+    if not all_embeddings:
+        return {"images": [], "source_id": image_id}
+
+    # Compute cosine similarity against all other images
+    image_ids = [r["image_id"] for r in all_embeddings]
+    import numpy as np
+    matrix = np.array([clip_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
+    similarities = matrix @ source_vec
+
+    # Exclude the source image and get top results
+    top_indices = np.argsort(similarities)[::-1]
+    results = []
+    images_data = await db.get_images_by_ids(image_ids)
+    for idx in top_indices:
+        img_id = image_ids[idx]
+        if img_id == image_id:
+            continue
+        img = images_data.get(img_id)
+        if not img:
+            continue
+        results.append({
+            "id": img_id,
+            "filename": img["filename"],
+            "elo": round(img["elo"], 1),
+            "comparisons": img["comparisons"],
+            "similarity": round(float(similarities[idx]), 4),
+            "aspect_ratio": img.get("aspect_ratio") or 1.5,
+            "thumb_url": f"/api/thumb/sm/{img_id}",
+        })
+        if len(results) >= limit:
+            break
+
+    return {"images": results, "source_id": image_id}
+
+
 @app.get("/api/stats")
 async def api_stats():
     return await db.get_stats()
