@@ -117,6 +117,8 @@ async def run_clip_worker():
 
     last_train_count = await db.get_comparison_count()
     has_model = False
+    batches_since_train = 0
+    TRAIN_EVERY_N_BATCHES = 10  # train every ~640 new embeddings
 
     while True:
         try:
@@ -146,12 +148,17 @@ async def run_clip_worker():
                     embedded_count = await db.get_embedding_count()
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")
 
+                batches_since_train += 1
                 await asyncio.sleep(0.1)  # yield before next batch
-                continue  # keep embedding before training
 
-            # Phase 2: Retrain if enough new comparisons
+                # Train periodically during embedding, not just after
+                if batches_since_train < TRAIN_EVERY_N_BATCHES:
+                    continue
+
+            # Phase 2: Train/retrain the taste model
+            batches_since_train = 0
             current_count = await db.get_comparison_count()
-            if not has_model or current_count - last_train_count >= RETRAIN_EVERY:
+            if not has_model or current_count - last_train_count >= RETRAIN_EVERY or unembedded:
                 training_data = await db.get_training_data()
                 if len(training_data) >= 20:  # need minimum data
                     coef, intercept, XtX_inv = await loop.run_in_executor(

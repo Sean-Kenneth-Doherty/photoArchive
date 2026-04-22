@@ -172,6 +172,100 @@ a:hover {
     font-size: 11px;
 }
 
+/* AI Info Panel */
+.ai-panel {
+    position: fixed;
+    bottom: var(--bar-height);
+    right: 8px;
+    width: 340px;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    z-index: 101;
+    font-size: 12px;
+}
+
+.ai-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid #333;
+}
+
+.ai-panel-title {
+    font-weight: 600;
+    color: #e0e0e0;
+}
+
+.ai-panel-close {
+    color: #666;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+}
+
+.ai-panel-close:hover {
+    color: #aaa;
+}
+
+.ai-panel-body {
+    padding: 10px 12px;
+}
+
+.ai-panel-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.ai-panel-label {
+    color: #888;
+    flex-shrink: 0;
+    margin-right: 12px;
+}
+
+.ai-panel-value {
+    color: #ccc;
+    text-align: right;
+}
+
+.ai-panel-value.trained {
+    color: #4a9;
+}
+
+.ai-panel-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+}
+
+.ai-panel-progress {
+    flex: 1;
+    height: 4px;
+    background: #333;
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.ai-panel-fill {
+    height: 100%;
+    background: #6cb4ee;
+    width: 0%;
+    transition: width 0.5s;
+}
+
+.ai-panel-desc {
+    color: #666;
+    font-size: 11px;
+    line-height: 1.5;
+    padding-top: 4px;
+    border-top: 1px solid #333;
+}
+
 /* Landing page */
 .landing {
     max-width: 800px;
@@ -854,6 +948,17 @@ button:disabled {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.rank-ai-tag {
+    font-size: 9px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(108, 180, 238, 0.15);
+    color: #6cb4ee;
+    font-weight: 600;
+    margin-left: 4px;
+    vertical-align: middle;
 }
 
 .rankings-load-more {

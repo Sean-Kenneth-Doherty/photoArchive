@@ -60,10 +60,43 @@
         <span id="compare-stat-pool" class="bar-stat-num">0</span> images
     </div>
     <div class="bar-divider"></div>
-    <div class="bar-section bar-ai" id="bar-ai">
+    <div class="bar-section bar-ai" id="bar-ai" onclick="PhotoRanker.toggleAIPanel()" style="cursor:pointer">
         <span class="bar-ai-label">AI</span>
         <span id="ai-embed-count">—</span>/<span id="ai-embed-total">—</span>
         <span id="ai-model-state" class="bar-ai-state"></span>
+    </div>
+
+    <!-- AI info panel (hidden by default, toggled by clicking AI in bar) -->
+    <div class="ai-panel hidden" id="ai-panel">
+        <div class="ai-panel-header">
+            <span class="ai-panel-title">Active Learning</span>
+            <span class="ai-panel-close" onclick="PhotoRanker.toggleAIPanel()">&times;</span>
+        </div>
+        <div class="ai-panel-body">
+            <div class="ai-panel-row">
+                <span class="ai-panel-label">Embeddings</span>
+                <div class="ai-panel-bar-wrap">
+                    <div class="ai-panel-progress">
+                        <div class="ai-panel-fill" id="ai-panel-embed-fill"></div>
+                    </div>
+                    <span class="ai-panel-value" id="ai-panel-embed-text">—</span>
+                </div>
+            </div>
+            <div class="ai-panel-row">
+                <span class="ai-panel-label">Taste Model</span>
+                <span class="ai-panel-value" id="ai-panel-model-text">—</span>
+            </div>
+            <div class="ai-panel-row">
+                <span class="ai-panel-label">Predictions</span>
+                <span class="ai-panel-value" id="ai-panel-predictions-text">—</span>
+            </div>
+            <div class="ai-panel-desc" id="ai-panel-desc">
+                CLIP ViT-B/32 embeds each image into a 512-dim vector. A Ridge regression model
+                learns your taste from comparisons and predicts ratings for uncompared images.
+                The <strong>Learn</strong> strategy shows images the model is most uncertain about,
+                so each pick teaches it the most.
+            </div>
+        </div>
     </div>
     <div class="bar-section bar-nav">
         <a href="/rankings" class="bar-link">Rankings</a>
@@ -71,6 +104,8 @@
 </footer>
 {% endblock %}
 
+{% block scripts %}
 <script>
     document.addEventListener('DOMContentLoaded', () => PhotoRanker.initCompare());
 </script>
+{% endblock %}

@@ -261,6 +261,7 @@ async def undo_last_comparison():
 RANKING_SORTS = {
     "elo": "elo DESC",
     "elo_asc": "elo ASC",
+    "ai": "COALESCE(CASE WHEN comparisons > 0 THEN elo ELSE predicted_elo END, elo) DESC",
     "comparisons": "comparisons DESC",
     "least_compared": "comparisons ASC",
     "filename": "filename ASC",
@@ -272,7 +273,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
         cursor = await db.execute(
-            f"SELECT id, filename, filepath, elo, comparisons, status FROM images "
+            f"SELECT id, filename, filepath, elo, comparisons, status, predicted_elo FROM images "
             f"WHERE status IN ('kept', 'maybe') ORDER BY {order} LIMIT ? OFFSET ?",
             (limit, offset),
         )

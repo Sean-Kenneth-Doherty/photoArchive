@@ -23,6 +23,7 @@
     <div class="bar-section bar-sorts">
         <div class="toggle-group toggle-group-sm">
             <button id="sort-elo" class="active" onclick="PhotoRanker.setRankingsSort('elo')">Top Rated</button>
+            <button id="sort-ai" onclick="PhotoRanker.setRankingsSort('ai')">AI Ranked</button>
             <button id="sort-elo_asc" onclick="PhotoRanker.setRankingsSort('elo_asc')">Lowest</button>
             <button id="sort-comparisons" onclick="PhotoRanker.setRankingsSort('comparisons')">Most Compared</button>
             <button id="sort-least_compared" onclick="PhotoRanker.setRankingsSort('least_compared')">Least Compared</button>
@@ -41,6 +42,8 @@
 </footer>
 {% endblock %}
 
+{% block scripts %}
 <script>
     document.addEventListener('DOMContentLoaded', () => PhotoRanker.initRankings());
 </script>
+{% endblock %}

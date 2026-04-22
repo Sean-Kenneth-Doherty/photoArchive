@@ -326,14 +326,31 @@ const PhotoRanker = (() => {
         const grid = document.getElementById('mosaic-grid');
         grid.innerHTML = '';
 
-        // Adapt grid dimensions to image count
+        // Calculate best cols/rows to minimize dead space for the viewport
         const n = mosaicImages.length;
-        let cols, rows;
-        if (n <= 2) { cols = 2; rows = 1; }
-        else if (n <= 4) { cols = 2; rows = 2; }
-        else if (n <= 6) { cols = 3; rows = 2; }
-        else if (n <= 9) { cols = 3; rows = 3; }
-        else { cols = 4; rows = Math.ceil(n / 4); }
+        const barHeight = 40;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight - barHeight;
+        const aspect = vw / vh;
+
+        // Try different column counts and pick the one whose cell aspect ratio
+        // is closest to 3:2 (typical photo aspect ratio)
+        const targetAspect = 3 / 2;
+        let bestCols = 4;
+        let bestScore = Infinity;
+        for (let c = 2; c <= 6; c++) {
+            const r = Math.ceil(n / c);
+            const cellW = vw / c;
+            const cellH = vh / r;
+            const cellAspect = cellW / cellH;
+            const score = Math.abs(cellAspect - targetAspect);
+            if (score < bestScore) {
+                bestScore = score;
+                bestCols = c;
+            }
+        }
+        const cols = bestCols;
+        const rows = Math.ceil(n / cols);
         grid.style.setProperty('--mosaic-cols', cols);
         grid.style.setProperty('--mosaic-rows', rows);
 
@@ -514,10 +531,44 @@ const PhotoRanker = (() => {
                     stateEl.className = 'bar-ai-state';
                 }
             }
+            // Update panel if open
+            const embedFill = document.getElementById('ai-panel-embed-fill');
+            const embedText = document.getElementById('ai-panel-embed-text');
+            const modelText = document.getElementById('ai-panel-model-text');
+            const predText = document.getElementById('ai-panel-predictions-text');
+            if (embedFill) {
+                const pct = data.total_kept > 0 ? (data.embedded / data.total_kept * 100) : 0;
+                embedFill.style.width = pct + '%';
+            }
+            if (embedText) embedText.textContent = `${data.embedded.toLocaleString()} / ${data.total_kept.toLocaleString()} images`;
+            if (modelText) {
+                if (data.model_trained) {
+                    modelText.textContent = `Trained on ${data.compared.toLocaleString()} compared images`;
+                    modelText.className = 'ai-panel-value trained';
+                } else if (data.embedded > 0) {
+                    modelText.textContent = 'Waiting for embeddings to complete';
+                    modelText.className = 'ai-panel-value';
+                } else {
+                    modelText.textContent = 'Not started';
+                    modelText.className = 'ai-panel-value';
+                }
+            }
+            if (predText) {
+                if (data.predicted > 0) {
+                    predText.textContent = `${data.predicted.toLocaleString()} images have predicted ratings`;
+                } else {
+                    predText.textContent = 'None yet';
+                }
+            }
         } catch {
             const aiSection = document.getElementById('bar-ai');
             if (aiSection) aiSection.style.display = 'none';
         }
+    }
+
+    function toggleAIPanel() {
+        const panel = document.getElementById('ai-panel');
+        if (panel) panel.classList.toggle('hidden');
     }
 
     async function fetchComparePairs() {
@@ -707,7 +758,7 @@ const PhotoRanker = (() => {
         const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
-        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
+        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc' || rankingsSort === 'ai');
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
@@ -717,9 +768,14 @@ const PhotoRanker = (() => {
             card.className = 'rank-card';
             card.onclick = () => openLightbox(img);
 
+            // Show effective elo: direct if compared, predicted if not
+            const effectiveElo = img.comparisons > 0 ? img.elo : (img.predicted_elo || img.elo);
+            const eloLabel = img.comparisons > 0 ? `${img.elo}` : (img.predicted_elo ? `~${img.predicted_elo}` : `${img.elo}`);
+            const sourceTag = img.comparisons === 0 && img.predicted_elo ? '<span class="rank-ai-tag">AI</span>' : '';
+
             const infoLine = showRank
-                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo} Elo</span>`
-                : `<span class="rank-elo">${img.elo} Elo</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${eloLabel} ${sourceTag}</span>`
+                : `<span class="rank-elo">${eloLabel} ${sourceTag}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
 
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">
@@ -798,5 +854,6 @@ const PhotoRanker = (() => {
         gridSubmit,
         mosaicShuffle,
         setMosaicStrategy,
+        toggleAIPanel,
     };
 })();

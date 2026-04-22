@@ -278,6 +278,9 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
 
     import random
     candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
+    # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
+    for img in candidates:
+        img["effective_elo"] = img["elo"] if img["comparisons"] > 0 else (img.get("predicted_elo") or img["elo"])
     count = min(n, len(candidates))
 
     if strategy == "learn":
@@ -293,11 +296,11 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
         # Favor least-compared images
         weights = [1.0 / (img["comparisons"] + 1) for img in candidates]
     elif strategy == "compete" and grid_elo > 0:
-        # Favor images with Elo close to the grid average
-        weights = [1.0 / (abs(img["elo"] - grid_elo) + 50) for img in candidates]
+        # Favor images with effective Elo close to the grid average
+        weights = [1.0 / (abs(img["effective_elo"] - grid_elo) + 50) for img in candidates]
     elif strategy == "top":
         # Favor highest-rated within the top 50
-        weights = [img["elo"] for img in candidates]
+        weights = [img["effective_elo"] for img in candidates]
     else:
         # Random — uniform
         weights = [1.0 for _ in candidates]
@@ -316,7 +319,7 @@ async def mosaic_next(n: int = 12, exclude: str = "", strategy: str = "explore",
         result.append({
             "id": img["id"],
             "filename": img["filename"],
-            "elo": round(img["elo"], 1),
+            "elo": round(img["effective_elo"], 1),
             "thumb_url": f"/api/thumb/sm/{img['id']}",
         })
 
@@ -456,10 +459,12 @@ async def api_rankings(limit: int = 100, offset: int = 0, sort: str = "elo"):
     result = []
     for img in images:
         d = dict(img)
+        predicted = d.get("predicted_elo")
         result.append({
             "id": d["id"],
             "filename": d["filename"],
             "elo": round(d["elo"], 1),
+            "predicted_elo": round(predicted, 1) if predicted is not None else None,
             "comparisons": d["comparisons"],
             "status": d["status"],
             "thumb_url": f"/api/thumb/sm/{d['id']}",
@@ -514,9 +519,19 @@ async def ai_status():
             "SELECT COUNT(*) as c FROM images WHERE predicted_elo IS NOT NULL"
         )
         predicted = (await cursor.fetchone())["c"]
+        cursor = await conn.execute(
+            "SELECT COUNT(*) as c FROM images WHERE comparisons > 0"
+        )
+        compared = (await cursor.fetchone())["c"]
     finally:
         await conn.close()
-    return {"embedded": embedded, "total_kept": total_kept, "model_trained": predicted > 0}
+    return {
+        "embedded": embedded,
+        "total_kept": total_kept,
+        "model_trained": predicted > 0,
+        "predicted": predicted,
+        "compared": compared,
+    }
 
 
 if __name__ == "__main__":
