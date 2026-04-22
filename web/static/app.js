@@ -739,8 +739,12 @@ const PhotoArchive = (() => {
     let searchQuery = '';
     let searchDebounce = null;
 
+    let rankingsLoading = false;
+    let rankingsExhausted = false;
+
     async function initLibrary() {
         rankingsOffset = 0;
+        rankingsExhausted = false;
         await loadRankings();
 
         // Load stats and AI status for the bottom bar
@@ -751,6 +755,14 @@ const PhotoArchive = (() => {
         } catch {}
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
+
+        // Infinite scroll
+        window.addEventListener('scroll', () => {
+            if (rankingsLoading || rankingsExhausted || searchQuery) return;
+            if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) {
+                loadRankings();
+            }
+        });
 
         // Set up search input
         const input = document.getElementById('search-input');
@@ -790,6 +802,7 @@ const PhotoArchive = (() => {
         if (clearBtn) clearBtn.classList.add('hidden');
         if (sortToggles) sortToggles.style.opacity = '1';
         rankingsOffset = 0;
+        rankingsExhausted = false;
         document.getElementById('rankings-grid').innerHTML = '';
         loadRankings();
     }
@@ -830,6 +843,7 @@ const PhotoArchive = (() => {
         if (searchQuery) return; // ignore sort changes during search
         rankingsSort = sort;
         rankingsOffset = 0;
+        rankingsExhausted = false;
         document.getElementById('rankings-grid').innerHTML = '';
         const btn = document.getElementById('sort-' + sort);
         if (btn) {
@@ -844,6 +858,8 @@ const PhotoArchive = (() => {
     }
 
     async function loadRankings() {
+        if (rankingsLoading) return;
+        rankingsLoading = true;
         const res = await fetch(`/api/rankings?limit=${RANKINGS_PAGE_SIZE}&offset=${rankingsOffset}&sort=${rankingsSort}`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
@@ -877,17 +893,10 @@ const PhotoArchive = (() => {
         }
 
         rankingsOffset += data.images.length;
-
-        const loadMoreWrap = document.getElementById('load-more-wrap');
-        if (data.images.length >= RANKINGS_PAGE_SIZE) {
-            loadMoreWrap.classList.remove('hidden');
-        } else {
-            loadMoreWrap.classList.add('hidden');
+        rankingsLoading = false;
+        if (data.images.length < RANKINGS_PAGE_SIZE) {
+            rankingsExhausted = true;
         }
-    }
-
-    function loadMoreRankings() {
-        loadRankings();
     }
 
     function openLightbox(img) {
@@ -937,7 +946,6 @@ const PhotoArchive = (() => {
         clearSearch,
         setCullMode,
         setCompareMode,
-        loadMoreRankings,
         setRankingsSort,
         exportRankings,
         closeLightbox,

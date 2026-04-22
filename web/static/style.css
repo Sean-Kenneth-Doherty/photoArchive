@@ -893,14 +893,12 @@ button:disabled {
 /* Library / Rankings */
 .library-container,
 .rankings-container {
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 12px 24px calc(var(--bar-height) + 24px);
+    padding: 8px 8px calc(var(--bar-height) + 8px);
 }
 
 .library-search {
     position: relative;
-    margin-bottom: 16px;
+    margin: 0 0 8px;
 }
 
 .library-search input {
