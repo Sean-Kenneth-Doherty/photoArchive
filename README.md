@@ -26,6 +26,7 @@ A local-first photo archive manager with AI-powered ranking, semantic search, an
 - **Active learning**: Taste model (Ridge regression) learns your preferences from comparisons and predicts ratings for uncompared images
 - **Smart pairing**: Uses predicted Elo so uncompared images get matched against appropriate opponents instead of all starting at 1200
 - **Uncertainty-driven selection**: Learn strategy surfaces the most informative images to compare
+- **Elo propagation**: Each comparison ripples scaled Elo adjustments to visually similar images — comparing one shot from a set of 30 similar photos effectively ranks them all
 - Embeddings power search, similarity, duplicate detection, and auto-collections
 
 ### Additional Features
@@ -79,6 +80,7 @@ web/
   settings.py      # Runtime settings with JSON persistence
   scanner.py       # Recursive folder scanning
   pairing.py       # Elo math and Swiss-system pairing
+  elo_propagation.py # Propagate Elo to similar images via embeddings
   thumbnails.py    # Multi-tier thumbnail generation and caching
   static/
     app.js         # Frontend IIFE module (PhotoArchive)
@@ -98,6 +100,8 @@ web/
 Images start at 1200 Elo. In mosaic mode, picking one image as "best" records it as the winner against all other visible images (K=12 per pair). The Elo system naturally surfaces the best photos over time.
 
 The AI taste model accelerates this: after enough comparisons, it learns patterns in your preferences via the image embeddings and predicts where uncompared images would likely rank. The Learn strategy then shows you the images the model is most uncertain about, making each click maximally informative.
+
+Additionally, each comparison propagates scaled Elo adjustments to visually similar images via embedding cosine similarity. If you rank one photo from a shoot of 30 similar shots, all 30 get nudged toward the right position automatically. The propagation is gentle (30% of the direct K-factor, scaled by similarity) and only affects images with fewer than 8 direct comparisons, so it never overrides confident rankings.
 
 ## License
 
