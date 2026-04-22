@@ -5,5 +5,9 @@ Pillow
 rawpy
 jinja2
 python-multipart
-open-clip-torch
 scikit-learn
+sentence-transformers
+transformers
+bitsandbytes
+accelerate
+qwen-vl-utils

@@ -1,10 +1,11 @@
 """
-CLIP embedding + active learning taste model for PhotoRanker.
+Qwen3-VL-Embedding + active learning taste model for PhotoRanker.
 
 Background worker that:
-1. Embeds kept/maybe images using CLIP ViT-B/32
+1. Embeds kept/maybe images using Qwen3-VL-Embedding-8B (int4 quantized)
 2. Trains a Ridge regression (embedding -> predicted Elo) on comparison data
 3. Computes per-image uncertainty for smart mosaic selection
+4. Provides text-to-image search via shared embedding space
 """
 
 import asyncio
@@ -20,74 +21,78 @@ log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-EMBEDDING_DIM = 768
-BATCH_SIZE = 64
-RETRAIN_EVERY = 50  # retrain after this many new comparisons
+MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
+EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
+BATCH_SIZE = 4  # Small batches — 8B model is slow per image
+RETRAIN_EVERY = 50
 
-# Module-level references for text search (set by run_clip_worker on startup)
-_clip_model = None
-_clip_device = None
-_clip_tokenizer = None
+# Module-level reference for text search (set by run_clip_worker on startup)
+_model = None
 
 
-def _load_clip_model():
-    """Load CLIP ViT-B/32 on GPU (falls back to CPU)."""
-    import open_clip
+def _load_model():
+    """Load Qwen3-VL-Embedding-8B with int4 quantization."""
     import torch
+    from sentence_transformers import SentenceTransformer
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14", pretrained="datacomp_xl_s13b_b90k", device=device
+    model = SentenceTransformer(
+        MODEL_NAME,
+        model_kwargs={
+            "quantization_config": {
+                "load_in_4bit": True,
+                "bnb_4bit_compute_dtype": torch.float16,
+                "bnb_4bit_use_double_quant": True,
+                "bnb_4bit_quant_type": "nf4",
+            },
+            "torch_dtype": torch.float16,
+        },
+        trust_remote_code=True,
     )
-    model.eval()
-    tokenizer = open_clip.get_tokenizer("ViT-L-14")
-    log.info(f"CLIP model loaded on {device}")
-    return model, preprocess, device, tokenizer
+    model.truncate_dim = EMBEDDING_DIM
+    log.info(f"Qwen3-VL-Embedding-8B loaded (int4, {EMBEDDING_DIM}-dim)")
+    return model
 
 
-def _embed_batch(model, preprocess, device, jpeg_bytes_list: list[bytes]) -> list[np.ndarray]:
-    """Run CLIP inference on a batch of JPEG byte buffers."""
-    import torch
+def _embed_images(model, image_paths: list[str]) -> list[np.ndarray]:
+    """Embed images from file paths. Returns list of numpy arrays (or None for failures)."""
     from PIL import Image
-    import io
 
-    tensors = []
+    valid = []
     valid_indices = []
-    for i, data in enumerate(jpeg_bytes_list):
-        if not data:
-            continue
+    for i, path in enumerate(image_paths):
         try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-            tensors.append(preprocess(img))
+            img = Image.open(path).convert("RGB")
+            # Resize to max 1024px on long side to keep VRAM reasonable
+            max_side = max(img.size)
+            if max_side > 1024:
+                scale = 1024 / max_side
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+            valid.append(img)
             valid_indices.append(i)
         except Exception as e:
-            log.debug(f"Skipping image {i}: {e}")
+            log.debug(f"Skipping image {path}: {e}")
 
-    if not tensors:
-        return [None] * len(jpeg_bytes_list)
+    if not valid:
+        return [None] * len(image_paths)
 
-    batch = torch.stack(tensors).to(device)
-    with torch.no_grad():
-        features = model.encode_image(batch)
-        features = features / features.norm(dim=-1, keepdim=True)  # L2 normalize
-        features = features.cpu().numpy().astype(np.float32)
+    embeddings = model.encode(valid, normalize_embeddings=True)
 
-    results = [None] * len(jpeg_bytes_list)
+    results = [None] * len(image_paths)
     for idx, valid_i in enumerate(valid_indices):
-        results[valid_i] = features[idx]
+        results[valid_i] = embeddings[idx].astype(np.float32)
     return results
 
 
 def encode_text(query: str) -> np.ndarray | None:
-    """Encode a text query into a CLIP embedding. Returns None if model not loaded."""
-    if _clip_model is None or _clip_tokenizer is None:
+    """Encode a text query into an embedding. Returns None if model not loaded."""
+    if _model is None:
         return None
-    import torch
-    tokens = _clip_tokenizer([query]).to(_clip_device)
-    with torch.no_grad():
-        text_features = _clip_model.encode_text(tokens)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        return text_features.cpu().numpy().astype(np.float32)[0]
+    embedding = _model.encode(
+        [query],
+        prompt="Retrieve images relevant to the query.",
+        normalize_embeddings=True,
+    )
+    return embedding[0].astype(np.float32)
 
 
 def vec_to_blob(vec: np.ndarray) -> bytes:
@@ -130,35 +135,25 @@ async def run_clip_worker():
     """Main background loop: embed, train, predict."""
     loop = asyncio.get_event_loop()
 
-    global _clip_model, _clip_device, _clip_tokenizer
+    global _model
 
-    log.info("CLIP worker starting — loading model...")
-    model, preprocess, device, tokenizer = await loop.run_in_executor(None, _load_clip_model)
-    _clip_model = model
-    _clip_device = device
-    _clip_tokenizer = tokenizer
+    log.info("Loading Qwen3-VL-Embedding-8B (int4)...")
+    _model = await loop.run_in_executor(None, _load_model)
 
     last_train_count = await db.get_comparison_count()
     has_model = False
     batches_since_train = 0
-    TRAIN_EVERY_N_BATCHES = 10  # train every ~640 new embeddings
+    TRAIN_EVERY_N_BATCHES = 5  # train more frequently since batches are small
 
     while True:
         try:
             # Phase 1: Embed unembedded images
             unembedded = await db.get_unembedded_images(limit=BATCH_SIZE)
             if unembedded:
-                # Get thumbnails via existing cache/pipeline
-                jpeg_list = []
-                for row in unembedded:
-                    try:
-                        data = await thumbnails.get_thumbnail(row["filepath"], "sm", row["id"])
-                        jpeg_list.append(data)
-                    except Exception:
-                        jpeg_list.append(None)
+                image_paths = [row["filepath"] for row in unembedded]
 
                 vectors = await loop.run_in_executor(
-                    None, _embed_batch, model, preprocess, device, jpeg_list
+                    None, _embed_images, _model, image_paths
                 )
 
                 batch = []
@@ -172,9 +167,8 @@ async def run_clip_worker():
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")
 
                 batches_since_train += 1
-                await asyncio.sleep(0.1)  # yield before next batch
+                await asyncio.sleep(0.1)
 
-                # Train periodically during embedding, not just after
                 if batches_since_train < TRAIN_EVERY_N_BATCHES:
                     continue
 
@@ -183,7 +177,7 @@ async def run_clip_worker():
             current_count = await db.get_comparison_count()
             if not has_model or current_count - last_train_count >= RETRAIN_EVERY or unembedded:
                 training_data = await db.get_training_data()
-                if len(training_data) >= 20:  # need minimum data
+                if len(training_data) >= 20:
                     coef, intercept, XtX_inv = await loop.run_in_executor(
                         None, _train_taste_model, training_data
                     )
@@ -206,5 +200,5 @@ async def run_clip_worker():
             await asyncio.sleep(5)
 
         except Exception as e:
-            log.error(f"CLIP worker error: {e}")
+            log.error(f"Embedding worker error: {e}", exc_info=True)
             await asyncio.sleep(10)

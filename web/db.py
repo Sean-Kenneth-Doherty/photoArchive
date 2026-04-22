@@ -2,7 +2,7 @@ import aiosqlite
 import os
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoranker.db")
-EXPECTED_EMBEDDING_DIM = 768  # ViT-L/14
+EXPECTED_EMBEDDING_DIM = 2048  # Qwen3-VL-Embedding-8B (Matryoshka truncated)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS images (
