@@ -21,9 +21,9 @@ log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-8B"
+MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
 EMBEDDING_DIM = 2048  # Matryoshka truncation from 4096 -> 2048
-BATCH_SIZE = 4  # Small batches — 8B model is slow per image
+BATCH_SIZE = 4  # Small batches for VL model
 RETRAIN_EVERY = 50
 
 # Module-level reference for text search (set by run_clip_worker on startup)
@@ -31,7 +31,7 @@ _model = None
 
 
 def _load_model():
-    """Load Qwen3-VL-Embedding-8B with int4 quantization."""
+    """Load Qwen3-VL-Embedding-2B with int4 quantization to fit alongside other GPU apps."""
     import torch
     from sentence_transformers import SentenceTransformer
 
@@ -49,7 +49,7 @@ def _load_model():
         trust_remote_code=True,
     )
     model.truncate_dim = EMBEDDING_DIM
-    log.info(f"Qwen3-VL-Embedding-8B loaded (int4, {EMBEDDING_DIM}-dim)")
+    log.info(f"Qwen3-VL-Embedding-2B loaded (int4, {EMBEDDING_DIM}-dim)")
     return model
 
 
@@ -137,7 +137,7 @@ async def run_clip_worker():
 
     global _model
 
-    log.info("Loading Qwen3-VL-Embedding-8B (int4)...")
+    log.info("Loading Qwen3-VL-Embedding-2B...")
     _model = await loop.run_in_executor(None, _load_model)
 
     last_train_count = await db.get_comparison_count()
