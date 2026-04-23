@@ -49,6 +49,7 @@ _prefetch_executor = ThreadPoolExecutor(
 # In-memory thumbnail LRU: (size, image_id) -> (source_signature, jpeg_bytes)
 _memory_cache: OrderedDict[tuple[str, int], tuple[str, bytes]] = OrderedDict()
 _memory_cache_bytes = 0
+_memory_tier_bytes = {size: 0 for size in THUMB_TIERS}
 _cache_lock = threading.Lock()
 _meta_lock = threading.Lock()
 
@@ -248,7 +249,6 @@ def _memory_get_entry_fast(size: str, image_id: int) -> tuple[str, bytes] | None
 
 def _memory_get(size: str, image_id: int, source_signature: str) -> bytes | None:
     key = (size, image_id)
-    global _memory_cache_bytes
 
     with _cache_lock:
         entry = _memory_cache.get(key)
@@ -256,32 +256,69 @@ def _memory_get(size: str, image_id: int, source_signature: str) -> bytes | None
             return None
         cached_signature, data = entry
         if cached_signature != source_signature:
-            _memory_cache_bytes -= len(data)
-            _memory_cache.pop(key, None)
+            _memory_remove_locked(key)
             return None
         _memory_cache.move_to_end(key)
         return data
 
 
+def _memory_tier_budget(size: str) -> int:
+    if MEMORY_CACHE_BYTES <= 0:
+        return 0
+    ratios = {"sm": 0.12, "md": 0.38, "lg": 0.50}
+    return int(MEMORY_CACHE_BYTES * ratios.get(size, 0.0))
+
+
+def _memory_remove_locked(key: tuple[str, int]) -> bool:
+    global _memory_cache_bytes
+    entry = _memory_cache.pop(key, None)
+    if entry is None:
+        return False
+    size = key[0]
+    data_len = len(entry[1])
+    _memory_cache_bytes -= data_len
+    _memory_tier_bytes[size] = max(0, _memory_tier_bytes.get(size, 0) - data_len)
+    return True
+
+
+def _evict_memory_oldest_locked(size: str | None = None) -> bool:
+    for key in list(_memory_cache.keys()):
+        if size is None or key[0] == size:
+            return _memory_remove_locked(key)
+    return False
+
+
+def _enforce_memory_budget_locked():
+    for size in THUMB_TIERS:
+        budget = _memory_tier_budget(size)
+        while _memory_tier_bytes.get(size, 0) > budget:
+            if not _evict_memory_oldest_locked(size):
+                break
+
+    while _memory_cache and _memory_cache_bytes > MEMORY_CACHE_BYTES:
+        if not _evict_memory_oldest_locked():
+            break
+
+
 def _memory_put(size: str, image_id: int, source_signature: str, data: bytes):
     if not data or MEMORY_CACHE_BYTES <= 0:
+        return
+    tier_budget = _memory_tier_budget(size)
+    if tier_budget <= 0 or len(data) > tier_budget:
         return
 
     key = (size, image_id)
     global _memory_cache_bytes
 
     with _cache_lock:
-        existing = _memory_cache.pop(key, None)
-        if existing is not None:
-            _memory_cache_bytes -= len(existing[1])
+        _memory_remove_locked(key)
 
         _memory_cache[key] = (source_signature, data)
         _memory_cache.move_to_end(key)
-        _memory_cache_bytes += len(data)
-
-        while _memory_cache and _memory_cache_bytes > MEMORY_CACHE_BYTES:
-            _old_key, (_, old_data) = _memory_cache.popitem(last=False)
-            _memory_cache_bytes -= len(old_data)
+        data_len = len(data)
+        _memory_cache_bytes += data_len
+        _memory_tier_bytes[size] = _memory_tier_bytes.get(size, 0) + data_len
+        _enforce_memory_budget_locked()
 
 
 def _clear_memory_cache() -> dict:
@@ -294,6 +331,8 @@ def _clear_memory_cache() -> dict:
         bytes_cleared = _memory_cache_bytes
         _memory_cache.clear()
         _memory_cache_bytes = 0
+        for size in THUMB_TIERS:
+            _memory_tier_bytes[size] = 0
     return {
         "entries_cleared": entries_cleared,
         "bytes_cleared": bytes_cleared,
@@ -302,13 +341,11 @@ def _clear_memory_cache() -> dict:
 
 
 def _clear_memory_tiers(tiers: tuple[str, ...]):
-    global _memory_cache_bytes
     with _cache_lock:
         for key in list(_memory_cache.keys()):
             if key[0] not in tiers:
                 continue
-            _signature, data = _memory_cache.pop(key)
-            _memory_cache_bytes -= len(data)
+            _memory_remove_locked(key)
 
 
 def _memory_stats() -> dict:
@@ -317,6 +354,8 @@ def _memory_stats() -> dict:
         for (size, _image_id), (_signature, data) in _memory_cache.items():
             tiers[size]["count"] += 1
             tiers[size]["bytes"] += len(data)
+        for size in THUMB_TIERS:
+            tiers[size]["budget_bytes"] = _memory_tier_budget(size)
         return {
             "limit_bytes": MEMORY_CACHE_BYTES,
             "used_bytes": _memory_cache_bytes,
@@ -1344,9 +1383,7 @@ def configure(config: dict):
         _pregen_manual_pause = False
 
     with _cache_lock:
-        while _memory_cache and _memory_cache_bytes > MEMORY_CACHE_BYTES:
-            _key, (_signature, data) = _memory_cache.popitem(last=False)
-            _memory_cache_bytes -= len(data)
+        _enforce_memory_budget_locked()
 
     user_workers = int(config.get("user_workers", _executor_workers))
     if user_workers != _executor_workers:
