@@ -898,7 +898,7 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
     if len(images) < 2:
         return {"pairs": [], "total_kept": len(images)}
 
-    image_dicts = [img.copy() for img in images]
+    image_dicts = [dict(img) for img in images]
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
