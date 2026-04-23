@@ -946,31 +946,40 @@ async def _run_pregen_phase(size: str) -> int:
             return 0
 
     _pregen_scan_offsets[size] = offset + len(rows)
-    generated = 0
 
+    # Filter to uncached candidates
+    pending = []
     for row in rows:
         if not _prefetching or _pregen_manual_pause:
             break
         if not _pregen_manual_mode and (time.monotonic() - _last_user_activity) < PREGENERATE_IDLE_SECONDS:
             break
-
         current_signature = _build_source_signature(row["filepath"], size, row["id"])
         if row["source_signature"] == current_signature and has_cached(size, row["filepath"], row["id"]):
             continue
-
-        await _ensure_thumbnail_with_executor(
-            row["filepath"],
-            size,
-            row["id"],
-            _prefetch_executor,
-            note_activity=False,
-        )
-        generated += 1
-        _pregen_status["last_generated_at"] = _current_time()
-        _pregen_status["generated_this_session"] += 1
-
-        if generated >= PREGENERATE_GENERATE_BATCH:
+        pending.append(row)
+        if len(pending) >= PREGENERATE_GENERATE_BATCH:
             break
+
+    if not pending:
+        return 0
+
+    # Launch concurrent thumbnail jobs — overlap HDD reads with CPU processing
+    CONCURRENT = min(3, len(pending))
+    generated = 0
+    for i in range(0, len(pending), CONCURRENT):
+        chunk = pending[i:i + CONCURRENT]
+        tasks = [
+            _ensure_thumbnail_with_executor(
+                row["filepath"], size, row["id"],
+                _prefetch_executor, note_activity=False,
+            )
+            for row in chunk
+        ]
+        await asyncio.gather(*tasks)
+        generated += len(chunk)
+        _pregen_status["last_generated_at"] = _current_time()
+        _pregen_status["generated_this_session"] += len(chunk)
 
     if len(rows) < PREGENERATE_SCAN_BATCH:
         _pregen_scan_offsets[size] = 0
