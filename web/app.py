@@ -913,39 +913,111 @@ async def api_exif(image_id: int):
         return JSONResponse({"error": "Image not found"}, status_code=404)
 
     from PIL import Image as PILImage
-    from PIL.ExifTags import TAGS
+    from PIL.ExifTags import TAGS, IFD
     try:
         img = PILImage.open(image["filepath"])
         exif_raw = img.getexif()
+        # Also read EXIF IFD (where most camera data lives)
+        exif_ifd = {}
+        try:
+            exif_ifd = exif_raw.get_ifd(IFD.Exif)
+        except Exception:
+            pass
         img.close()
     except Exception:
         return {"exif": {}}
 
-    exif = {}
-    tag_map = {
-        "Make": "camera_make", "Model": "camera_model",
-        "FocalLength": "focal_length", "FNumber": "aperture",
-        "ExposureTime": "shutter_speed", "ISOSpeedRatings": "iso",
-        "DateTimeOriginal": "date", "LensModel": "lens",
-        "ImageWidth": "width", "ImageLength": "height",
-    }
+    # Merge base and IFD tags
+    all_tags = {}
     for tag_id, value in exif_raw.items():
         tag_name = TAGS.get(tag_id, "")
-        if tag_name in tag_map:
-            # Convert IFDRational to float/string
-            if hasattr(value, 'numerator'):
-                if tag_name == "ExposureTime" and value.numerator > 0:
-                    if value < 1:
-                        value = f"1/{int(1/float(value))}"
-                    else:
-                        value = f"{float(value):.1f}"
-                elif tag_name == "FNumber":
-                    value = f"f/{float(value):.1f}"
-                elif tag_name == "FocalLength":
-                    value = f"{float(value):.0f}mm"
-                else:
-                    value = float(value)
-            exif[tag_map[tag_name]] = str(value)
+        if tag_name:
+            all_tags[tag_name] = value
+    for tag_id, value in exif_ifd.items():
+        tag_name = TAGS.get(tag_id, "")
+        if tag_name:
+            all_tags[tag_name] = value
+
+    def fmt_rational(val):
+        if hasattr(val, 'numerator'):
+            return float(val)
+        return val
+
+    exif = {}
+    # Camera
+    make = str(all_tags.get("Make", "")).strip()
+    model = str(all_tags.get("Model", "")).strip()
+    # Remove make from model if duplicated (e.g., "Canon Canon EOS R5")
+    if make and model.startswith(make):
+        model = model[len(make):].strip()
+    if make:
+        exif["camera_make"] = make
+    if model:
+        exif["camera_model"] = model
+
+    # Lens
+    lens = str(all_tags.get("LensModel", "")).strip()
+    if lens:
+        exif["lens"] = lens
+
+    # Focal length
+    fl = all_tags.get("FocalLength")
+    if fl is not None:
+        exif["focal_length"] = f"{fmt_rational(fl):.0f}mm"
+    fl35 = all_tags.get("FocalLengthIn35mmFilm")
+    if fl35 is not None:
+        exif["focal_length_35mm"] = f"{int(fl35)}mm"
+
+    # Aperture
+    fnum = all_tags.get("FNumber")
+    if fnum is not None:
+        exif["aperture"] = f"f/{fmt_rational(fnum):.1f}"
+
+    # Shutter speed
+    exp = all_tags.get("ExposureTime")
+    if exp is not None:
+        ev = fmt_rational(exp)
+        if ev > 0:
+            exif["shutter_speed"] = f"1/{int(1/ev)}" if ev < 1 else f"{ev:.1f}"
+
+    # ISO
+    iso = all_tags.get("ISOSpeedRatings") or all_tags.get("PhotographicSensitivity")
+    if iso is not None:
+        exif["iso"] = str(int(iso) if isinstance(iso, (int, float)) else iso)
+
+    # Exposure program
+    exp_prog_map = {1: "Manual", 2: "Program", 3: "Aperture Priority", 4: "Shutter Priority"}
+    exp_prog = all_tags.get("ExposureProgram")
+    if exp_prog in exp_prog_map:
+        exif["exposure_program"] = exp_prog_map[exp_prog]
+
+    # White balance
+    wb = all_tags.get("WhiteBalance")
+    if wb is not None:
+        exif["white_balance"] = "Auto" if wb == 0 else "Manual"
+
+    # Flash
+    flash = all_tags.get("Flash")
+    if flash is not None:
+        exif["flash"] = "Fired" if (flash & 1) else "No flash"
+
+    # Dimensions
+    w = all_tags.get("ExifImageWidth") or all_tags.get("ImageWidth")
+    h = all_tags.get("ExifImageHeight") or all_tags.get("ImageLength")
+    if w and h:
+        exif["dimensions"] = f"{w} x {h}"
+
+    # Date
+    date = all_tags.get("DateTimeOriginal") or all_tags.get("DateTime")
+    if date:
+        exif["date"] = str(date)
+
+    # File info
+    exif["filepath"] = image["filepath"]
+    try:
+        exif["filesize"] = f"{os.path.getsize(image['filepath']) / (1024*1024):.1f} MB"
+    except Exception:
+        pass
 
     return {"exif": exif}
 
