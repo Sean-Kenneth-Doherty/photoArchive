@@ -1374,138 +1374,63 @@ button:disabled {
 .loupe-main {
     flex: 1;
     display: flex;
-    align-items: center;
     min-height: 0;
     position: relative;
+    overflow: hidden;
 }
 
 .loupe-image-wrap {
     flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    position: relative;
     min-width: 0;
     min-height: 0;
-    padding: 8px;
+    height: 100%;
     overflow: hidden;
     cursor: zoom-in;
-}
-
-.loupe-image-wrap.zoomed {
-    cursor: grab;
-    overflow: auto;
-}
-
-.loupe-image-wrap.zoomed:active {
-    cursor: grabbing;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 .loupe-image-wrap img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+    will-change: transform;
     transition: opacity 0.15s;
 }
 
-.loupe-image-wrap.zoomed img {
-    max-width: none;
-    max-height: none;
-    cursor: grab;
-}
-
-.loupe-nav {
-    width: 50px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 36px;
-    color: #333;
-    cursor: pointer;
-    transition: color 0.15s;
-    user-select: none;
-    flex-shrink: 0;
-}
-
-.loupe-nav:hover {
-    color: #aaa;
-}
-
-/* Metadata panel (Lightroom-style sidebar) */
-.loupe-meta-panel {
+/* Metadata overlay (top-left white text) */
+.loupe-meta-overlay {
     position: absolute;
-    top: 0;
-    right: 0;
-    width: 240px;
-    height: 100%;
-    background: rgba(0,0,0,0.85);
-    border-left: 1px solid #222;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    overflow-y: auto;
-    opacity: 0;
-    transition: opacity 0.2s;
-}
-
-.loupe-main:hover .loupe-meta-panel {
-    opacity: 1;
-}
-
-.loupe-meta-section {
-    border-bottom: 1px solid #222;
-    padding-bottom: 10px;
-}
-
-.loupe-meta-filename {
-    color: #e0e0e0;
-    font-size: 13px;
-    font-weight: 600;
-    word-break: break-all;
-    margin-bottom: 4px;
-}
-
-.loupe-meta-rating {
-    color: #c9a84c;
-    font-size: 14px;
-    letter-spacing: 2px;
-}
-
-.loupe-meta-label {
-    color: #666;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-top: 6px;
-}
-
-.loupe-meta-value {
-    color: #bbb;
-    font-size: 12px;
-    font-family: monospace;
-}
-
-.loupe-meta-actions {
-    margin-top: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-
-.lightbox-btn {
-    padding: 5px 12px;
-    font-size: 11px;
-    background: rgba(255,255,255,0.08);
-    color: #999;
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 4px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-}
-
-.lightbox-btn:hover {
-    background: rgba(255,255,255,0.18);
+    top: 16px;
+    left: 16px;
     color: #fff;
+    text-shadow: 0 1px 6px rgba(0,0,0,0.9), 0 0 2px rgba(0,0,0,0.7);
+    font-size: 13px;
+    line-height: 1.6;
+    z-index: 10;
+    pointer-events: none;
+    max-width: 400px;
+}
+
+#loupe-overlay-filename {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 2px;
+}
+
+#loupe-overlay-exif {
+    color: rgba(255,255,255,0.8);
+    font-family: monospace;
+    font-size: 12px;
+    white-space: pre-line;
+}
+
+#loupe-overlay-stats {
+    color: rgba(255,255,255,0.6);
+    font-size: 12px;
+    margin-top: 2px;
 }
 
 /* Filmstrip */

@@ -6,47 +6,16 @@
     <div class="rankings-grid" id="rankings-grid">
     </div>
 
-    <!-- Loupe view (Lightroom-style full screen + filmstrip) -->
+    <!-- Loupe view (full screen + filmstrip) -->
     <div class="loupe hidden" id="loupe">
         <div class="loupe-main">
-            <div class="loupe-nav loupe-prev" onclick="PhotoArchive.lightboxPrev()">&#8249;</div>
-            <div class="loupe-image-wrap" id="loupe-image-wrap" onclick="PhotoArchive.toggleLoupeZoom(event)">
-                <img id="loupe-img" src="" alt="">
+            <div class="loupe-image-wrap" id="loupe-image-wrap">
+                <img id="loupe-img" src="" alt="" draggable="false">
             </div>
-            <div class="loupe-nav loupe-next" onclick="PhotoArchive.lightboxNext()">&#8250;</div>
-
-            <!-- Metadata panel (Lightroom-style, right side) -->
-            <div class="loupe-meta-panel" id="loupe-meta-panel">
-                <div class="loupe-meta-section">
-                    <div class="loupe-meta-filename" id="loupe-filename"></div>
-                    <div class="loupe-meta-rating" id="loupe-rating"></div>
-                </div>
-                <div class="loupe-meta-section" id="loupe-exif-section">
-                    <div class="loupe-meta-label">Camera</div>
-                    <div class="loupe-meta-value" id="loupe-camera"></div>
-                    <div class="loupe-meta-label">Lens</div>
-                    <div class="loupe-meta-value" id="loupe-lens"></div>
-                    <div class="loupe-meta-label">Settings</div>
-                    <div class="loupe-meta-value" id="loupe-settings"></div>
-                    <div class="loupe-meta-label">Exposure</div>
-                    <div class="loupe-meta-value" id="loupe-exposure"></div>
-                    <div class="loupe-meta-label">Dimensions</div>
-                    <div class="loupe-meta-value" id="loupe-dimensions"></div>
-                    <div class="loupe-meta-label">Date</div>
-                    <div class="loupe-meta-value" id="loupe-date"></div>
-                    <div class="loupe-meta-label">File</div>
-                    <div class="loupe-meta-value" id="loupe-filesize"></div>
-                </div>
-                <div class="loupe-meta-section">
-                    <div class="loupe-meta-label">Elo</div>
-                    <div class="loupe-meta-value" id="loupe-elo"></div>
-                    <div class="loupe-meta-label">Comparisons</div>
-                    <div class="loupe-meta-value" id="loupe-comparisons"></div>
-                </div>
-                <div class="loupe-meta-actions">
-                    <button class="lightbox-btn" onclick="PhotoArchive.findSimilar()">Find Similar</button>
-                    <button class="lightbox-btn" onclick="PhotoArchive.closeLightbox()">Back to Grid</button>
-                </div>
+            <div class="loupe-meta-overlay" id="loupe-meta-overlay">
+                <div id="loupe-overlay-filename"></div>
+                <div id="loupe-overlay-exif"></div>
+                <div id="loupe-overlay-stats"></div>
             </div>
         </div>
         <div class="filmstrip" id="filmstrip">

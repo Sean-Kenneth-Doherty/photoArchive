@@ -1080,13 +1080,16 @@ const PhotoArchive = (() => {
         await rankingsPromise;
         await statsPromise;
 
-        // Infinite scroll
-        window.addEventListener('scroll', () => {
-            if (rankingsLoading || rankingsExhausted || searchQuery) return;
-            if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) {
+        // Infinite scroll via IntersectionObserver (avoids continuous scroll events)
+        const sentinel = document.createElement('div');
+        sentinel.style.height = '1px';
+        document.querySelector('.rankings-grid')?.after(sentinel);
+        const scrollObserver = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting && !rankingsLoading && !rankingsExhausted && !searchQuery) {
                 loadRankings();
             }
-        });
+        }, { rootMargin: '600px' });
+        scrollObserver.observe(sentinel);
 
         // Loupe keyboard navigation
         document.addEventListener('keydown', (e) => {
@@ -1096,6 +1099,9 @@ const PhotoArchive = (() => {
             else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxPrev(); }
             else if (e.key === 'Escape') { closeLightbox(); }
         });
+
+        // Loupe zoom/pan interaction
+        initLoupeInteraction();
 
         // Set up search input
         const input = document.getElementById('search-input');
@@ -1281,9 +1287,17 @@ const PhotoArchive = (() => {
         showLoupeImage(libraryImages[lightboxIndex]);
     }
 
+    let _filmstripBuiltFor = null;  // track which image set the filmstrip was built for
+
     function buildFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        // Only rebuild if the image set changed
+        if (_filmstripBuiltFor === libraryImages) {
+            updateFilmstripActive();
+            return;
+        }
+        _filmstripBuiltFor = libraryImages;
         scroll.innerHTML = '';
         for (let i = 0; i < libraryImages.length; i++) {
             const img = libraryImages[i];
@@ -1294,7 +1308,7 @@ const PhotoArchive = (() => {
                 lightboxIndex = i;
                 showLoupeImage(libraryImages[i]);
             };
-            thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}">`;
+            thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
             scroll.appendChild(thumb);
         }
     }
@@ -1312,16 +1326,29 @@ const PhotoArchive = (() => {
         }
     }
 
-    let loupeZoomed = false;
+    // Loupe zoom/pan state
+    let loupeScale = 1;
+    let loupeFitScale = 1;
+    let loupePanX = 0;
+    let loupePanY = 0;
+    let loupeNatW = 0;
+    let loupeNatH = 0;
+    let loupeIsFit = true;
+    let _loupeDragMoved = false;
+    let _loupeDragging = false;
+    const loupeRefLong = 3840; // lg thumbnail long side — reference for 1:1 zoom
 
     function showLoupeImage(img) {
         const loupe = document.getElementById('loupe');
         const loupeImg = document.getElementById('loupe-img');
-        const wrap = document.getElementById('loupe-image-wrap');
 
-        // Reset zoom
-        loupeZoomed = false;
-        if (wrap) wrap.classList.remove('zoomed');
+        // Pre-calculate fit dimensions from aspect ratio so all progressive
+        // loads (sm/md/lg) display at the same screen size — no size jumps
+        loupeIsFit = true;
+        const ar = img.aspect_ratio || 1.5;
+        const refLong = 3840;
+        loupeNatW = ar >= 1 ? refLong : Math.round(refLong * ar);
+        loupeNatH = ar >= 1 ? Math.round(refLong / ar) : refLong;
 
         // Progressive loading: sm (instant) → md (fast) → lg (full quality)
         loupeImg.src = img.thumb_url;
@@ -1332,83 +1359,238 @@ const PhotoArchive = (() => {
         lg.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = lg.src; };
         lg.src = `/api/thumb/lg/${img.id}`;
 
-        // Populate metadata panel
-        const filenameEl = document.getElementById('loupe-filename');
-        const ratingEl = document.getElementById('loupe-rating');
-        const eloEl = document.getElementById('loupe-elo');
-        const compsEl = document.getElementById('loupe-comparisons');
-        const cameraEl = document.getElementById('loupe-camera');
-        const lensEl = document.getElementById('loupe-lens');
-        const settingsEl = document.getElementById('loupe-settings');
-        const dateEl = document.getElementById('loupe-date');
+        // Populate metadata overlay
+        const filenameEl = document.getElementById('loupe-overlay-filename');
+        const exifEl = document.getElementById('loupe-overlay-exif');
+        const statsEl = document.getElementById('loupe-overlay-stats');
+
+        if (filenameEl) filenameEl.textContent = img.filename;
+        if (exifEl) exifEl.textContent = '';
 
         const stars = eloToStars(img.elo, img.comparisons);
-        if (filenameEl) filenameEl.textContent = img.filename;
-        if (ratingEl) ratingEl.textContent = '★'.repeat(stars) + '☆'.repeat(5 - stars);
-        if (eloEl) eloEl.textContent = `${img.elo}`;
-        if (compsEl) compsEl.textContent = `${img.comparisons}`;
-        if (cameraEl) cameraEl.textContent = '—';
-        if (lensEl) lensEl.textContent = '—';
-        if (settingsEl) settingsEl.textContent = '—';
-        if (dateEl) dateEl.textContent = '—';
+        const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
+        if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} comparisons`;
 
         loupe.classList.remove('hidden');
+
+        // Apply fit transform immediately so sm appears at the same size as lg
+        const wrap = document.getElementById('loupe-image-wrap');
+        if (wrap) {
+            loupeFitScale = loupeComputeFitScale();
+            loupeScale = loupeFitScale;
+            loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
+            loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+            loupeApplyTransform();
+            wrap.style.cursor = 'zoom-in';
+        }
+
         updateFilmstripActive();
 
-        // Prefetch neighbors
-        if (lightboxIndex > 0) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex - 1].id}`);
-        if (lightboxIndex < libraryImages.length - 1) preloadImage(`/api/thumb/md/${libraryImages[lightboxIndex + 1].id}`);
+        // Warm-load adjacent images at full res for instant navigation
+        for (const delta of [-1, 1]) {
+            const ni = lightboxIndex + delta;
+            if (ni >= 0 && ni < libraryImages.length) {
+                const nid = libraryImages[ni].id;
+                preloadImage(`/api/thumb/md/${nid}`);
+                preloadImage(`/api/thumb/lg/${nid}`);
+            }
+        }
 
-        // Load EXIF into panel
-        const exposureEl = document.getElementById('loupe-exposure');
-        const dimsEl = document.getElementById('loupe-dimensions');
-        const filesizeEl = document.getElementById('loupe-filesize');
-        if (exposureEl) exposureEl.textContent = '—';
-        if (dimsEl) dimsEl.textContent = '—';
-        if (filesizeEl) filesizeEl.textContent = '—';
-
+        // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
             if (!data.exif || libraryImages[lightboxIndex]?.id !== img.id) return;
             const e = data.exif;
-            if (cameraEl) cameraEl.textContent = [e.camera_make, e.camera_model].filter(Boolean).join(' ') || '—';
-            if (lensEl) lensEl.textContent = e.lens || '—';
-            const settingsParts = [];
-            if (e.focal_length) settingsParts.push(e.focal_length);
-            if (e.focal_length_35mm) settingsParts.push(`(${e.focal_length_35mm} eq)`);
-            if (e.aperture) settingsParts.push(e.aperture);
-            if (e.shutter_speed) settingsParts.push(e.shutter_speed + 's');
-            if (e.iso) settingsParts.push('ISO ' + e.iso);
-            if (settingsEl) settingsEl.textContent = settingsParts.join('  ') || '—';
-            const expParts = [];
-            if (e.exposure_program) expParts.push(e.exposure_program);
-            if (e.white_balance) expParts.push('WB: ' + e.white_balance);
-            if (e.flash) expParts.push(e.flash);
-            if (exposureEl) exposureEl.textContent = expParts.join('  ') || '—';
-            if (dimsEl) dimsEl.textContent = e.dimensions || '—';
-            if (dateEl) dateEl.textContent = e.date || '—';
-            if (filesizeEl) filesizeEl.textContent = e.filesize || '—';
+            const parts = [];
+            const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
+            if (camera) parts.push(camera);
+            const settings = [];
+            if (e.focal_length) settings.push(e.focal_length);
+            if (e.aperture) settings.push(e.aperture);
+            if (e.shutter_speed) settings.push(e.shutter_speed + 's');
+            if (e.iso) settings.push('ISO ' + e.iso);
+            if (settings.length) parts.push(settings.join('  '));
+            if (e.lens) parts.push(e.lens);
+            if (exifEl) exifEl.textContent = parts.join('\n');
+            if (e.dimensions && statsEl) {
+                statsEl.textContent += ' · ' + e.dimensions;
+            }
         }).catch(() => {});
     }
 
-    function toggleLoupeZoom(e) {
+    // ==================== LOUPE ZOOM/PAN ====================
+
+    function loupeComputeFitScale() {
+        const wrap = document.getElementById('loupe-image-wrap');
+        if (!wrap || !loupeNatW || !loupeNatH) return 1;
+        return Math.min(wrap.clientWidth / loupeNatW, wrap.clientHeight / loupeNatH);
+    }
+
+    function loupeApplyTransform() {
+        const img = document.getElementById('loupe-img');
+        if (!img) return;
+        img.style.transform = `translate(${loupePanX}px, ${loupePanY}px) scale(${loupeScale})`;
+    }
+
+    function loupeCenterFit() {
+        const wrap = document.getElementById('loupe-image-wrap');
+        const img = document.getElementById('loupe-img');
+        if (!wrap || !img) return;
+        loupeFitScale = loupeComputeFitScale();
+        loupeScale = loupeFitScale;
+        loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
+        loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+        loupeIsFit = true;
+        img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
+        loupeApplyTransform();
+        wrap.style.cursor = 'zoom-in';
+        setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
+    }
+
+    function loupeZoomTo(newScale, pivotX, pivotY) {
+        const wrap = document.getElementById('loupe-image-wrap');
+        if (!wrap) return;
+
+        const rect = wrap.getBoundingClientRect();
+        const imgX = (pivotX - rect.left - loupePanX) / loupeScale;
+        const imgY = (pivotY - rect.top - loupePanY) / loupeScale;
+
+        const oneToOne = loupeRefLong / Math.max(loupeNatW, loupeNatH, 1);
+        const minScale = Math.min(loupeFitScale, oneToOne) * 0.5;
+        const maxScale = Math.max(oneToOne * 4, loupeFitScale * 2);
+        loupeScale = Math.max(minScale, Math.min(maxScale, newScale));
+
+        loupePanX = pivotX - rect.left - imgX * loupeScale;
+        loupePanY = pivotY - rect.top - imgY * loupeScale;
+
+        loupeIsFit = Math.abs(loupeScale - loupeFitScale) < 0.001;
+        loupeClampPan();
+        loupeApplyTransform();
+        wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
+    }
+
+    function loupeClampPan() {
+        const wrap = document.getElementById('loupe-image-wrap');
+        if (!wrap) return;
+        const cw = wrap.clientWidth;
+        const ch = wrap.clientHeight;
+        const iw = loupeNatW * loupeScale;
+        const ih = loupeNatH * loupeScale;
+
+        if (iw <= cw) {
+            loupePanX = (cw - iw) / 2;
+        } else {
+            loupePanX = Math.min(0, Math.max(cw - iw, loupePanX));
+        }
+
+        if (ih <= ch) {
+            loupePanY = (ch - ih) / 2;
+        } else {
+            loupePanY = Math.min(0, Math.max(ch - ih, loupePanY));
+        }
+    }
+
+    function initLoupeInteraction() {
         const wrap = document.getElementById('loupe-image-wrap');
         const img = document.getElementById('loupe-img');
         if (!wrap || !img) return;
 
-        loupeZoomed = !loupeZoomed;
-        wrap.classList.toggle('zoomed', loupeZoomed);
+        // Handle progressive image loads (sm -> md -> lg)
+        img.addEventListener('load', () => {
+            const oldNatW = loupeNatW;
+            loupeNatW = img.naturalWidth;
+            loupeNatH = img.naturalHeight;
+            loupeFitScale = loupeComputeFitScale();
 
-        if (loupeZoomed) {
-            // Zoom to click position
-            const rect = wrap.getBoundingClientRect();
-            const clickX = (e.clientX - rect.left) / rect.width;
-            const clickY = (e.clientY - rect.top) / rect.height;
-            // Wait for layout to update
-            requestAnimationFrame(() => {
-                wrap.scrollLeft = (img.scrollWidth - rect.width) * clickX;
-                wrap.scrollTop = (img.scrollHeight - rect.height) * clickY;
-            });
-        }
+            if (loupeIsFit || !oldNatW) {
+                loupeScale = loupeFitScale;
+                loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
+                loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+                loupeApplyTransform();
+                wrap.style.cursor = 'zoom-in';
+            } else {
+                // Progressive upgrade while zoomed — maintain visible area
+                const ratio = oldNatW / loupeNatW;
+                loupeScale *= ratio;
+                loupeClampPan();
+                loupeApplyTransform();
+            }
+        });
+
+        // Drag to pan
+        let dragStartX = 0, dragStartY = 0;
+        let dragPanStartX = 0, dragPanStartY = 0;
+
+        wrap.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            const img = document.getElementById('loupe-img');
+            if (img) img.style.transition = 'opacity 0.15s';
+            _loupeDragMoved = false;
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            dragPanStartX = loupePanX;
+            dragPanStartY = loupePanY;
+
+            if (!loupeIsFit) {
+                _loupeDragging = true;
+                wrap.style.cursor = 'grabbing';
+                e.preventDefault();
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!_loupeDragging) return;
+            const dx = e.clientX - dragStartX;
+            const dy = e.clientY - dragStartY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) _loupeDragMoved = true;
+            loupePanX = dragPanStartX + dx;
+            loupePanY = dragPanStartY + dy;
+            loupeClampPan();
+            loupeApplyTransform();
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (_loupeDragging) {
+                _loupeDragging = false;
+                wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
+            }
+        });
+
+        // Click to toggle between fit and 1:1
+        wrap.addEventListener('click', (e) => {
+            if (_loupeDragMoved) { _loupeDragMoved = false; return; }
+
+            if (loupeIsFit) {
+                // Zoom to 1:1 pixel scale (relative to lg resolution) centered on click
+                const targetScale = loupeRefLong / Math.max(loupeNatW, loupeNatH, 1);
+                const img = document.getElementById('loupe-img');
+                if (img) img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
+                loupeZoomTo(targetScale, e.clientX, e.clientY);
+                setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
+            } else {
+                loupeCenterFit();
+            }
+        });
+
+        // Mouse wheel zoom (centered on cursor)
+        wrap.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const img = document.getElementById('loupe-img');
+            if (img) img.style.transition = 'opacity 0.15s';
+            const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+            loupeZoomTo(loupeScale * factor, e.clientX, e.clientY);
+        }, { passive: false });
+
+        // Recalculate fit on window resize
+        window.addEventListener('resize', () => {
+            if (!loupeNatW) return;
+            loupeFitScale = loupeComputeFitScale();
+            if (loupeIsFit) {
+                loupeScale = loupeFitScale;
+                loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
+                loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+                loupeApplyTransform();
+            }
+        });
     }
 
     function lightboxNext() {
@@ -1425,21 +1607,28 @@ const PhotoArchive = (() => {
 
     function closeLightbox() {
         const loupe = document.getElementById('loupe');
-        const wrap = document.getElementById('loupe-image-wrap');
         if (loupe) loupe.classList.add('hidden');
-        if (wrap) wrap.classList.remove('zoomed');
-        loupeZoomed = false;
+        loupeIsFit = true;
+        loupeNatW = 0;
+        loupeNatH = 0;
         lightboxIndex = -1;
     }
 
     function setThumbSize(value) {
         thumbHeight = parseInt(value);
-        // Update all existing cards
-        document.querySelectorAll('.rank-card').forEach(card => {
-            const ar = parseFloat(card.dataset.ar) || 1.5;
-            card.style.height = thumbHeight + 'px';
-            card.style.flexBasis = (thumbHeight * ar) + 'px';
-        });
+        // Use CSS custom property to avoid per-card layout thrashing
+        document.documentElement.style.setProperty('--thumb-height', thumbHeight + 'px');
+        // Cards that need explicit flex-basis still need individual updates,
+        // but batch reads first, then writes to avoid interleaved reflows.
+        const cards = document.querySelectorAll('.rank-card');
+        const updates = [];
+        for (const card of cards) {
+            updates.push({ el: card, basis: thumbHeight * (parseFloat(card.dataset.ar) || 1.5) });
+        }
+        for (const { el, basis } of updates) {
+            el.style.height = thumbHeight + 'px';
+            el.style.flexBasis = basis + 'px';
+        }
     }
 
     function reloadForFilters() {
@@ -2080,7 +2269,6 @@ const PhotoArchive = (() => {
         closeLightbox,
         lightboxNext,
         lightboxPrev,
-        toggleLoupeZoom,
         setThumbSize,
         setFilter,
         toggleFilter,
