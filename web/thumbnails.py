@@ -145,12 +145,23 @@ def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
     return allocations
 
 
-def _build_source_signature(filepath: str, size: str, image_id: int) -> str:
+_source_stat_cache: dict[str, str] = {}
+
+def _get_source_bits(filepath: str) -> str:
+    """Cache os.stat results per filepath to avoid repeated HDD stat calls."""
+    cached = _source_stat_cache.get(filepath)
+    if cached is not None:
+        return cached
     try:
         stat = os.stat(filepath)
-        source_bits = f"{stat.st_size}|{stat.st_mtime_ns}|{filepath}"
+        bits = f"{stat.st_size}|{stat.st_mtime_ns}|{filepath}"
     except OSError:
-        source_bits = f"missing|{filepath}"
+        bits = f"missing|{filepath}"
+    _source_stat_cache[filepath] = bits
+    return bits
+
+def _build_source_signature(filepath: str, size: str, image_id: int) -> str:
+    source_bits = _get_source_bits(filepath)
 
     if size == FULL_TIER:
         signature = f"{CACHE_VERSION}|full|{image_id}|{source_bits}"
