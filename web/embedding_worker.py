@@ -341,7 +341,6 @@ async def run_embedding_worker():
                         f"Skipping {len(failed)} unavailable files for now; retrying other images. Latest error: {sample_error}",
                         ready=True,
                     )
-                await asyncio.sleep(0.1)
                 continue
 
             if candidates and cooled_down:
