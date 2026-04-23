@@ -2,6 +2,8 @@ import asyncio
 import csv
 import io
 import os
+import subprocess
+import time
 
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -47,9 +49,27 @@ _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/ai/status",
     "/api/cache/status",
     "/api/cache/pregen/status",
+    "/api/dev/status",
     "/api/scan/status",
     "/api/settings",
 }
+_STARTED_AT = time.time()
+
+
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        ).strip()
+    except Exception:
+        return None
+
+
+_GIT_COMMIT = _git_commit()
 
 
 @app.middleware("http")
@@ -162,6 +182,18 @@ async def library_page(request: Request):
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     return templates.TemplateResponse(request, "settings.html")
+
+
+@app.get("/api/dev/status")
+async def dev_status():
+    """Lightweight process/version probe for local server management."""
+    return {
+        "pid": os.getpid(),
+        "started_at": _STARTED_AT,
+        "uptime_seconds": round(time.time() - _STARTED_AT, 3),
+        "git_commit": _GIT_COMMIT,
+        "cwd": os.getcwd(),
+    }
 
 
 # --- Scan API ---

@@ -1,10 +1,15 @@
 elo_ratings.json
+.codex
 web/.venv/
 web/.cache/
 web/.embedcache/
 web/.thumbcache/
 web/.models/
+web/.run/
 web/settings.local.json
+web/*.db
+web/*.db-shm
+web/*.db-wal
 web/photoranker.db
 web/photoarchive.db
 web/photoarchive.db-shm

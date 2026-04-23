@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WEB="$ROOT/web"
+RUN_DIR="$WEB/.run"
+PIDFILE="$RUN_DIR/photoarchive.pid"
+LOGFILE="$RUN_DIR/server.log"
+HOST="${PHOTOARCHIVE_HOST:-127.0.0.1}"
+PORT="${PHOTOARCHIVE_PORT:-8000}"
+URL="http://${HOST}:${PORT}"
+UVICORN="$WEB/.venv/bin/uvicorn"
+MATCH_PATTERN="$WEB/.venv/bin/python .*uvicorn app:app --host ${HOST} --port ${PORT}"
+
+mkdir -p "$RUN_DIR"
+
+find_pids() {
+    pgrep -f "$MATCH_PATTERN" 2>/dev/null || true
+}
+
+is_healthy() {
+    curl -fsS --max-time 1 "$URL/api/dev/status" >/dev/null 2>&1
+}
+
+print_status() {
+    local pids
+    pids="$(find_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    printf 'repo: %s\n' "$ROOT"
+    printf 'url:  %s\n' "$URL"
+    printf 'log:  %s\n' "$LOGFILE"
+    if [[ -n "$pids" ]]; then
+        printf 'pids: %s\n' "$pids"
+    else
+        printf 'pids: none\n'
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --max-time 1 "$URL/api/dev/status"; then
+            printf '\n'
+        else
+            printf 'health: not responding to /api/dev/status\n'
+        fi
+    fi
+}
+
+stop_server() {
+    local pids deadline remaining
+    pids="$(find_pids)"
+    if [[ -z "$pids" ]]; then
+        echo "No photoArchive server found for ${URL}."
+        return 0
+    fi
+
+    echo "$pids" | xargs -r kill -TERM
+    deadline=$((SECONDS + 10))
+    while [[ $SECONDS -lt $deadline ]]; do
+        remaining="$(find_pids)"
+        [[ -z "$remaining" ]] && break
+        sleep 0.25
+    done
+
+    remaining="$(find_pids)"
+    if [[ -n "$remaining" ]]; then
+        echo "$remaining" | xargs -r kill -KILL
+    fi
+    rm -f "$PIDFILE"
+}
+
+start_server() {
+    if [[ ! -x "$UVICORN" ]]; then
+        echo "Missing $UVICORN. Run: cd web && python -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+        return 1
+    fi
+
+    if [[ -n "$(find_pids)" ]] || curl -fsS --max-time 1 "$URL/api/stats" >/dev/null 2>&1; then
+        echo "photoArchive already appears to be running on ${URL}." >&2
+        print_status
+        return 1
+    fi
+
+    (
+        cd "$WEB"
+        "$UVICORN" app:app --host "$HOST" --port "$PORT" >>"$LOGFILE" 2>&1 &
+        echo "$!" >"$PIDFILE"
+    )
+
+    for _ in {1..40}; do
+        is_healthy && break
+        sleep 0.25
+    done
+
+    print_status
+}
+
+case "${1:-status}" in
+    start)
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    restart)
+        stop_server
+        start_server
+        ;;
+    status)
+        print_status
+        ;;
+    logs)
+        touch "$LOGFILE"
+        tail -f "$LOGFILE"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|logs}" >&2
+        exit 2
+        ;;
+esac

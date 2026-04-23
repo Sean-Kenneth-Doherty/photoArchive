@@ -9,8 +9,15 @@ photoArchive is a FastAPI web app for managing, ranking, and searching a large p
 ## Running
 
 ```bash
-cd web && .venv/bin/uvicorn app:app --reload
+./scripts/photoarchive-server restart
+./scripts/photoarchive-server status
+./scripts/photoarchive-server logs
 ```
+
+Use the helper for performance work: it runs a single non-reload uvicorn process,
+writes logs/PID state to `web/.run/`, and `/api/dev/status` reports the live PID
+and git commit. Avoid `--reload` while benchmarking because the reloader creates
+extra processes and noisy timings.
 
 To set up from scratch:
 

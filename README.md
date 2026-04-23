@@ -63,11 +63,17 @@ Install the AI model from the Settings page after first launch, or it will downl
 ## Running
 
 ```bash
-cd web
-.venv/bin/uvicorn app:app --reload
+./scripts/photoarchive-server restart
+./scripts/photoarchive-server status
+./scripts/photoarchive-server logs
 ```
 
 Open http://localhost:8000. Scan a folder to import photos, then start comparing.
+
+The helper writes runtime logs and PID state under `web/.run/` and exposes
+`/api/dev/status` so you can confirm the live PID and git commit after a restart.
+For profiling, prefer this non-reload server path so reload watchers do not skew
+timings.
 
 ## Architecture
 
