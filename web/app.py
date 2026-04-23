@@ -52,6 +52,16 @@ async def startup():
     except ImportError:
         pass  # AI features disabled — missing dependencies
 
+    # Pre-warm embed cache in background so first search/similar is fast
+    async def _warm_embed_cache():
+        await asyncio.sleep(3)  # let the server settle
+        try:
+            import embed_cache
+            await embed_cache.get_matrix()
+        except Exception:
+            pass
+    asyncio.create_task(_warm_embed_cache())
+
 
 async def classify_orientations_background():
     """Continuously classify unclassified images by reading just the image header."""
@@ -466,6 +476,20 @@ async def cull_undo():
 
 # --- Mosaic Ranking API ---
 
+# Cache for get_kept_images_for_pairing — invalidated by comparisons
+_pairing_cache = {"data": None, "comparison_count": -1}
+
+async def _get_pairing_images():
+    """Cached wrapper around db.get_kept_images_for_pairing()."""
+    stats = await db.get_stats()
+    cc = stats["total_comparisons"]
+    if _pairing_cache["data"] is not None and _pairing_cache["comparison_count"] == cc:
+        return _pairing_cache["data"]
+    images = await db.get_kept_images_for_pairing()
+    _pairing_cache["data"] = images
+    _pairing_cache["comparison_count"] = cc
+    return images
+
 async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
     """Select images that maximize visual diversity using embedding distance."""
     import random
@@ -537,7 +561,7 @@ async def mosaic_next(
     if strategy == "top":
         images = await db.get_top_images(limit=50)
     else:
-        images = await db.get_kept_images_for_pairing()
+        images = await _get_pairing_images()
 
     if len(images) < 2:
         return {"images": [], "total_kept": len(images)}
@@ -663,6 +687,9 @@ async def mosaic_pick(request: Request):
     finally:
         await conn.close()
 
+    # Invalidate pairing cache since Elo changed
+    _pairing_cache["comparison_count"] = -1
+
     # Fire-and-forget: propagate Elo to similar images via embeddings
     asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, other_ids, k=12.0))
 
@@ -676,7 +703,7 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
     if mode == "topn":
         images = await db.get_top_images(limit=50)
     else:
-        images = await db.get_kept_images_for_pairing()
+        images = await _get_pairing_images()
 
     if len(images) < 2:
         return {"pairs": [], "total_kept": len(images)}
@@ -730,6 +757,7 @@ async def submit_comparison(request: Request):
     )
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
+    _pairing_cache["comparison_count"] = -1
     asyncio.create_task(elo_propagation.propagate_comparison(winner_id, loser_id, k))
 
     return {

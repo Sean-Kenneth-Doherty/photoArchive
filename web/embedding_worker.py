@@ -12,8 +12,13 @@ import os
 import struct
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+
+# Dedicated executor — keeps embedding GIL holds off the default pool
+# so thumbnail serving and other async tasks aren't blocked
+_embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
 
 import ai_models
 import db
@@ -26,7 +31,7 @@ if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
 EMBEDDING_DIM = 2048  # Native output dimension for Qwen3-VL-Embedding-2B
-BATCH_SIZE = 4  # Small batches for VL model
+BATCH_SIZE = 2  # Smaller batches = shorter GIL holds = less event loop blocking
 EMBED_SPEED_WINDOW_SECONDS = 300
 EMBED_CANDIDATE_MULTIPLIER = 16
 EMBED_RETRY_SECONDS = 600
@@ -246,7 +251,7 @@ def vec_to_blob(vec: np.ndarray) -> bytes:
 
 
 def blob_to_vec(blob: bytes) -> np.ndarray:
-    return np.array(struct.unpack(f"{EMBEDDING_DIM}f", blob), dtype=np.float32)
+    return np.frombuffer(blob, dtype=np.float32).copy()
 
 
 async def run_embedding_worker():
@@ -285,7 +290,7 @@ async def run_embedding_worker():
                 or _loaded_model_revision != model_revision
             ):
                 _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
-                _model = await loop.run_in_executor(None, _load_model, model_dir, model_id)
+                _model = await loop.run_in_executor(_embed_executor, _load_model, model_dir, model_id)
                 _loaded_model_dir = model_dir
                 _loaded_model_id = model_id
                 _loaded_model_revision = model_revision
@@ -300,8 +305,9 @@ async def run_embedding_worker():
                 embed_started = time.perf_counter()
 
                 vectors, errors = await loop.run_in_executor(
-                    None, _embed_images, _model, image_refs
+                    _embed_executor, _embed_images, _model, image_refs
                 )
+                await asyncio.sleep(0)  # yield to event loop after GPU work
 
                 batch = []
                 failed = []
