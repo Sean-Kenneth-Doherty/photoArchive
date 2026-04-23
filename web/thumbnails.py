@@ -944,6 +944,10 @@ def has_cached(size: str, filepath: str, image_id: int) -> bool:
     return _get_disk_entry(size, image_id, source_signature, touch=False) is not None
 
 
+def has_cached_fast(size: str, image_id: int) -> bool:
+    return _memory_get_entry_fast(size, image_id) is not None or fast_disk_has(size, image_id)
+
+
 async def _run_thumbnail_job(
     filepath: str,
     size: str,

@@ -322,7 +322,7 @@ async def build_cache_status(ahead: int = 100):
 
         result["total"] = len(rows)
         result["cached"] = sum(
-            1 for row in rows if thumbnails.has_cached("lg", row["filepath"], row["id"])
+            1 for row in rows if thumbnails.has_cached_fast("lg", row["id"])
         )
     else:
         result["total"] = 0
