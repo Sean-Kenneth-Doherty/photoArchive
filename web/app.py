@@ -526,12 +526,22 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
                 sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
             return sample
 
-        # Extract only the vectors we need (small subset of full matrix)
-        vecs = matrix[cand_indices]
+        # Subsample candidates to ~200 for fast diversity computation
+        # (running greedy diversity on 20k vectors is too slow)
+        POOL_SIZE = min(200, len(cand_items))
+        if len(cand_items) > POOL_SIZE:
+            explore_weights = [1.0 / (c["comparisons"] + 1) for c in cand_items]
+            pool_indices = random.choices(range(len(cand_items)), weights=explore_weights, k=POOL_SIZE)
+            pool_indices = list(set(pool_indices))  # deduplicate
+        else:
+            pool_indices = list(range(len(cand_items)))
 
-        # Greedy diverse selection
-        explore_weights = [1.0 / (c["comparisons"] + 1) for c in cand_items]
-        first = random.choices(range(len(cand_items)), weights=explore_weights, k=1)[0]
+        pool_matrix_indices = [cand_indices[i] for i in pool_indices]
+        vecs = matrix[pool_matrix_indices]
+        pool_items = [cand_items[i] for i in pool_indices]
+
+        # Greedy diverse selection on the small pool
+        first = random.randrange(len(pool_items))
         selected = [first]
 
         for _ in range(count - 1):
@@ -541,7 +551,7 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
                 max_sim[si] = 999
             selected.append(int(np.argmin(max_sim)))
 
-        return [cand_items[i] for i in selected]
+        return [pool_items[i] for i in selected]
 
     except Exception:
         # Fallback to random if embeddings unavailable
