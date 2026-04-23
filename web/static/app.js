@@ -1064,19 +1064,21 @@ const PhotoArchive = (() => {
     async function initLibrary() {
         rankingsOffset = 0;
         rankingsExhausted = false;
-        await loadRankings();
 
-        // Load stats and AI status for the bottom bar
-        try {
-            const stats = await (await fetch('/api/stats')).json();
+        // Fire all init requests in parallel — don't block on rankings
+        const rankingsPromise = loadRankings();
+        const statsPromise = fetch('/api/stats').then(r => r.json()).then(stats => {
             compareStats = stats;
             updateCompareProgress();
-        } catch {}
-        pollAIStatus();
-        setInterval(pollAIStatus, 5000);
+        }).catch(() => {});
 
         loadFolderList();
         initStarHover();
+        pollAIStatus();
+        setInterval(pollAIStatus, 5000);
+
+        await rankingsPromise;
+        await statsPromise;
 
         // Infinite scroll
         window.addEventListener('scroll', () => {
@@ -1135,8 +1137,8 @@ const PhotoArchive = (() => {
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
-        document.getElementById('rankings-grid').innerHTML = '';
-        loadRankings();
+        rankingsLoading = false;
+        loadRankings(true);
     }
 
     async function loadSearchResults() {
@@ -1179,8 +1181,9 @@ const PhotoArchive = (() => {
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
-        document.getElementById('rankings-grid').innerHTML = '';
-        loadRankings();
+        // Clear grid only after new data arrives to avoid blank flash
+        rankingsLoading = false; // allow loadRankings to proceed
+        loadRankings(true);  // true = clear grid before appending
     }
 
     function setSortField(field) {
@@ -1207,7 +1210,7 @@ const PhotoArchive = (() => {
         if (btn) btn.classList.toggle('active', !sortDesc);
     }
 
-    async function loadRankings() {
+    async function loadRankings(clearFirst = false) {
         if (rankingsLoading) return;
         rankingsLoading = true;
         const requestOffset = rankingsOffset;
@@ -1219,9 +1222,12 @@ const PhotoArchive = (() => {
             return;
         }
         const grid = document.getElementById('rankings-grid');
+        if (clearFirst) grid.innerHTML = '';
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
         const rowH = thumbHeight;
 
+        // Batch DOM writes with DocumentFragment to avoid per-card reflows
+        const frag = document.createDocumentFragment();
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
             const rank = rankingsOffset + i + 1;
@@ -1240,13 +1246,10 @@ const PhotoArchive = (() => {
                 else { openLightbox(img); }
             };
 
-            const eloLabel = `${img.elo}`;
-            const sourceTag = '';
             const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
-
             const infoLine = showRank
-                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${eloLabel} ${sourceTag}</span>`
-                : `<span class="rank-elo">${eloLabel} ${sourceTag}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo}</span>`
+                : `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
 
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
@@ -1254,9 +1257,10 @@ const PhotoArchive = (() => {
                 ${confDot}
                 <div class="rank-card-info">${infoLine}</div>
             `;
-            grid.appendChild(card);
+            frag.appendChild(card);
             libraryImages.push(img);
         }
+        grid.appendChild(frag);
 
         rankingsOffset += data.images.length;
         rankingsLoading = false;
@@ -1444,8 +1448,8 @@ const PhotoArchive = (() => {
             rankingsOffset = 0;
             rankingsExhausted = false;
             libraryImages = [];
-            grid.innerHTML = '';
-            loadRankings();
+            rankingsLoading = false;
+            loadRankings(true);
         } else {
             // Compare page — reload mosaic
             loadMosaicBatch();
