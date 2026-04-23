@@ -1009,7 +1009,7 @@ const PhotoArchive = (() => {
         const addRequest = (url) => {
             if (seen.has(url)) return;
             seen.add(url);
-            requests.push({ url, extract: imageThumbUrls });
+            requests.push({ url, cacheKey: `library:${url}`, extract: imageThumbUrls });
         };
 
         const sortKey = SORT_KEYS[sortField];
@@ -1267,9 +1267,10 @@ const PhotoArchive = (() => {
         if (data.images.length < limit) {
             rankingsExhausted = true;
         }
-        if (requestOffset === 0 && data.images.length > 0) {
+        if (data.images.length > 0) {
+            // Always warm neighbors — not just on first load
             scheduleLibraryNeighborWarmup();
-            scheduleCrossViewWarmup('library');
+            if (requestOffset === 0) scheduleCrossViewWarmup('library');
         }
     }
 
