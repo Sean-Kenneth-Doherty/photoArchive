@@ -7,12 +7,19 @@ Rebuilt when the embedding count changes (new images embedded).
 
 import numpy as np
 import asyncio
+import json
+import os
+import sqlite3
 import time
 import db
 
 COUNT_CHECK_TTL_SECONDS = 1.0
 MATRIX_GROWTH_MIN_ROWS = 512
 MATRIX_GROWTH_FACTOR = 1.10
+SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), ".embedcache")
+SNAPSHOT_MATRIX_PATH = os.path.join(SNAPSHOT_DIR, "matrix.npy")
+SNAPSHOT_IDS_PATH = os.path.join(SNAPSHOT_DIR, "image_ids.npy")
+SNAPSHOT_META_PATH = os.path.join(SNAPSHOT_DIR, "meta.json")
 
 _cache = {
     "image_ids": None,
@@ -32,20 +39,111 @@ def _matrix_view():
     return matrix[:len(image_ids)]
 
 
-def _rows_to_matrix(rows):
+def _rows_to_matrix(rows, *, overallocate: bool = True):
     if not rows:
         return [], None
 
-    image_ids = [r["image_id"] for r in rows]
-    dim = len(rows[0]["embedding"]) // 4
-    capacity = max(
-        len(rows),
-        int(len(rows) * MATRIX_GROWTH_FACTOR) + MATRIX_GROWTH_MIN_ROWS,
-    )
+    image_ids = [r[0] for r in rows]
+    dim = len(rows[0][1]) // 4
+    capacity = len(rows)
+    if overallocate:
+        capacity = max(
+            len(rows),
+            int(len(rows) * MATRIX_GROWTH_FACTOR) + MATRIX_GROWTH_MIN_ROWS,
+        )
     matrix = np.empty((capacity, dim), dtype=np.float32)
-    for i, row in enumerate(rows):
-        matrix[i] = np.frombuffer(row["embedding"], dtype=np.float32, count=dim)
+    for i, (_image_id, blob) in enumerate(rows):
+        matrix[i] = np.frombuffer(blob, dtype=np.float32, count=dim)
     return image_ids, matrix
+
+
+def _db_file_signature() -> list[tuple[str, int, int]]:
+    signature = []
+    for path in (db.DB_PATH, f"{db.DB_PATH}-wal", f"{db.DB_PATH}-shm"):
+        try:
+            stat = os.stat(path)
+            signature.append((os.path.basename(path), stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            signature.append((os.path.basename(path), -1, -1))
+    return signature
+
+
+def _load_snapshot_sync(expected_count: int):
+    try:
+        with open(SNAPSHOT_META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if int(meta.get("count", -1)) != expected_count:
+            return None
+        if meta.get("db_signature") != _db_file_signature():
+            return None
+        ids = np.load(SNAPSHOT_IDS_PATH, mmap_mode="r")
+        matrix = np.load(SNAPSHOT_MATRIX_PATH, mmap_mode="r")
+        if len(ids) != expected_count or matrix.shape[0] != expected_count:
+            return None
+        return ids.astype(np.int64).tolist(), matrix
+    except Exception:
+        return None
+
+
+def _save_snapshot_sync(image_ids: list[int], matrix: np.ndarray):
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        ids_tmp = f"{SNAPSHOT_IDS_PATH}.tmp"
+        matrix_tmp = f"{SNAPSHOT_MATRIX_PATH}.tmp"
+        meta_tmp = f"{SNAPSHOT_META_PATH}.tmp"
+        np.save(ids_tmp, np.asarray(image_ids, dtype=np.int64))
+        np.save(matrix_tmp, np.asarray(matrix[:len(image_ids)], dtype=np.float32))
+        with open(meta_tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "count": len(image_ids),
+                "db_signature": _db_file_signature(),
+                "created_at": time.time(),
+            }, f)
+        os.replace(f"{ids_tmp}.npy", SNAPSHOT_IDS_PATH)
+        os.replace(f"{matrix_tmp}.npy", SNAPSHOT_MATRIX_PATH)
+        os.replace(meta_tmp, SNAPSHOT_META_PATH)
+    except Exception:
+        pass
+
+
+def _get_embedding_count_sync() -> int:
+    conn = sqlite3.connect(db.DB_PATH, timeout=30)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM embeddings e "
+            "JOIN images i ON e.image_id = i.id "
+            "WHERE i.status IN ('kept', 'maybe')"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _load_embeddings_sync(expected_count: int):
+    snapshot = _load_snapshot_sync(expected_count)
+    if snapshot is not None:
+        return snapshot
+
+    conn = sqlite3.connect(db.DB_PATH, timeout=30)
+    try:
+        rows = conn.execute(
+            "SELECT e.image_id, e.embedding FROM embeddings e "
+            "JOIN images i ON e.image_id = i.id "
+            "WHERE i.status IN ('kept', 'maybe')"
+        ).fetchall()
+    finally:
+        conn.close()
+    image_ids, matrix = _rows_to_matrix(rows)
+    if image_ids and matrix is not None:
+        _save_snapshot_sync(image_ids, matrix)
+    return image_ids, matrix
+
+
+def _remove_snapshot_sync():
+    for path in (SNAPSHOT_MATRIX_PATH, SNAPSHOT_IDS_PATH, SNAPSHOT_META_PATH):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 async def get_matrix():
@@ -65,13 +163,13 @@ async def get_matrix():
         ):
             return _cache["image_ids"], _matrix_view()
 
-        current_count = await db.get_embedding_count()
+        current_count = _get_embedding_count_sync()
         _cache["checked_at"] = now
         if _cache["matrix"] is not None and _cache["count"] == current_count:
             return _cache["image_ids"], _matrix_view()
 
-        all_embeddings = await db.get_all_embeddings()
-        if not all_embeddings:
+        image_ids, matrix = _load_embeddings_sync(current_count)
+        if not image_ids or matrix is None:
             _cache.update({
                 "image_ids": None,
                 "id_to_idx": None,
@@ -80,8 +178,6 @@ async def get_matrix():
                 "checked_at": now,
             })
             return None, None
-
-        image_ids, matrix = _rows_to_matrix(all_embeddings)
 
         # Build new cache atomically to avoid partial reads from concurrent callers
         new_cache = {

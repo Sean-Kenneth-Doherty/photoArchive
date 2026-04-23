@@ -1,6 +1,7 @@
 elo_ratings.json
 web/.venv/
 web/.cache/
+web/.embedcache/
 web/.thumbcache/
 web/.models/
 web/settings.local.json
