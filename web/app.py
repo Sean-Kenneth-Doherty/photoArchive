@@ -3,7 +3,7 @@ import csv
 import io
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -236,7 +236,7 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
 
 
 @app.get("/api/full/{image_id}")
-async def serve_full_image(request: Request, image_id: int):
+async def serve_full_image(request: Request, image_id: int, background_tasks: BackgroundTasks):
     image = await db.get_image_by_id(image_id)
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
@@ -256,7 +256,11 @@ async def serve_full_image(request: Request, image_id: int):
     if request.headers.get("if-none-match") == headers["ETag"]:
         return Response(status_code=304, headers=headers)
 
-    path = await thumbnails.get_full_image_path(image["filepath"], image_id)
+    path = thumbnails.get_cached_full_image_path(image["filepath"], image_id)
+    if path is None:
+        path = image["filepath"]
+        background_tasks.add_task(thumbnails.schedule_full_image_cache, image["filepath"], image_id)
+
     if not path or not os.path.exists(path):
         return JSONResponse({"error": "Full image unavailable"}, status_code=404)
 
@@ -1227,10 +1231,11 @@ async def api_collections(n_clusters: int = 20):
         import embedding_worker
         import numpy as np
         import embed_cache
-        from sklearn.cluster import KMeans
+        from sklearn.cluster import KMeans, MiniBatchKMeans
     except ImportError:
         return JSONResponse({"error": "Dependencies not available"}, status_code=503)
 
+    n_clusters = max(2, min(int(n_clusters), 100))
     image_ids, matrix = await embed_cache.get_matrix()
     if image_ids is None or len(image_ids) < n_clusters:
         return {"collections": []}
@@ -1240,35 +1245,49 @@ async def api_collections(n_clusters: int = 20):
         return _collections_cache["data"]
 
     loop = asyncio.get_running_loop()
-    kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
+    if len(image_ids) > 5000:
+        kmeans = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            batch_size=4096,
+            n_init=3,
+            random_state=42,
+        )
+    else:
+        kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
     labels = await loop.run_in_executor(None, kmeans.fit_predict, matrix)
 
-    # Group images by cluster and pick a representative (closest to centroid)
-    images_data = await db.get_images_by_ids(image_ids)
-    collections = []
+    # Group images by cluster and pick a representative (closest to centroid).
+    # Only representative rows need DB metadata; fetching every embedded image
+    # used to dominate this endpoint after clustering was cached/warm.
+    collection_drafts = []
+    representative_ids = []
     for c in range(n_clusters):
-        cluster_indices = [i for i, l in enumerate(labels) if l == c]
-        if not cluster_indices:
+        cluster_indices = np.flatnonzero(labels == c)
+        if cluster_indices.size == 0:
             continue
 
-        # Find representative: closest to centroid
         centroid = kmeans.cluster_centers_[c]
         cluster_vecs = matrix[cluster_indices]
         dists = np.linalg.norm(cluster_vecs - centroid, axis=1)
-        rep_idx = cluster_indices[np.argmin(dists)]
+        rep_idx = int(cluster_indices[int(np.argmin(dists))])
         rep_id = image_ids[rep_idx]
-        rep_img = images_data.get(rep_id, {})
+        representative_ids.append(rep_id)
+        member_ids = [image_ids[int(i)] for i in cluster_indices[:50]]
+        collection_drafts.append((c, int(cluster_indices.size), rep_id, member_ids))
 
-        member_ids = [image_ids[i] for i in cluster_indices]
+    images_data = await db.get_images_by_ids(representative_ids)
+    collections = []
+    for c, count, rep_id, member_ids in collection_drafts:
+        rep_img = images_data.get(rep_id, {})
         collections.append({
             "id": c,
-            "count": len(cluster_indices),
+            "count": count,
             "representative": {
                 "id": rep_id,
                 "filename": rep_img.get("filename", ""),
                 "thumb_url": f"/api/thumb/sm/{rep_id}",
             },
-            "image_ids": member_ids[:50],  # first 50 for preview
+            "image_ids": member_ids,
         })
 
     # Sort by size descending

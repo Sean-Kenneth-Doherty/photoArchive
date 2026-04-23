@@ -1009,6 +1009,39 @@ async def _run_full_image_job(filepath: str, image_id: int):
     )
 
 
+def get_cached_full_image_path(filepath: str, image_id: int) -> str | None:
+    source_signature = _build_source_signature(filepath, FULL_TIER, image_id)
+    row = _get_disk_entry(FULL_TIER, image_id, source_signature)
+    return row["path"] if row is not None else None
+
+
+async def schedule_full_image_cache(filepath: str, image_id: int):
+    if not SSD_CACHE_DIR or _disk_allocations.get(FULL_TIER, 0) <= 0:
+        return
+    if not os.path.exists(filepath):
+        return
+
+    source_signature = _build_source_signature(filepath, FULL_TIER, image_id)
+    inflight_key = ("full", image_id, source_signature)
+    task = _inflight.get(inflight_key)
+    if task is not None:
+        return
+
+    task = asyncio.create_task(_run_full_image_job(filepath, image_id))
+    _inflight[inflight_key] = task
+
+    async def _release_when_done():
+        try:
+            await task
+        except Exception:
+            pass
+        finally:
+            if _inflight.get(inflight_key) is task:
+                _inflight.pop(inflight_key, None)
+
+    asyncio.create_task(_release_when_done())
+
+
 async def get_full_image_path(filepath: str, image_id: int) -> str:
     note_user_activity()
     source_signature = _build_source_signature(filepath, FULL_TIER, image_id)

@@ -96,7 +96,7 @@ const PhotoArchive = (() => {
 
     function warmImageUrls(urls) {
         for (const url of urls || []) {
-            preloadImage(url);
+            preloadImage(url, 'low');
         }
     }
 
@@ -2362,23 +2362,48 @@ const PhotoArchive = (() => {
 
     // ==================== UTILITIES ====================
 
-    const PRELOAD_LIMIT = 200;
+    const PRELOAD_LIMIT = 240;
+    const PRELOAD_CONCURRENCY = 8;
+    const preloadQueue = [];
+    let preloadActive = 0;
+
+    function pumpPreloadQueue() {
+        while (preloadActive < PRELOAD_CONCURRENCY && preloadQueue.length > 0) {
+            const item = preloadQueue.shift();
+            preloadActive++;
+            const img = new Image();
+            img.decoding = 'async';
+            if ('fetchPriority' in img) img.fetchPriority = item.priority;
+            const finish = () => {
+                preloadActive = Math.max(0, preloadActive - 1);
+                item.resolve();
+                pumpPreloadQueue();
+            };
+            img.onload = finish;
+            img.onerror = finish;
+            img.src = item.url;
+        }
+    }
 
     function preloadImage(url, priority = 'auto') {
-        if (preloaded.has(url)) return;
+        if (preloaded.has(url)) return preloaded.get(url);
         // Evict oldest entries when limit reached
         if (preloaded.size >= PRELOAD_LIMIT) {
             const first = preloaded.keys().next().value;
             preloaded.delete(first);
         }
+        const normalizedPriority = priority === 'high' || priority === 'low' ? priority : 'auto';
         const promise = new Promise((resolve) => {
-            const img = new Image();
-            img.onload = resolve;
-            img.onerror = resolve;
-            if ('fetchPriority' in img) img.fetchPriority = priority;
-            img.src = url;
+            const item = { url, priority: normalizedPriority, resolve };
+            if (normalizedPriority === 'high') {
+                preloadQueue.unshift(item);
+            } else {
+                preloadQueue.push(item);
+            }
+            pumpPreloadQueue();
         });
         preloaded.set(url, promise);
+        return promise;
     }
 
     // ==================== PUBLIC API ====================
