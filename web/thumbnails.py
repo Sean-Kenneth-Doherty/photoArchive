@@ -851,28 +851,31 @@ async def get_full_image_path(filepath: str, image_id: int) -> str:
 
 
 def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
-    source_signature = _build_source_signature(filepath, "md", image_id)
-    cached = _memory_get("md", image_id, source_signature)
-    if cached is None:
-        cached = _read_disk_thumbnail("md", image_id, source_signature)
+    """Load an image for embedding, ONLY from SSD-cached md thumbnails.
+    Returns None if md thumbnail is not cached yet — the embedding worker
+    should skip this image and retry later after pre-generation catches up."""
+    # Try fast path first (no HDD stat)
+    data = _memory_get_fast("md", image_id)
+    if data is None:
+        data = fast_disk_read("md", image_id)
 
-    if cached is not None:
-        with Image.open(io.BytesIO(cached)) as source:
-            source.load()
-            img = source.copy()
-        if img.mode != "RGB":
-            converted = img.convert("RGB")
-            img.close()
-            img = converted
-        return img
+    # Fallback to signature-validated read
+    if data is None:
+        source_signature = _build_source_signature(filepath, "md", image_id)
+        data = _memory_get("md", image_id, source_signature)
+        if data is None:
+            data = _read_disk_thumbnail("md", image_id, source_signature)
 
-    img = _load_source_image(filepath, SIZES["md"], prefer_draft=False)
-    if max(img.width, img.height) > 1024:
-        resized = _resize_to_long_side(img, 1024)
-        img.close()
-        img = resized
+    if data is None:
+        return None  # Not cached — skip, don't read from HDD
+
+    with Image.open(io.BytesIO(data)) as source:
+        source.load()
+        img = source.copy()
     if img.mode != "RGB":
         converted = img.convert("RGB")
+        img.close()
+        img = converted
         img.close()
         img = converted
     return img

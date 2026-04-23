@@ -187,6 +187,9 @@ def _embed_images(
         img = None
         try:
             img = _load_image_for_embedding(image_id, path)
+            if img is None:
+                errors[i] = "md thumbnail not cached yet"
+                continue
             # Resize to max 1024px on long side to keep VRAM reasonable
             max_side = max(img.size)
             if max_side > 1024:
