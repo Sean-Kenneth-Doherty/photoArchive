@@ -354,7 +354,7 @@ async def run_embedding_worker():
                 continue
 
             _set_worker_status("idle", "Waiting for new images…", ready=True)
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
         except Exception as e:
             _set_worker_status("error", str(e), ready=False, last_error=str(e))

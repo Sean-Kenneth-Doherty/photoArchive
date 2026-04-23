@@ -1219,9 +1219,9 @@ async def run_prefetch_worker():
                     "complete",
                     "Cache is warm for current budget. " + " · ".join(phase_parts),
                 )
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
             else:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0)  # yield then immediately process next batch
 
         except Exception as e:
             _set_pregen_state("error", "Pre-generation worker hit an error.", error=str(e))

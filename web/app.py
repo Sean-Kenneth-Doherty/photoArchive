@@ -54,7 +54,7 @@ async def startup():
 
     # Pre-warm embed cache in background so first search/similar is fast
     async def _warm_embed_cache():
-        await asyncio.sleep(3)  # let the server settle
+        await asyncio.sleep(0)  # yield once then warm immediately
         try:
             import embed_cache
             await embed_cache.get_matrix()
@@ -91,7 +91,6 @@ async def classify_orientations_background():
             results = await loop.run_in_executor(None, _classify_batch, rows)
             if results:
                 await db.batch_set_orientations(results)
-            await asyncio.sleep(0.1)
         except Exception as e:
             print(f"Orientation classifier error: {e}")
             await asyncio.sleep(5)
