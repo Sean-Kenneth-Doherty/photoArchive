@@ -193,6 +193,10 @@ def _build_source_signature(filepath: str, size: str, image_id: int) -> str:
     return hashlib.sha1(signature.encode("utf-8", "surrogateescape")).hexdigest()
 
 
+def _source_missing(filepath: str) -> bool:
+    return _get_source_bits(filepath).startswith("missing|")
+
+
 def get_etag(filepath: str, size: str, image_id: int) -> str:
     return f"\"{_build_source_signature(filepath, size, image_id)}\""
 
@@ -853,6 +857,9 @@ def _queue_orientation(image_id: int, img: Image.Image):
 
 
 def _planned_thumbnail_sizes(filepath: str, image_id: int, requested_size: str) -> list[str]:
+    if _source_missing(filepath):
+        return []
+
     needed = []
     for size in THUMB_TIERS:
         should_consider = size == requested_size or _disk_allocations.get(size, 0) > 0
@@ -978,6 +985,8 @@ async def _ensure_thumbnail_with_executor(
     cached = _read_disk_thumbnail(size, image_id, source_signature)
     if cached is not None:
         return cached
+    if _source_missing(filepath):
+        return b""
 
     inflight_key = ("thumb", image_id, source_signature)
     task = _inflight.get(inflight_key)
@@ -1206,6 +1215,8 @@ async def _run_pregen_phase(size: str) -> int:
             break
         if not _pregen_manual_mode and (time.monotonic() - _last_user_activity) < PREGENERATE_IDLE_SECONDS:
             break
+        if _source_missing(row["filepath"]):
+            continue
         current_signature = _build_source_signature(row["filepath"], size, row["id"])
         if row["source_signature"] == current_signature and has_cached(size, row["filepath"], row["id"]):
             continue
