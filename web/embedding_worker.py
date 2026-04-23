@@ -193,14 +193,6 @@ def _preload_images(
             if img is None:
                 errors[i] = "md thumbnail not cached yet"
                 continue
-            max_side = max(img.size)
-            if max_side > 1024:
-                scale = 1024 / max_side
-                img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
-            if img.mode != "RGB":
-                converted = img.convert("RGB")
-                img.close()
-                img = converted
             valid.append(img)
             valid_indices.append(i)
         except Exception as e:
