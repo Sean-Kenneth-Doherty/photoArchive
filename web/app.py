@@ -474,11 +474,13 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
 
     try:
         import numpy as np
-        from embedding_worker import blob_to_vec
+        import embed_cache
 
-        # Get embeddings for candidates
-        all_embeddings = await db.get_all_embeddings()
-        embed_map = {r["image_id"]: blob_to_vec(r["embedding"]) for r in all_embeddings}
+        # Use shared embedding cache
+        image_ids, matrix = await embed_cache.get_matrix()
+        if image_ids is None:
+            raise ImportError("No embeddings")
+        embed_map = {image_ids[i]: matrix[i] for i in range(len(image_ids))}
 
         # Filter to candidates with embeddings
         with_emb = [(c, embed_map[c["id"]]) for c in candidates if c["id"] in embed_map]
@@ -816,37 +818,31 @@ async def export_rankings(format: str = "json", ids: str = ""):
 
 @app.get("/api/search")
 async def api_search(q: str = "", limit: int = 50):
-    """Search images by text query using CLIP text-image similarity."""
+    """Search images by text query using embedding similarity."""
     if not q.strip():
         return {"images": [], "query": q}
 
     try:
         import embedding_worker
         import numpy as np
+        import embed_cache
     except ImportError:
-        return JSONResponse({"error": "CLIP not available"}, status_code=503)
+        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
 
     text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, q)
     if text_vec is None:
-        return JSONResponse({"error": "CLIP model still loading"}, status_code=503)
+        return JSONResponse({"error": "Model still loading"}, status_code=503)
 
-    all_embeddings = await db.get_all_embeddings()
-    if not all_embeddings:
+    image_ids, matrix = await embed_cache.get_matrix()
+    if image_ids is None:
         return {"images": [], "query": q}
 
-    # Compute cosine similarity against all image embeddings
-    image_ids = [row["image_id"] for row in all_embeddings]
-    matrix = np.array([embedding_worker.blob_to_vec(row["embedding"]) for row in all_embeddings])
-    similarities = matrix @ text_vec  # already L2-normalized, so dot product = cosine sim
-
-    # Get top results
+    similarities = matrix @ text_vec
     top_indices = np.argsort(similarities)[::-1][:limit]
     top_ids = [image_ids[i] for i in top_indices]
     top_scores = [float(similarities[i]) for i in top_indices]
 
-    # Fetch image details
     images = await db.get_images_by_ids(top_ids)
-
     result = []
     for img_id, score in zip(top_ids, top_scores):
         img = images.get(img_id)
@@ -869,35 +865,20 @@ async def api_search(q: str = "", limit: int = 50):
 async def api_similar(image_id: int, limit: int = 50):
     """Find visually similar images using embedding cosine similarity."""
     try:
-        import embedding_worker
         import numpy as np
+        import embed_cache
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
 
-    # Get the source image's embedding
-    conn = await db.get_db()
-    try:
-        cursor = await conn.execute("SELECT embedding FROM embeddings WHERE image_id = ?", (image_id,))
-        row = await cursor.fetchone()
-    finally:
-        await conn.close()
-
-    if not row:
-        return JSONResponse({"error": "Image not embedded yet"}, status_code=404)
-
-    source_vec = embedding_worker.blob_to_vec(row["embedding"])
-
-    all_embeddings = await db.get_all_embeddings()
-    if not all_embeddings:
+    image_ids, matrix = await embed_cache.get_matrix()
+    if image_ids is None:
         return {"images": [], "source_id": image_id}
 
-    # Compute cosine similarity against all other images
-    image_ids = [r["image_id"] for r in all_embeddings]
-    import numpy as np
-    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
-    similarities = matrix @ source_vec
+    source_vec = embed_cache.get_vector(image_id)
+    if source_vec is None:
+        return JSONResponse({"error": "Image not embedded yet"}, status_code=404)
 
-    # Exclude the source image and get top results
+    similarities = matrix @ source_vec
     top_indices = np.argsort(similarities)[::-1]
     results = []
     images_data = await db.get_images_by_ids(image_ids)
@@ -927,19 +908,15 @@ async def api_similar(image_id: int, limit: int = 50):
 async def api_duplicates(threshold: float = 0.95, limit: int = 100):
     """Find near-duplicate image pairs using embedding similarity."""
     try:
-        import embedding_worker
         import numpy as np
+        import embed_cache
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
 
-    all_embeddings = await db.get_all_embeddings()
-    if len(all_embeddings) < 2:
+    image_ids, matrix = await embed_cache.get_matrix()
+    if image_ids is None or len(image_ids) < 2:
         return {"pairs": []}
 
-    image_ids = [r["image_id"] for r in all_embeddings]
-    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
-
-    # Compute pairwise similarities (upper triangle only)
     sim_matrix = matrix @ matrix.T
     pairs = []
     for i in range(len(image_ids)):
@@ -1090,16 +1067,14 @@ async def api_collections(n_clusters: int = 20):
     try:
         import embedding_worker
         import numpy as np
+        import embed_cache
         from sklearn.cluster import KMeans
     except ImportError:
         return JSONResponse({"error": "Dependencies not available"}, status_code=503)
 
-    all_embeddings = await db.get_all_embeddings()
-    if len(all_embeddings) < n_clusters:
+    image_ids, matrix = await embed_cache.get_matrix()
+    if image_ids is None or len(image_ids) < n_clusters:
         return {"collections": []}
-
-    image_ids = [r["image_id"] for r in all_embeddings]
-    matrix = np.array([embedding_worker.blob_to_vec(r["embedding"]) for r in all_embeddings])
 
     kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
     labels = kmeans.fit_predict(matrix)

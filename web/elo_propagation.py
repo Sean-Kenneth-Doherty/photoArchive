@@ -14,6 +14,7 @@ import logging
 import numpy as np
 
 import db
+import embed_cache
 
 log = logging.getLogger("elo_propagation")
 
@@ -23,37 +24,6 @@ MAX_NEIGHBORS = 10            # max images to adjust per winner/loser
 PROPAGATION_DECAY = 0.3       # scale factor (0.3 = propagated change is 30% of direct)
 MAX_DIRECT_COMPARISONS = 8    # don't propagate to images with this many+ direct comparisons
 
-# Cached embedding matrix (rebuilt periodically)
-_embed_cache = {
-    "image_ids": None,
-    "matrix": None,
-    "count": 0,
-}
-
-
-async def _ensure_embed_cache():
-    """Load or refresh the embedding matrix cache."""
-    current_count = await db.get_embedding_count()
-    if _embed_cache["matrix"] is not None and _embed_cache["count"] == current_count:
-        return _embed_cache["image_ids"], _embed_cache["matrix"]
-
-    all_embeddings = await db.get_all_embeddings()
-    if len(all_embeddings) < 10:
-        return None, None
-
-    try:
-        from embedding_worker import blob_to_vec
-    except ImportError:
-        return None, None
-
-    image_ids = [r["image_id"] for r in all_embeddings]
-    matrix = np.array([blob_to_vec(r["embedding"]) for r in all_embeddings])
-
-    _embed_cache["image_ids"] = image_ids
-    _embed_cache["matrix"] = matrix
-    _embed_cache["count"] = current_count
-
-    return image_ids, matrix
 
 
 def _find_similar(image_id, image_ids, matrix, threshold, max_n):
@@ -85,7 +55,7 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
     Called as a fire-and-forget background task.
     """
     try:
-        image_ids, matrix = await _ensure_embed_cache()
+        image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
             return  # no embeddings available yet
 
@@ -149,7 +119,7 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
     since they only lost to the best image, not to each other.
     """
     try:
-        image_ids, matrix = await _ensure_embed_cache()
+        image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
             return
 
