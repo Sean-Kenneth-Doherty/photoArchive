@@ -531,16 +531,19 @@ async def cull_undo():
 
 # --- Mosaic Ranking API ---
 
-# Cache for get_kept_images_for_pairing — invalidated by comparisons
-_pairing_cache = {"data": None, "valid": False}
+# Cache for get_kept_images_for_pairing — patched on direct comparisons and
+# refreshed after background Elo propagation touches wider neighborhoods.
+_pairing_cache = {"data": None, "by_id": None, "valid": False}
 _matchups_cache = {"data": None, "valid": False}
 
 async def _get_pairing_images():
     """Cached wrapper — invalidated by mosaic_pick and submit_comparison."""
     if _pairing_cache["valid"] and _pairing_cache["data"] is not None:
         return _pairing_cache["data"]
-    images = await db.get_kept_images_for_pairing()
+    rows = await db.get_kept_images_for_pairing()
+    images = [dict(row) for row in rows]
     _pairing_cache["data"] = images
+    _pairing_cache["by_id"] = {img["id"]: img for img in images}
     _pairing_cache["valid"] = True
     return images
 
@@ -564,6 +567,30 @@ def _add_past_matchups(pairs: list[tuple[int, int]]):
         return
     for a, b in pairs:
         _matchups_cache["data"].add((min(a, b), max(a, b)))
+
+
+def _patch_pairing_cache(updates: list[tuple[int, float, int]]):
+    if not _pairing_cache["valid"] or _pairing_cache["by_id"] is None:
+        return
+    by_id = _pairing_cache["by_id"]
+    for image_id, new_elo, comparison_delta in updates:
+        img = by_id.get(image_id)
+        if img is None:
+            continue
+        img["elo"] = new_elo
+        img["comparisons"] = max(0, int(img.get("comparisons") or 0) + comparison_delta)
+
+
+def _schedule_pairing_propagation(coro):
+    async def _runner():
+        try:
+            await coro
+        except Exception as exc:
+            print(f"Elo propagation error: {exc}")
+        finally:
+            _invalidate_pairing_cache()
+
+    asyncio.create_task(_runner())
 
 
 def _invalidate_active_caches():
@@ -682,7 +709,7 @@ async def mosaic_next(
         return {"images": [], "total_kept": len(images)}
 
     import random
-    candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
+    candidates = [img.copy() for img in images if img["id"] not in exclude_ids]
 
     # Apply filters
     if orientation in ("landscape", "portrait"):
@@ -811,13 +838,18 @@ async def mosaic_pick(request: Request):
     finally:
         await conn.close()
 
-    # Invalidate pairing cache since Elo changed
-    _invalidate_pairing_cache()
+    if comparison_rows:
+        _patch_pairing_cache(
+            [(picked_id, picked_elo, len(comparison_rows))]
+            + [(image_id, new_elo, 1) for new_elo, image_id in loser_updates]
+        )
     _add_past_matchups([(picked_id, row[1]) for row in comparison_rows])
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
     valid_loser_ids = [row[1] for row in comparison_rows]
-    asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0))
+    _schedule_pairing_propagation(
+        elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0)
+    )
 
     return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(comparison_rows)}
 
@@ -834,7 +866,7 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
     if len(images) < 2:
         return {"pairs": [], "total_kept": len(images)}
 
-    image_dicts = [dict(img) for img in images]
+    image_dicts = [img.copy() for img in images]
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
@@ -882,10 +914,10 @@ async def submit_comparison(request: Request):
         new_winner_elo, new_loser_elo,
     )
 
-    # Fire-and-forget: propagate Elo to similar images via embeddings
-    _invalidate_pairing_cache()
+    _patch_pairing_cache([(winner_id, new_winner_elo, 1), (loser_id, new_loser_elo, 1)])
     _add_past_matchups([(winner_id, loser_id)])
-    asyncio.create_task(elo_propagation.propagate_comparison(winner_id, loser_id, k))
+    # Fire-and-forget: propagate Elo to similar images via embeddings.
+    _schedule_pairing_propagation(elo_propagation.propagate_comparison(winner_id, loser_id, k))
 
     return {
         "ok": True,
