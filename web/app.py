@@ -476,18 +476,19 @@ async def cull_undo():
 # --- Mosaic Ranking API ---
 
 # Cache for get_kept_images_for_pairing — invalidated by comparisons
-_pairing_cache = {"data": None, "comparison_count": -1}
+_pairing_cache = {"data": None, "valid": False}
 
 async def _get_pairing_images():
-    """Cached wrapper around db.get_kept_images_for_pairing()."""
-    stats = await db.get_stats()
-    cc = stats["total_comparisons"]
-    if _pairing_cache["data"] is not None and _pairing_cache["comparison_count"] == cc:
+    """Cached wrapper — invalidated by mosaic_pick and submit_comparison."""
+    if _pairing_cache["valid"] and _pairing_cache["data"] is not None:
         return _pairing_cache["data"]
     images = await db.get_kept_images_for_pairing()
     _pairing_cache["data"] = images
-    _pairing_cache["comparison_count"] = cc
+    _pairing_cache["valid"] = True
     return images
+
+def _invalidate_pairing_cache():
+    _pairing_cache["valid"] = False
 
 async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
     """Select images that maximize visual diversity using embedding distance."""
@@ -499,47 +500,48 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
         import numpy as np
         import embed_cache
 
-        # Use shared embedding cache
         image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
             raise ImportError("No embeddings")
-        embed_map = {image_ids[i]: matrix[i] for i in range(len(image_ids))}
 
-        # Filter to candidates with embeddings
-        with_emb = [(c, embed_map[c["id"]]) for c in candidates if c["id"] in embed_map]
-        without_emb = [c for c in candidates if c["id"] not in embed_map]
+        # Use id_to_idx for O(1) lookups instead of building a full dict copy
+        id_to_idx = embed_cache._cache.get("id_to_idx") or {}
 
-        if len(with_emb) < count:
-            # Not enough embeddings — fall back to random + explore
-            sample = [c for c, _ in with_emb]
+        # Filter candidates to those with embeddings, get their matrix indices
+        cand_indices = []  # index into matrix
+        cand_items = []    # corresponding candidate dicts
+        without_emb = []
+        for c in candidates:
+            idx = id_to_idx.get(c["id"])
+            if idx is not None:
+                cand_indices.append(idx)
+                cand_items.append(c)
+            else:
+                without_emb.append(c)
+
+        if len(cand_items) < count:
+            sample = list(cand_items)
             remaining = count - len(sample)
             if without_emb and remaining > 0:
                 sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
             return sample
 
-        # Greedy diverse selection: pick first randomly (favor least-compared),
-        # then iteratively pick the image most dissimilar from all selected
-        explore_weights = [1.0 / (c["comparisons"] + 1) for c, _ in with_emb]
-        first = random.choices(range(len(with_emb)), weights=explore_weights, k=1)[0]
+        # Extract only the vectors we need (small subset of full matrix)
+        vecs = matrix[cand_indices]
 
-        selected_indices = [first]
-        vecs = np.array([v for _, v in with_emb])
+        # Greedy diverse selection
+        explore_weights = [1.0 / (c["comparisons"] + 1) for c in cand_items]
+        first = random.choices(range(len(cand_items)), weights=explore_weights, k=1)[0]
+        selected = [first]
 
         for _ in range(count - 1):
-            # Compute min similarity to any already-selected image for each candidate
-            selected_vecs = vecs[selected_indices]
-            sims = vecs @ selected_vecs.T  # (N, len(selected))
-            max_sim_to_selected = sims.max(axis=1)  # most similar selected image per candidate
+            selected_vecs = vecs[selected]
+            max_sim = (vecs @ selected_vecs.T).max(axis=1)
+            for si in selected:
+                max_sim[si] = 999
+            selected.append(int(np.argmin(max_sim)))
 
-            # Mask already-selected
-            for si in selected_indices:
-                max_sim_to_selected[si] = 999
-
-            # Pick the one with lowest max similarity (most different from all selected)
-            next_idx = int(np.argmin(max_sim_to_selected))
-            selected_indices.append(next_idx)
-
-        return [with_emb[i][0] for i in selected_indices]
+        return [cand_items[i] for i in selected]
 
     except Exception:
         # Fallback to random if embeddings unavailable
@@ -687,7 +689,7 @@ async def mosaic_pick(request: Request):
         await conn.close()
 
     # Invalidate pairing cache since Elo changed
-    _pairing_cache["comparison_count"] = -1
+    _invalidate_pairing_cache()
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
     asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, other_ids, k=12.0))
@@ -756,7 +758,7 @@ async def submit_comparison(request: Request):
     )
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
-    _pairing_cache["comparison_count"] = -1
+    _invalidate_pairing_cache()
     asyncio.create_task(elo_propagation.propagate_comparison(winner_id, loser_id, k))
 
     return {
@@ -971,9 +973,13 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
     return {"pairs": result}
 
 
+_exif_cache: dict[int, dict] = {}
+
 @app.get("/api/image/{image_id}/exif")
 async def api_exif(image_id: int):
-    """Extract EXIF metadata from an image."""
+    """Extract EXIF metadata from an image (cached per image)."""
+    if image_id in _exif_cache:
+        return _exif_cache[image_id]
     image = await db.get_image_by_id(image_id)
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
@@ -1085,7 +1091,9 @@ async def api_exif(image_id: int):
     except Exception:
         pass
 
-    return {"exif": exif}
+    result = {"exif": exif}
+    _exif_cache[image_id] = result
+    return result
 
 
 @app.get("/api/collections")
@@ -1139,14 +1147,13 @@ async def api_collections(n_clusters: int = 20):
     return {"collections": collections}
 
 
-_folders_cache = {"data": None, "count": 0}
+_folders_cache = {"data": None, "expires": 0}
 
 @app.get("/api/folders")
 async def api_folders():
-    """Get folder tree with image counts (cached)."""
-    stats = await db.get_stats()
-    total = stats["kept"] + stats["maybe"]
-    if _folders_cache["data"] and _folders_cache["count"] == total:
+    """Get folder tree with image counts (cached 60s)."""
+    import time as _time
+    if _folders_cache["data"] and _time.time() < _folders_cache["expires"]:
         return _folders_cache["data"]
 
     conn = await db.get_db()
@@ -1179,7 +1186,7 @@ async def api_folders():
                for k, v in sorted(folder_counts.items())]
     result = {"folders": folders, "root": root}
     _folders_cache["data"] = result
-    _folders_cache["count"] = total
+    _folders_cache["expires"] = _time.time() + 60
     return result
 
 

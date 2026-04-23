@@ -233,16 +233,26 @@ def _encode_images(
     return results, errors
 
 
+_text_cache: dict[str, np.ndarray] = {}
+_TEXT_CACHE_MAX = 100
+
 def encode_text(query: str) -> np.ndarray | None:
-    """Encode a text query into an embedding. Returns None if model not loaded."""
+    """Encode a text query into an embedding. Cached for repeat queries."""
     if _model is None:
         return None
+    cached = _text_cache.get(query)
+    if cached is not None:
+        return cached
     embedding = _model.encode(
         [query],
         prompt="Retrieve images relevant to the query.",
         normalize_embeddings=True,
     )
-    return embedding[0].astype(np.float32)
+    vec = embedding[0].astype(np.float32)
+    if len(_text_cache) >= _TEXT_CACHE_MAX:
+        _text_cache.pop(next(iter(_text_cache)))  # evict oldest
+    _text_cache[query] = vec
+    return vec
 
 
 def vec_to_blob(vec: np.ndarray) -> bytes:

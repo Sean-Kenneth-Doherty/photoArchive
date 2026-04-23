@@ -37,6 +37,8 @@ CREATE INDEX IF NOT EXISTS idx_images_status_elo_asc ON images(status, elo ASC);
 CREATE INDEX IF NOT EXISTS idx_images_status_id ON images(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_images_status_comparisons ON images(status, comparisons DESC);
 CREATE INDEX IF NOT EXISTS idx_images_status_filename ON images(status, filename ASC);
+CREATE INDEX IF NOT EXISTS idx_images_status_orient_elo ON images(status, orientation, elo DESC);
+CREATE INDEX IF NOT EXISTS idx_images_status_comps_elo ON images(status, comparisons, elo DESC);
 
 CREATE TABLE IF NOT EXISTS embeddings (
     image_id INTEGER PRIMARY KEY REFERENCES images(id),
@@ -351,35 +353,35 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
         await db.close()
 
 
+import time as _time
+_stats_cache = {"data": None, "expires": 0}
+
 async def get_stats():
+    if _stats_cache["data"] and _time.time() < _stats_cache["expires"]:
+        return _stats_cache["data"]
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT COUNT(*) as total FROM images")
-        total = (await cursor.fetchone())["total"]
-
-        cursor = await db.execute("SELECT COUNT(*) as c FROM images WHERE status = 'unculled'")
-        unculled = (await cursor.fetchone())["c"]
-
-        cursor = await db.execute("SELECT COUNT(*) as c FROM images WHERE status = 'kept'")
-        kept = (await cursor.fetchone())["c"]
-
-        cursor = await db.execute("SELECT COUNT(*) as c FROM images WHERE status = 'maybe'")
-        maybe = (await cursor.fetchone())["c"]
-
-        cursor = await db.execute("SELECT COUNT(*) as c FROM images WHERE status = 'rejected'")
-        rejected = (await cursor.fetchone())["c"]
+        # Single query for all status counts
+        cursor = await db.execute(
+            "SELECT status, COUNT(*) as c FROM images GROUP BY status"
+        )
+        counts = {row["status"]: row["c"] for row in await cursor.fetchall()}
 
         cursor = await db.execute("SELECT COUNT(*) as c FROM comparisons")
         total_comparisons = (await cursor.fetchone())["c"]
 
-        return {
+        total = sum(counts.values())
+        result = {
             "total_images": total,
-            "unculled": unculled,
-            "kept": kept,
-            "maybe": maybe,
-            "rejected": rejected,
+            "unculled": counts.get("unculled", 0),
+            "kept": counts.get("kept", 0),
+            "maybe": counts.get("maybe", 0),
+            "rejected": counts.get("rejected", 0),
             "total_comparisons": total_comparisons,
         }
+        _stats_cache["data"] = result
+        _stats_cache["expires"] = _time.time() + 2  # cache for 2 seconds
+        return result
     finally:
         await db.close()
 
