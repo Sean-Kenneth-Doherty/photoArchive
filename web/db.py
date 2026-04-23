@@ -1,5 +1,6 @@
 import aiosqlite
 import os
+import time as _time
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoarchive.db")
 EXPECTED_EMBEDDING_DIM = 2048  # Qwen3-VL-Embedding-2B native dimension
@@ -40,6 +41,25 @@ CREATE INDEX IF NOT EXISTS idx_images_status_filename ON images(status, filename
 CREATE INDEX IF NOT EXISTS idx_images_status_orient_elo ON images(status, orientation, elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_status_comps_elo ON images(status, comparisons, elo DESC);
 
+-- Hot-path partial indexes for the active Library/Compare working set.
+-- These avoid temp B-tree sorts caused by status IN ('kept', 'maybe').
+CREATE INDEX IF NOT EXISTS idx_images_active_elo
+ON images(elo DESC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_elo_asc
+ON images(elo ASC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_comparisons
+ON images(comparisons DESC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_comparisons_asc
+ON images(comparisons ASC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_filename
+ON images(filename ASC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_id
+ON images(id DESC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_filepath
+ON images(filepath ASC) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_orientation_elo
+ON images(orientation, elo DESC) WHERE status IN ('kept', 'maybe');
+
 CREATE TABLE IF NOT EXISTS embeddings (
     image_id INTEGER PRIMARY KEY REFERENCES images(id),
     embedding BLOB NOT NULL,
@@ -60,20 +80,39 @@ CREATE TABLE IF NOT EXISTS cache_entries (
 
 CREATE INDEX IF NOT EXISTS idx_cache_entries_root_size_access
 ON cache_entries(cache_root, size, last_accessed);
+
+-- For pregen candidate batch query (ORDER BY filepath ASC with status filter)
+CREATE INDEX IF NOT EXISTS idx_images_status_filepath ON images(status, filepath ASC);
+
+-- For LRU eviction ordering (avoids TEMP B-TREE sort during budget enforcement)
+CREATE INDEX IF NOT EXISTS idx_cache_entries_root_size_accessed_id
+ON cache_entries(cache_root, size, last_accessed, image_id);
 """
+
+_stats_cache = {"data": None, "expires": 0}
+
+
+def _invalidate_stats_cache():
+    _stats_cache["data"] = None
+    _stats_cache["expires"] = 0
+
+
+def invalidate_stats_cache():
+    _invalidate_stats_cache()
 
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH)
+    db = await aiosqlite.connect(DB_PATH, timeout=30)
     db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA synchronous=NORMAL")
     return db
 
 
 async def init_db():
+    db_exists = os.path.exists(DB_PATH)
     db = await get_db()
     try:
+        if not db_exists:
+            await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(SCHEMA)
         # Migrations: add columns if missing
         for col, defn in [
@@ -162,6 +201,7 @@ async def insert_images_batch(rows: list[tuple[str, str]]):
             rows,
         )
         await db.commit()
+        _invalidate_stats_cache()
     finally:
         await db.close()
 
@@ -185,6 +225,7 @@ async def set_image_status(image_id: int, status: str):
             "UPDATE images SET status = ? WHERE id = ?", (status, image_id)
         )
         await db.commit()
+        _invalidate_stats_cache()
     finally:
         await db.close()
 
@@ -196,6 +237,7 @@ async def set_image_status_and_elo(image_id: int, status: str, new_elo: float):
             "UPDATE images SET status = ?, elo = ? WHERE id = ?", (status, new_elo, image_id)
         )
         await db.commit()
+        _invalidate_stats_cache()
     finally:
         await db.close()
 
@@ -204,12 +246,12 @@ async def batch_cull(decisions: list[tuple[int, str, float]]):
     """Apply multiple cull decisions at once. Each tuple: (image_id, status, new_elo)."""
     db = await get_db()
     try:
-        for image_id, status, new_elo in decisions:
-            await db.execute(
-                "UPDATE images SET status = ?, elo = ? WHERE id = ?",
-                (status, new_elo, image_id),
-            )
+        await db.executemany(
+            "UPDATE images SET status = ?, elo = ? WHERE id = ?",
+            [(status, new_elo, image_id) for image_id, status, new_elo in decisions],
+        )
         await db.commit()
+        _invalidate_stats_cache()
     finally:
         await db.close()
 
@@ -225,6 +267,7 @@ async def undo_last_cull():
         if row:
             await db.execute("UPDATE images SET status = 'unculled' WHERE id = ?", (row["id"],))
             await db.commit()
+            _invalidate_stats_cache()
             return {"id": row["id"], "previous_status": row["status"]}
         return None
     finally:
@@ -237,6 +280,7 @@ async def get_kept_images_for_pairing():
     try:
         cursor = await db.execute(
             "SELECT id, filename, filepath, elo, comparisons, orientation, aspect_ratio FROM images "
+            "INDEXED BY idx_images_active_elo "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
         )
         return await cursor.fetchall()
@@ -271,6 +315,7 @@ async def record_comparison(winner_id: int, loser_id: int, mode: str, elo_before
             (new_loser_elo, loser_id),
         )
         await db.commit()
+        _invalidate_stats_cache()
     finally:
         await db.close()
 
@@ -294,6 +339,7 @@ async def undo_last_comparison():
             )
             await db.execute("DELETE FROM comparisons WHERE id = ?", (row["id"],))
             await db.commit()
+            _invalidate_stats_cache()
             return {"winner_id": row["winner_id"], "loser_id": row["loser_id"]}
         return None
     finally:
@@ -309,6 +355,16 @@ RANKING_SORTS = {
     "filename_desc": "filename DESC",
     "newest": "id DESC",
     "oldest": "id ASC",
+}
+RANKING_INDEXES = {
+    "elo": "idx_images_active_elo",
+    "elo_asc": "idx_images_active_elo_asc",
+    "comparisons": "idx_images_active_comparisons",
+    "least_compared": "idx_images_active_comparisons_asc",
+    "filename": "idx_images_active_filename",
+    "filename_desc": "idx_images_active_filename",
+    "newest": "idx_images_active_id",
+    "oldest": "idx_images_active_id",
 }
 
 STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
@@ -343,8 +399,12 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 
         where = " AND ".join(conditions)
         params.extend([limit, offset])
+        index_name = RANKING_INDEXES.get(sort, "idx_images_active_elo")
+        if orientation in ("landscape", "portrait") and sort == "elo":
+            index_name = "idx_images_active_orientation_elo"
         cursor = await db.execute(
-            f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio FROM images "
+            f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+            f"FROM images INDEXED BY {index_name} "
             f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params,
         )
@@ -352,9 +412,6 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
     finally:
         await db.close()
 
-
-import time as _time
-_stats_cache = {"data": None, "expires": 0}
 
 async def get_stats():
     if _stats_cache["data"] and _time.time() < _stats_cache["expires"]:
@@ -417,6 +474,7 @@ async def get_top_images(limit: int = 50):
     try:
         cursor = await db.execute(
             "SELECT id, filename, filepath, elo, comparisons FROM images "
+            "INDEXED BY idx_images_active_elo "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC LIMIT ?",
             (limit,),
         )
@@ -441,18 +499,38 @@ async def get_scan_folder():
 
 # --- Embedding / Active Learning ---
 
-async def get_unembedded_images(limit: int = 64):
+async def get_unembedded_images(limit: int = 64, md_cache_root: str = ""):
     """Get kept/maybe images that don't have CLIP embeddings yet."""
     db = await get_db()
     try:
-        cursor = await db.execute(
-            "SELECT i.id, i.filepath FROM images i "
-            "LEFT JOIN embeddings e ON i.id = e.image_id "
-            "WHERE e.image_id IS NULL AND i.status IN ('kept', 'maybe') "
-            "ORDER BY RANDOM() "
-            "LIMIT ?",
-            (limit,),
-        )
+        if md_cache_root:
+            cursor = await db.execute(
+                "SELECT i.id, i.filepath FROM images i "
+                "INDEXED BY idx_images_active_id "
+                "WHERE i.status IN ('kept', 'maybe') "
+                "AND EXISTS ("
+                "  SELECT 1 FROM cache_entries c "
+                "  WHERE c.cache_root = ? AND c.size = 'md' AND c.image_id = i.id"
+                ") "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM embeddings e WHERE e.image_id = i.id"
+                ") "
+                "ORDER BY i.id ASC "
+                "LIMIT ?",
+                (md_cache_root, limit),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT i.id, i.filepath FROM images i "
+                "INDEXED BY idx_images_active_id "
+                "WHERE i.status IN ('kept', 'maybe') "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM embeddings e WHERE e.image_id = i.id"
+                ") "
+                "ORDER BY i.id ASC "
+                "LIMIT ?",
+                (limit,),
+            )
         return await cursor.fetchall()
     finally:
         await db.close()
@@ -488,7 +566,11 @@ async def get_all_embeddings():
 async def get_embedding_count() -> int:
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT COUNT(*) as c FROM embeddings")
+        cursor = await db.execute(
+            "SELECT COUNT(*) as c FROM embeddings e "
+            "JOIN images i ON e.image_id = i.id "
+            "WHERE i.status IN ('kept', 'maybe')"
+        )
         return (await cursor.fetchone())["c"]
     finally:
         await db.close()

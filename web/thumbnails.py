@@ -32,12 +32,12 @@ SSD_CACHE_BYTES = 10 * 1024 * 1024 * 1024
 MEMORY_CACHE_BYTES = 512 * 1024 * 1024
 PREGENERATE_ON_IDLE = True
 PREGENERATE_IDLE_SECONDS = 5.0
-PREGENERATE_SCAN_BATCH = 256
-PREGENERATE_GENERATE_BATCH = 48
+PREGENERATE_SCAN_BATCH = 1024
+PREGENERATE_GENERATE_BATCH = 256
 BROWSER_CACHE_MAX_AGE = 86400
 BROWSER_CACHE_STALE_WHILE_REVALIDATE = 604800
 _executor_workers = 4
-_prefetch_workers_count = 2
+_prefetch_workers_count = 6
 
 _disk_allocations = {tier: 0 for tier in ALL_TIERS}
 _executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix="thumb")
@@ -54,6 +54,10 @@ _meta_lock = threading.Lock()
 
 # Shared in-flight work so a burst of requests only performs one source read.
 _inflight: dict[tuple[str, int, str], asyncio.Task[object]] = {}
+
+# Write-behind queue for cache DB entries — reduces _meta_lock contention.
+_write_queue: list[tuple[str, int, str, str, int]] = []  # (size, image_id, sig, path, bytes)
+_write_queue_lock = threading.Lock()
 
 # Orientation detections pending DB write: image_id -> (orientation, aspect_ratio)
 _orientation_queue: dict[int, tuple[str, float]] = {}
@@ -91,13 +95,20 @@ RAW_EXTENSIONS = {
 }
 
 
+_persistent_conn: sqlite3.Connection | None = None
+
+
 def _db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(db.DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+    """Return persistent connection (under _meta_lock, so safe to share)."""
+    global _persistent_conn
+    if _persistent_conn is None:
+        conn = sqlite3.connect(db.DB_PATH, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        _persistent_conn = conn
+    return _persistent_conn
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -130,34 +141,42 @@ def _ensure_disk_cache_dirs():
 
 def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
     allocations = {tier: 0 for tier in ALL_TIERS}
-    remaining = max(0, int(total_bytes))
+    total = max(0, int(total_bytes))
+    # Target proportions — scaled to actual budget if budget is smaller
     targets = {
-        "sm": 300 * 1024 * 1024,
-        "md": 4 * 1024 * 1024 * 1024,
-        "lg": 12 * 1024 * 1024 * 1024,
+        "sm": 1 * 1024 * 1024 * 1024,
+        "md": 15 * 1024 * 1024 * 1024,
+        "lg": 55 * 1024 * 1024 * 1024,
     }
+    target_sum = sum(targets.values())
+    # Reserve at least 10% for full tier, rest split proportionally among thumb tiers
+    thumb_budget = min(total, int(total * 0.9)) if total < target_sum else target_sum
+    scale = thumb_budget / target_sum if target_sum > 0 else 0
     for tier in THUMB_TIERS:
-        if remaining <= 0:
-            break
-        allocations[tier] = min(targets[tier], remaining)
-        remaining -= allocations[tier]
-    allocations[FULL_TIER] = max(0, remaining)
+        allocations[tier] = int(targets[tier] * scale)
+    allocations[FULL_TIER] = max(0, total - sum(allocations[t] for t in THUMB_TIERS))
     return allocations
 
 
-_source_stat_cache: dict[str, str] = {}
+_SOURCE_STAT_CACHE_MAX = 25000
+_SOURCE_STAT_CACHE_TTL_SECONDS = 60.0
+_source_stat_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
 
 def _get_source_bits(filepath: str) -> str:
     """Cache os.stat results per filepath to avoid repeated HDD stat calls."""
+    now = time.monotonic()
     cached = _source_stat_cache.get(filepath)
-    if cached is not None:
-        return cached
+    if cached is not None and now - cached[0] <= _SOURCE_STAT_CACHE_TTL_SECONDS:
+        _source_stat_cache.move_to_end(filepath)
+        return cached[1]
     try:
         stat = os.stat(filepath)
         bits = f"{stat.st_size}|{stat.st_mtime_ns}|{filepath}"
     except OSError:
         bits = f"missing|{filepath}"
-    _source_stat_cache[filepath] = bits
+    _source_stat_cache[filepath] = (now, bits)
+    if len(_source_stat_cache) > _SOURCE_STAT_CACHE_MAX:
+        _source_stat_cache.popitem(last=False)
     return bits
 
 def _build_source_signature(filepath: str, size: str, image_id: int) -> str:
@@ -211,14 +230,20 @@ def _replace_executor(
 
 def _memory_get_fast(size: str, image_id: int) -> bytes | None:
     """Fast memory check — no signature validation."""
+    entry = _memory_get_entry_fast(size, image_id)
+    return entry[1] if entry is not None else None
+
+
+def _memory_get_entry_fast(size: str, image_id: int) -> tuple[str, bytes] | None:
+    """Fast memory check that also returns the cached signature."""
     key = (size, image_id)
     with _cache_lock:
         entry = _memory_cache.get(key)
         if entry is None:
             return None
-        _, data = entry
+        signature, data = entry
         _memory_cache.move_to_end(key)
-        return data
+        return signature, data
 
 
 def _memory_get(size: str, image_id: int, source_signature: str) -> bytes | None:
@@ -311,21 +336,41 @@ def _remove_cache_entry_locked(conn: sqlite3.Connection, row: sqlite3.Row):
         "DELETE FROM cache_entries WHERE cache_root = ? AND size = ? AND image_id = ?",
         (row["cache_root"], row["size"], row["image_id"]),
     )
+    _unindex_disk_entry(row["size"], row["image_id"])
+
+
+_tier_byte_totals: dict[str, int] = {}  # running totals, populated lazily
+
+
+def _tier_bytes(conn: sqlite3.Connection, size: str) -> int:
+    """Get running total for a tier, initializing from DB if needed."""
+    total = _tier_byte_totals.get(size)
+    if total is None:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS t FROM cache_entries "
+            "WHERE cache_root = ? AND size = ?",
+            (SSD_CACHE_DIR, size),
+        ).fetchone()
+        total = int(row["t"])
+        _tier_byte_totals[size] = total
+    return total
 
 
 def _enforce_tier_budget_locked(conn: sqlite3.Connection, size: str):
     budget = _disk_allocations.get(size, 0)
-    rows = conn.execute(
-        "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
-        "WHERE cache_root = ? AND size = ?",
-        (SSD_CACHE_DIR, size),
-    ).fetchall()
-    total = sum(int(row["size_bytes"]) for row in rows)
+    total = _tier_bytes(conn, size)
 
     if budget <= 0:
+        rows = conn.execute(
+            "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
+            "WHERE cache_root = ? AND size = ?",
+            (SSD_CACHE_DIR, size),
+        ).fetchall()
         for row in rows:
             _remove_cache_entry_locked(conn, row)
+            total -= int(row["size_bytes"])
         conn.commit()
+        _tier_byte_totals[size] = max(0, total)
         return
 
     if total <= budget:
@@ -343,33 +388,32 @@ def _enforce_tier_budget_locked(conn: sqlite3.Connection, size: str):
         if total <= budget:
             break
     conn.commit()
+    _tier_byte_totals[size] = max(0, total)
 
 
 def _enforce_all_disk_budgets():
+    _tier_byte_totals.clear()  # force re-read from DB
     with _meta_lock:
         conn = _db_connect()
-        try:
-            for size in ALL_TIERS:
-                _enforce_tier_budget_locked(conn, size)
-        finally:
-            conn.close()
+        for size in ALL_TIERS:
+            _enforce_tier_budget_locked(conn, size)
 
 
 def _clear_disk_tiers(tiers: tuple[str, ...]):
+    _clear_disk_index(tiers)
     with _meta_lock:
         conn = _db_connect()
-        try:
-            placeholders = ",".join("?" for _ in tiers)
-            rows = conn.execute(
-                f"SELECT cache_root, size, image_id, path FROM cache_entries "
-                f"WHERE cache_root = ? AND size IN ({placeholders})",
-                (SSD_CACHE_DIR, *tiers),
-            ).fetchall()
-            for row in rows:
-                _remove_cache_entry_locked(conn, row)
-            conn.commit()
-        finally:
-            conn.close()
+        placeholders = ",".join("?" for _ in tiers)
+        rows = conn.execute(
+            f"SELECT cache_root, size, image_id, path FROM cache_entries "
+            f"WHERE cache_root = ? AND size IN ({placeholders})",
+            (SSD_CACHE_DIR, *tiers),
+        ).fetchall()
+        for row in rows:
+            _remove_cache_entry_locked(conn, row)
+        conn.commit()
+        for tier in tiers:
+            _tier_byte_totals.pop(tier, None)
 
     for tier in tiers:
         tier_dir = os.path.join(SSD_CACHE_DIR, tier)
@@ -394,38 +438,39 @@ def _get_disk_entry(
 
     with _meta_lock:
         conn = _db_connect()
-        try:
-            row = conn.execute(
-                "SELECT cache_root, size, image_id, path, source_signature, size_bytes "
-                "FROM cache_entries WHERE cache_root = ? AND size = ? AND image_id = ?",
+        row = conn.execute(
+            "SELECT cache_root, size, image_id, path, source_signature, size_bytes "
+            "FROM cache_entries WHERE cache_root = ? AND size = ? AND image_id = ?",
+            (SSD_CACHE_DIR, size, image_id),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["source_signature"] != source_signature or not os.path.exists(row["path"]):
+            stale_row = conn.execute(
+                "SELECT cache_root, size, image_id, path FROM cache_entries "
+                "WHERE cache_root = ? AND size = ? AND image_id = ?",
                 (SSD_CACHE_DIR, size, image_id),
             ).fetchone()
-            if row is None:
-                return None
-            if row["source_signature"] != source_signature or not os.path.exists(row["path"]):
-                stale_row = conn.execute(
-                    "SELECT cache_root, size, image_id, path FROM cache_entries "
-                    "WHERE cache_root = ? AND size = ? AND image_id = ?",
-                    (SSD_CACHE_DIR, size, image_id),
-                ).fetchone()
-                if stale_row is not None:
-                    _remove_cache_entry_locked(conn, stale_row)
-                    conn.commit()
-                return None
-            if touch:
-                conn.execute(
-                    "UPDATE cache_entries SET last_accessed = ? "
-                    "WHERE cache_root = ? AND size = ? AND image_id = ?",
-                    (_current_time(), SSD_CACHE_DIR, size, image_id),
-                )
+            if stale_row is not None:
+                _remove_cache_entry_locked(conn, stale_row)
                 conn.commit()
-            return row
-        finally:
-            conn.close()
+            return None
+        if touch:
+            conn.execute(
+                "UPDATE cache_entries SET last_accessed = ? "
+                "WHERE cache_root = ? AND size = ? AND image_id = ?",
+                (_current_time(), SSD_CACHE_DIR, size, image_id),
+            )
+            conn.commit()
+        _index_disk_entry(size, image_id, row["path"], row["source_signature"])
+        return row
 
 
-# In-memory index: (size, image_id) -> disk path. Built on startup, updated on writes.
-_disk_path_index: dict[tuple[str, int], str] = {}
+# In-memory index: (size, image_id) -> (disk path, source signature).
+# Built on startup and updated on writes/evictions so hot thumbnail requests
+# can skip SQLite without believing stale evicted files still exist.
+_disk_path_index: dict[tuple[str, int], tuple[str, str]] = {}
+_disk_index_lock = threading.Lock()
 _disk_index_built = False
 
 
@@ -433,39 +478,94 @@ def _build_disk_path_index():
     """Load all cache entry paths into memory for fast lookup."""
     global _disk_index_built
     if not SSD_CACHE_DIR:
+        _clear_disk_index()
         _disk_index_built = True
         return
     with _meta_lock:
         conn = _db_connect()
-        try:
-            rows = conn.execute(
-                "SELECT size, image_id, path FROM cache_entries WHERE cache_root = ?",
-                (SSD_CACHE_DIR,),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT size, image_id, path, source_signature FROM cache_entries WHERE cache_root = ?",
+            (SSD_CACHE_DIR,),
+        ).fetchall()
+    new_index = {}
     for row in rows:
-        _disk_path_index[(row["size"], row["image_id"])] = row["path"]
+        new_index[(row["size"], row["image_id"])] = (row["path"], row["source_signature"])
+    with _disk_index_lock:
+        _disk_path_index.clear()
+        _disk_path_index.update(new_index)
     _disk_index_built = True
 
 
-def _index_disk_entry(size: str, image_id: int, path: str):
+def _index_disk_entry(size: str, image_id: int, path: str, source_signature: str):
     """Update the in-memory index when a new cache entry is written."""
-    _disk_path_index[(size, image_id)] = path
+    with _disk_index_lock:
+        _disk_path_index[(size, image_id)] = (path, source_signature)
+
+
+def _unindex_disk_entry(size: str, image_id: int):
+    with _disk_index_lock:
+        _disk_path_index.pop((size, image_id), None)
+
+
+def _clear_disk_index(tiers: tuple[str, ...] | None = None):
+    global _disk_index_built
+    with _disk_index_lock:
+        if tiers is None:
+            _disk_path_index.clear()
+            _disk_index_built = False
+            return
+        for key in list(_disk_path_index.keys()):
+            if key[0] in tiers:
+                _disk_path_index.pop(key, None)
+
+
+def fast_disk_has(size: str, image_id: int, source_signature: str | None = None) -> bool:
+    if not _disk_index_built:
+        _build_disk_path_index()
+    with _disk_index_lock:
+        entry = _disk_path_index.get((size, image_id))
+    if entry is None:
+        return False
+    path, cached_signature = entry
+    if source_signature is not None and cached_signature != source_signature:
+        return False
+    if os.path.exists(path):
+        return True
+    _unindex_disk_entry(size, image_id)
+    return False
+
+
+def fast_disk_read_entry(
+    size: str,
+    image_id: int,
+    source_signature: str | None = None,
+    *,
+    populate_memory: bool = False,
+) -> tuple[str, bytes] | None:
+    if not _disk_index_built:
+        _build_disk_path_index()
+    with _disk_index_lock:
+        entry = _disk_path_index.get((size, image_id))
+    if entry is None:
+        return None
+    path, cached_signature = entry
+    if source_signature is not None and cached_signature != source_signature:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        _unindex_disk_entry(size, image_id)
+        return None
+    if populate_memory and size in THUMB_TIERS:
+        _memory_put(size, image_id, cached_signature, data)
+    return cached_signature, data
 
 
 def fast_disk_read(size: str, image_id: int) -> bytes | None:
     """Fast path: read thumbnail from SSD via in-memory index. No SQLite, no locks, no HDD stat."""
-    if not _disk_index_built:
-        _build_disk_path_index()
-    path = _disk_path_index.get((size, image_id))
-    if path is None:
-        return None
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None
+    entry = fast_disk_read_entry(size, image_id)
+    return entry[1] if entry is not None else None
 
 
 def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> bytes | None:
@@ -479,17 +579,14 @@ def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> byt
     except OSError:
         with _meta_lock:
             conn = _db_connect()
-            try:
-                stale_row = conn.execute(
-                    "SELECT cache_root, size, image_id, path FROM cache_entries "
-                    "WHERE cache_root = ? AND size = ? AND image_id = ?",
-                    (SSD_CACHE_DIR, size, image_id),
-                ).fetchone()
-                if stale_row is not None:
-                    _remove_cache_entry_locked(conn, stale_row)
-                    conn.commit()
-            finally:
-                conn.close()
+            stale_row = conn.execute(
+                "SELECT cache_root, size, image_id, path FROM cache_entries "
+                "WHERE cache_root = ? AND size = ? AND image_id = ?",
+                (SSD_CACHE_DIR, size, image_id),
+            ).fetchone()
+            if stale_row is not None:
+                _remove_cache_entry_locked(conn, stale_row)
+                conn.commit()
         return None
 
     _memory_put(size, image_id, source_signature, data)
@@ -499,35 +596,38 @@ def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> byt
 def _store_disk_entry(size: str, image_id: int, source_signature: str, path: str, size_bytes: int):
     with _meta_lock:
         conn = _db_connect()
-        try:
-            previous = conn.execute(
-                "SELECT cache_root, size, image_id, path FROM cache_entries "
-                "WHERE cache_root = ? AND size = ? AND image_id = ?",
-                (SSD_CACHE_DIR, size, image_id),
-            ).fetchone()
-            if previous is not None and previous["path"] != path:
+        previous = conn.execute(
+            "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
+            "WHERE cache_root = ? AND size = ? AND image_id = ?",
+            (SSD_CACHE_DIR, size, image_id),
+        ).fetchone()
+        old_bytes = 0
+        if previous is not None:
+            old_bytes = int(previous["size_bytes"])
+            if previous["path"] != path:
                 _remove_cache_entry_locked(conn, previous)
 
-            conn.execute(
-                "INSERT OR REPLACE INTO cache_entries "
-                "(cache_root, size, image_id, path, source_signature, size_bytes, last_accessed, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    SSD_CACHE_DIR,
-                    size,
-                    image_id,
-                    path,
-                    source_signature,
-                    int(size_bytes),
-                    _current_time(),
-                    _current_time(),
-                ),
-            )
-            _enforce_tier_budget_locked(conn, size)
-            conn.commit()
-            _index_disk_entry(size, image_id, path)
-        finally:
-            conn.close()
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_entries "
+            "(cache_root, size, image_id, path, source_signature, size_bytes, last_accessed, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                SSD_CACHE_DIR,
+                size,
+                image_id,
+                path,
+                source_signature,
+                int(size_bytes),
+                _current_time(),
+                _current_time(),
+            ),
+        )
+        # Update running total: add new, subtract old (if replacing)
+        if size in _tier_byte_totals:
+            _tier_byte_totals[size] += int(size_bytes) - old_bytes
+        _enforce_tier_budget_locked(conn, size)
+        conn.commit()
+        _index_disk_entry(size, image_id, path, source_signature)
 
 
 def _write_thumbnail_to_disk(size: str, image_id: int, source_signature: str, data: bytes):
@@ -541,7 +641,63 @@ def _write_thumbnail_to_disk(size: str, image_id: int, source_signature: str, da
     with open(temp_path, "wb") as f:
         f.write(data)
     os.replace(temp_path, path)
-    _store_disk_entry(size, image_id, source_signature, path, len(data))
+    # Update in-memory index immediately so has_cached sees it.
+    _index_disk_entry(size, image_id, path, source_signature)
+    # Queue DB write for bulk flush instead of acquiring _meta_lock per thumbnail.
+    with _write_queue_lock:
+        _write_queue.append((size, image_id, source_signature, path, len(data)))
+    _maybe_flush_write_queue()
+
+
+_WRITE_FLUSH_SIZE = 30  # flush after this many queued writes
+
+
+def _flush_write_queue():
+    """Flush pending cache DB writes in a single transaction."""
+    with _write_queue_lock:
+        if not _write_queue:
+            return
+        # Keep only the newest write per cache key. Pregeneration can queue the
+        # same image/tier more than once while older work is still flushing.
+        latest = {}
+        for entry in _write_queue:
+            latest[(entry[0], entry[1])] = entry
+        batch = list(latest.values())
+        _write_queue.clear()
+
+    now = _current_time()
+    with _meta_lock:
+        conn = _db_connect()
+        for size, image_id, source_signature, path, size_bytes in batch:
+            previous = conn.execute(
+                "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
+                "WHERE cache_root = ? AND size = ? AND image_id = ?",
+                (SSD_CACHE_DIR, size, image_id),
+            ).fetchone()
+            old_bytes = int(previous["size_bytes"]) if previous is not None else 0
+            if previous is not None and previous["path"] != path:
+                _remove_cache_entry_locked(conn, previous)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_entries "
+                "(cache_root, size, image_id, path, source_signature, size_bytes, last_accessed, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (SSD_CACHE_DIR, size, image_id, path, source_signature, int(size_bytes), now, now),
+            )
+            if size in _tier_byte_totals:
+                _tier_byte_totals[size] += int(size_bytes) - old_bytes
+            _index_disk_entry(size, image_id, path, source_signature)
+        for size in {entry[0] for entry in batch}:
+            _enforce_tier_budget_locked(conn, size)
+        conn.commit()
+
+
+def _maybe_flush_write_queue():
+    """Flush if enough writes have accumulated — called from worker threads."""
+    with _write_queue_lock:
+        should_flush = len(_write_queue) >= _WRITE_FLUSH_SIZE
+    if should_flush:
+        _flush_write_queue()
 
 
 def _cache_full_image_sync(filepath: str, image_id: int, source_signature: str) -> str:
@@ -616,7 +772,9 @@ def _load_source_image(filepath: str, max_target: int, prefer_draft: bool) -> Im
         return Image.fromarray(rgb)
 
     with Image.open(filepath) as source:
-        if prefer_draft and ext in JPEG_EXTENSIONS:
+        if ext in JPEG_EXTENSIONS:
+            # Always use draft mode for JPEGs — decodes at reduced resolution
+            # via libjpeg DCT scaling, cutting both I/O and decode time.
             source.draft("RGB", (max_target * 2, max_target * 2))
         source.load()
         img = ImageOps.exif_transpose(source)
@@ -630,12 +788,22 @@ def _resize_to_long_side(img: Image.Image, target_long_side: int) -> Image.Image
     if long_side <= target_long_side:
         return img.copy()
 
+    # Fast integer pre-downscale with reduce() when source is much larger,
+    # then final filter for quality.
+    factor = max(1, long_side // (target_long_side * 2))
+    if factor > 1:
+        img = img.reduce(factor)
+        long_side = max(img.width, img.height)
+
     scale = target_long_side / long_side
     new_size = (
         max(1, int(round(img.width * scale))),
         max(1, int(round(img.height * scale))),
     )
-    return img.resize(new_size, Image.LANCZOS)
+    # Use BILINEAR for large targets (≥1920px) where the downscale ratio is small
+    # and quality difference is imperceptible. LANCZOS for smaller sizes.
+    resample = Image.BILINEAR if target_long_side >= 1920 else Image.LANCZOS
+    return img.resize(new_size, resample)
 
 
 def _queue_orientation(image_id: int, img: Image.Image):
@@ -653,6 +821,9 @@ def _planned_thumbnail_sizes(filepath: str, image_id: int, requested_size: str) 
             continue
         source_signature = _build_source_signature(filepath, size, image_id)
         if _memory_get(size, image_id, source_signature) is not None:
+            continue
+        # Fast check via in-memory index before expensive DB query.
+        if fast_disk_has(size, image_id, source_signature):
             continue
         if _get_disk_entry(size, image_id, source_signature, touch=False) is not None:
             continue
@@ -720,6 +891,10 @@ def has_cached(size: str, filepath: str, image_id: int) -> bool:
     source_signature = _build_source_signature(filepath, size, image_id)
     if size in THUMB_TIERS and _memory_get(size, image_id, source_signature) is not None:
         return True
+    # Fast check via in-memory index — avoids SQLite while still rejecting
+    # stale signatures and evicted files.
+    if fast_disk_has(size, image_id, source_signature):
+        return True
     return _get_disk_entry(size, image_id, source_signature, touch=False) is not None
 
 
@@ -755,6 +930,12 @@ async def _ensure_thumbnail_with_executor(
     if cached is not None:
         return cached
 
+    # Try lock-free fast path via in-memory index before DB round-trip
+    if not note_activity:
+        cached = fast_disk_read(size, image_id)
+        if cached is not None:
+            return cached
+
     cached = _read_disk_thumbnail(size, image_id, source_signature)
     if cached is not None:
         return cached
@@ -776,7 +957,7 @@ async def _ensure_thumbnail_with_executor(
     cached = _memory_get(size, image_id, source_signature)
     if cached is not None:
         return cached
-    return _read_disk_thumbnail(size, image_id, source_signature) or b""
+    return fast_disk_read(size, image_id) or _read_disk_thumbnail(size, image_id, source_signature) or b""
 
 
 async def get_thumbnail(filepath: str, size: str, image_id: int) -> bytes:
@@ -876,8 +1057,6 @@ def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
         converted = img.convert("RGB")
         img.close()
         img = converted
-        img.close()
-        img = converted
     return img
 
 
@@ -924,6 +1103,7 @@ async def _pregen_candidate_batch(size: str, offset: int, limit: int):
         cursor = await conn.execute(
             "SELECT i.id, i.filepath, c.source_signature "
             "FROM images i "
+            "INDEXED BY idx_images_active_filepath "
             "LEFT JOIN cache_entries c "
             "  ON c.cache_root = ? AND c.size = ? AND c.image_id = i.id "
             "WHERE i.status IN ('kept', 'maybe') "
@@ -964,22 +1144,20 @@ async def _run_pregen_phase(size: str) -> int:
     if not pending:
         return 0
 
-    # Launch concurrent thumbnail jobs — overlap HDD reads with CPU processing
-    CONCURRENT = min(3, len(pending))
-    generated = 0
-    for i in range(0, len(pending), CONCURRENT):
-        chunk = pending[i:i + CONCURRENT]
-        tasks = [
-            _ensure_thumbnail_with_executor(
-                row["filepath"], size, row["id"],
-                _prefetch_executor, note_activity=False,
-            )
-            for row in chunk
-        ]
-        await asyncio.gather(*tasks)
-        generated += len(chunk)
-        _pregen_status["last_generated_at"] = _current_time()
-        _pregen_status["generated_this_session"] += len(chunk)
+    # Submit all pending jobs at once — the thread pool's internal queue keeps
+    # the HDD saturated by starting the next read as soon as a thread frees up.
+    tasks = [
+        _ensure_thumbnail_with_executor(
+            row["filepath"], size, row["id"],
+            _prefetch_executor, note_activity=False,
+        )
+        for row in pending
+    ]
+    await asyncio.gather(*tasks)
+    _flush_write_queue()
+    generated = len(pending)
+    _pregen_status["last_generated_at"] = _current_time()
+    _pregen_status["generated_this_session"] += generated
 
     if len(rows) < PREGENERATE_SCAN_BATCH:
         _pregen_scan_offsets[size] = 0
@@ -999,14 +1177,11 @@ def cache_stats() -> dict:
 
     with _meta_lock:
         conn = _db_connect()
-        try:
-            rows = conn.execute(
-                "SELECT size, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes "
-                "FROM cache_entries WHERE cache_root = ? GROUP BY size",
-                (SSD_CACHE_DIR,),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            "SELECT size, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes "
+            "FROM cache_entries WHERE cache_root = ? GROUP BY size",
+            (SSD_CACHE_DIR,),
+        ).fetchall()
 
     for row in rows:
         if row["size"] in disk_tiers:
@@ -1051,6 +1226,7 @@ def get_pregen_status(target_total: int = 0) -> dict:
 
 def clear_cache() -> dict:
     memory = _clear_memory_cache()
+    _flush_write_queue()
 
     disk_removed = 0
     if SSD_CACHE_DIR and os.path.isdir(SSD_CACHE_DIR):
@@ -1058,14 +1234,14 @@ def clear_cache() -> dict:
             disk_removed += len(files)
         shutil.rmtree(SSD_CACHE_DIR, ignore_errors=True)
     _ensure_disk_cache_dirs()
+    _clear_disk_index()
+    _tier_byte_totals.clear()
+    _source_stat_cache.clear()
 
     with _meta_lock:
         conn = _db_connect()
-        try:
-            conn.execute("DELETE FROM cache_entries WHERE cache_root = ?", (SSD_CACHE_DIR,))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("DELETE FROM cache_entries WHERE cache_root = ?", (SSD_CACHE_DIR,))
+        conn.commit()
 
     return {
         "memory_entries_cleared": memory["entries_cleared"],
@@ -1082,6 +1258,9 @@ def configure(config: dict):
     global BROWSER_CACHE_MAX_AGE, BROWSER_CACHE_STALE_WHILE_REVALIDATE
     global _executor_workers, _prefetch_workers_count, _executor, _prefetch_executor
     global _disk_allocations, _last_thumb_config_signature, _pregen_manual_pause
+
+    _flush_write_queue()
+    old_cache_dir = SSD_CACHE_DIR
 
     SIZES["sm"] = int(config.get("thumb_size_sm", SIZES["sm"]))
     SIZES["md"] = int(config.get("thumb_size_md", SIZES["md"]))
@@ -1113,6 +1292,9 @@ def configure(config: dict):
         or SSD_CACHE_DIR
     )
     SSD_CACHE_DIR = os.path.abspath(str(disk_cache_dir).strip() or SSD_CACHE_DIR)
+    if SSD_CACHE_DIR != old_cache_dir:
+        _clear_disk_index()
+        _tier_byte_totals.clear()
     _ensure_disk_cache_dirs()
 
     new_thumb_config_signature = _thumb_config_signature()
@@ -1171,9 +1353,12 @@ def stop_pregeneration() -> dict:
 async def run_prefetch_worker():
     global _prefetching
     _prefetching = True
+    _target_total_cache = 0
+    _target_total_at = 0.0
 
     while _prefetching:
         try:
+            _flush_write_queue()
             await flush_orientation_updates()
 
             if _pregen_manual_pause:
@@ -1196,7 +1381,11 @@ async def run_prefetch_worker():
                 await asyncio.sleep(1)
                 continue
 
-            target_total = await _cache_target_total()
+            now = time.monotonic()
+            if now - _target_total_at > 30:
+                _target_total_cache = await _cache_target_total()
+                _target_total_at = now
+            target_total = _target_total_cache
             if target_total <= 0:
                 _set_pregen_state("idle", "No kept or maybe images to pre-generate.")
                 await asyncio.sleep(5)
@@ -1213,9 +1402,8 @@ async def run_prefetch_worker():
                 _set_pregen_state("running", f"Pre-generating {phase} thumbnails…", phase=phase)
                 phase_generated = await _run_pregen_phase(phase)
                 generated += phase_generated
-                await flush_orientation_updates()
-                if phase_generated > 0:
-                    break
+
+            await flush_orientation_updates()
 
             if generated == 0:
                 status = get_pregen_status(target_total)

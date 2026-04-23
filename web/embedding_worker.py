@@ -9,7 +9,6 @@ detection, and auto-collections.
 import asyncio
 import logging
 import os
-import struct
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +21,7 @@ _preload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed-
 
 import ai_models
 import db
+import embed_cache
 import settings
 import thumbnails
 
@@ -256,7 +256,7 @@ def encode_text(query: str) -> np.ndarray | None:
 
 
 def vec_to_blob(vec: np.ndarray) -> bytes:
-    return struct.pack(f"{EMBEDDING_DIM}f", *vec)
+    return np.asarray(vec, dtype=np.float32).tobytes()
 
 
 def blob_to_vec(blob: bytes) -> np.ndarray:
@@ -306,7 +306,10 @@ async def run_embedding_worker():
                 _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
 
             # Phase 1: Embed unembedded images with pipelined CPU/GPU
-            candidates = await db.get_unembedded_images(limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER)
+            candidates = await db.get_unembedded_images(
+                limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER,
+                md_cache_root=thumbnails.SSD_CACHE_DIR,
+            )
             unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
                 _set_worker_status("embedding", f"Embedding {len(unembedded)} images…", ready=True)
@@ -329,10 +332,12 @@ async def run_embedding_worker():
                 errors = [preload_errors[i] or encode_errors[i] for i in range(len(image_refs))]
 
                 batch = []
+                cached_vectors = []
                 failed = []
                 for row, vec, error in zip(unembedded, vectors, errors):
                     if vec is not None:
                         batch.append((row["id"], vec_to_blob(vec)))
+                        cached_vectors.append((row["id"], vec))
                         _embed_retry_after.pop(row["id"], None)
                     elif error:
                         failed.append((row["id"], error))
@@ -340,6 +345,7 @@ async def run_embedding_worker():
 
                 if batch:
                     await db.store_embeddings_batch(batch)
+                    embed_cache.add_vectors(cached_vectors)
                     _record_embedding_batch(len(batch), time.perf_counter() - embed_started)
                     embedded_count = await db.get_embedding_count()
                     log.info(f"Embedded {len(batch)} images (total: {embedded_count})")

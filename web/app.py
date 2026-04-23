@@ -16,7 +16,27 @@ import scanner
 import settings
 import thumbnails
 
+from starlette.middleware.gzip import GZipMiddleware
+
+
+class SelectiveGZipMiddleware:
+    """Compress text/JSON responses without spending CPU on JPEG/full images."""
+
+    def __init__(self, app, minimum_size: int = 1000):
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path") or ""
+            if path.startswith("/api/thumb/") or path.startswith("/api/full/"):
+                await self.app(scope, receive, send)
+                return
+        await self.gzip(scope, receive, send)
+
+
 app = FastAPI(title="photoArchive")
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000)
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
@@ -174,16 +194,29 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
     if size not in thumbnails.SIZES:
         return JSONResponse({"error": "Invalid size"}, status_code=400)
 
-    # Fast path: check memory cache, then SSD disk cache — no DB lookup or HDD stat
-    data = thumbnails._memory_get_fast(size, image_id)
-    if data is None:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None, thumbnails.fast_disk_read, size, image_id
+    # Fast path: check memory cache, then SSD disk cache — no DB lookup or HDD stat.
+    # The cached signature is strong enough for browser revalidation and avoids
+    # the old "size-id" ETag that could mask regenerated thumbnails.
+    entry = thumbnails._memory_get_entry_fast(size, image_id)
+    if entry is None:
+        entry = await asyncio.get_event_loop().run_in_executor(
+            None,
+            thumbnails.fast_disk_read_entry,
+            size,
+            image_id,
+            None,
         )
-    if data:
+        if entry is not None:
+            signature, data = entry
+            thumbnails._memory_put(size, image_id, signature, data)
+    if entry is not None:
+        signature, data = entry
         headers = {
-            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
-            "ETag": f'"{size}-{image_id}"',
+            "Cache-Control": (
+                f"public, max-age={thumbnails.BROWSER_CACHE_MAX_AGE}, "
+                f"stale-while-revalidate={thumbnails.BROWSER_CACHE_STALE_WHILE_REVALIDATE}"
+            ),
+            "ETag": f'"{signature}"',
         }
         if request.headers.get("if-none-match") == headers["ETag"]:
             return Response(status_code=304, headers=headers)
@@ -426,7 +459,10 @@ async def submit_cull(request: Request):
         new_elo = old_elo
 
     _cull_history.append({"image_id": image_id, "previous_status": image["status"], "previous_elo": old_elo})
+    if len(_cull_history) > 500:
+        _cull_history[:] = _cull_history[-200:]
     await db.set_image_status_and_elo(image_id, status, new_elo)
+    _invalidate_active_caches()
     return {"ok": True}
 
 
@@ -438,11 +474,14 @@ async def submit_cull_batch(request: Request):
     if not decisions_in:
         return JSONResponse({"error": "No decisions"}, status_code=400)
 
+    image_ids = [d["image_id"] for d in decisions_in]
+    images_map = await db.get_images_by_ids(image_ids)
+
     db_decisions = []
     history_batch = []
 
     for d in decisions_in:
-        image = await db.get_image_by_id(d["image_id"])
+        image = images_map.get(d["image_id"])
         if not image:
             continue
         status = d["status"]
@@ -460,6 +499,9 @@ async def submit_cull_batch(request: Request):
 
     await db.batch_cull(db_decisions)
     _cull_history.extend(history_batch)
+    if len(_cull_history) > 500:
+        _cull_history[:] = _cull_history[-200:]
+    _invalidate_active_caches()
     return {"ok": True, "count": len(db_decisions)}
 
 
@@ -470,6 +512,7 @@ async def cull_undo():
 
     entry = _cull_history.pop()
     await db.set_image_status_and_elo(entry["image_id"], entry["previous_status"], entry["previous_elo"])
+    _invalidate_active_caches()
     return {"ok": True, "image_id": entry["image_id"], "restored_status": entry["previous_status"]}
 
 
@@ -477,6 +520,7 @@ async def cull_undo():
 
 # Cache for get_kept_images_for_pairing — invalidated by comparisons
 _pairing_cache = {"data": None, "valid": False}
+_matchups_cache = {"data": None, "valid": False}
 
 async def _get_pairing_images():
     """Cached wrapper — invalidated by mosaic_pick and submit_comparison."""
@@ -489,6 +533,45 @@ async def _get_pairing_images():
 
 def _invalidate_pairing_cache():
     _pairing_cache["valid"] = False
+    _matchups_cache["valid"] = False
+
+
+async def _get_past_matchups():
+    if _matchups_cache["valid"] and _matchups_cache["data"] is not None:
+        return _matchups_cache["data"]
+    matchups = await db.get_past_matchups()
+    _matchups_cache["data"] = matchups
+    _matchups_cache["valid"] = True
+    return matchups
+
+
+def _invalidate_active_caches():
+    _invalidate_pairing_cache()
+    _folders_cache["expires"] = 0
+    _collections_cache["key"] = None
+    _collections_cache["data"] = None
+    try:
+        import embed_cache
+        embed_cache.invalidate()
+    except Exception:
+        pass
+
+
+def _top_indices_desc(values, limit: int, exclude_index: int | None = None):
+    import numpy as np
+
+    if limit <= 0 or len(values) == 0:
+        return []
+    if exclude_index is not None:
+        values = values.copy()
+        values[exclude_index] = -np.inf
+
+    limit = min(limit, len(values))
+    if len(values) <= limit:
+        return np.argsort(values)[::-1]
+
+    candidates = np.argpartition(values, -limit)[-limit:]
+    return candidates[np.argsort(values[candidates])[::-1]]
 
 async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
     """Select images that maximize visual diversity using embedding distance."""
@@ -671,6 +754,8 @@ async def mosaic_pick(request: Request):
 
     picked = images[picked_id]
     picked_elo = picked["elo"]
+    comparison_rows = []
+    loser_updates = []
 
     conn = await db.get_db()
     try:
@@ -680,21 +765,28 @@ async def mosaic_pick(request: Request):
                 continue
             new_picked, new_other = pairing.update_elo(picked_elo, other["elo"], k=12.0)
 
-            await conn.execute(
-                "INSERT INTO comparisons (winner_id, loser_id, mode, elo_before_winner, elo_before_loser) VALUES (?, ?, 'mosaic', ?, ?)",
-                (picked_id, oid, picked_elo, other["elo"]),
-            )
-            await conn.execute(
-                "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
-                (new_other, oid),
-            )
+            comparison_rows.append((picked_id, oid, picked_elo, other["elo"]))
+            loser_updates.append((new_other, oid))
             picked_elo = new_picked
 
-        await conn.execute(
-            "UPDATE images SET elo = ?, comparisons = comparisons + ? WHERE id = ?",
-            (picked_elo, len(other_ids), picked_id),
-        )
+        if comparison_rows:
+            await conn.executemany(
+                "INSERT INTO comparisons "
+                "(winner_id, loser_id, mode, elo_before_winner, elo_before_loser) "
+                "VALUES (?, ?, 'mosaic', ?, ?)",
+                comparison_rows,
+            )
+            await conn.executemany(
+                "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+                loser_updates,
+            )
+
+            await conn.execute(
+                "UPDATE images SET elo = ?, comparisons = comparisons + ? WHERE id = ?",
+                (picked_elo, len(comparison_rows), picked_id),
+            )
         await conn.commit()
+        db.invalidate_stats_cache()
     finally:
         await conn.close()
 
@@ -702,9 +794,10 @@ async def mosaic_pick(request: Request):
     _invalidate_pairing_cache()
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
-    asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, other_ids, k=12.0))
+    valid_loser_ids = [row[1] for row in comparison_rows]
+    asyncio.create_task(elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0))
 
-    return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(other_ids)}
+    return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(comparison_rows)}
 
 
 # --- Compare API ---
@@ -720,7 +813,7 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
         return {"pairs": [], "total_kept": len(images)}
 
     image_dicts = [dict(img) for img in images]
-    past = await db.get_past_matchups()
+    past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
     result = []
@@ -752,8 +845,8 @@ async def submit_comparison(request: Request):
     loser_id = body.get("loser_id")
     mode = body.get("mode", "swiss")
 
-    winner = await db.get_image_by_id(winner_id)
-    loser = await db.get_image_by_id(loser_id)
+    both = await db.get_images_by_ids([winner_id, loser_id])
+    winner, loser = both.get(winner_id), both.get(loser_id)
 
     if not winner or not loser:
         return JSONResponse({"error": "Image not found"}, status_code=404)
@@ -782,6 +875,7 @@ async def submit_comparison(request: Request):
 async def compare_undo():
     result = await db.undo_last_comparison()
     if result:
+        _invalidate_pairing_cache()
         return {"ok": True, **result}
     return JSONResponse({"error": "Nothing to undo"}, status_code=400)
 
@@ -831,11 +925,11 @@ async def export_rankings(format: str = "json", ids: str = ""):
     data = [
         {
             "rank": i + 1,
-            "filename": dict(img)["filename"],
-            "filepath": dict(img)["filepath"],
-            "elo": round(dict(img)["elo"], 1),
-            "comparisons": dict(img)["comparisons"],
-            "status": dict(img)["status"],
+            "filename": img["filename"],
+            "filepath": img["filepath"],
+            "elo": round(img["elo"], 1),
+            "comparisons": img["comparisons"],
+            "status": img["status"],
         }
         for i, img in enumerate(images)
     ]
@@ -860,10 +954,10 @@ async def api_search(q: str = "", limit: int = 50):
     """Search images by text query using embedding similarity."""
     if not q.strip():
         return {"images": [], "query": q}
+    limit = max(1, min(int(limit), 500))
 
     try:
         import embedding_worker
-        import numpy as np
         import embed_cache
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
@@ -877,7 +971,7 @@ async def api_search(q: str = "", limit: int = 50):
         return {"images": [], "query": q}
 
     similarities = matrix @ text_vec
-    top_indices = np.argsort(similarities)[::-1][:limit]
+    top_indices = _top_indices_desc(similarities, limit)
     top_ids = [image_ids[i] for i in top_indices]
     top_scores = [float(similarities[i]) for i in top_indices]
 
@@ -903,8 +997,8 @@ async def api_search(q: str = "", limit: int = 50):
 @app.get("/api/similar/{image_id}")
 async def api_similar(image_id: int, limit: int = 50):
     """Find visually similar images using embedding cosine similarity."""
+    limit = max(1, min(int(limit), 500))
     try:
-        import numpy as np
         import embed_cache
     except ImportError:
         return JSONResponse({"error": "Embeddings not available"}, status_code=503)
@@ -918,13 +1012,13 @@ async def api_similar(image_id: int, limit: int = 50):
         return JSONResponse({"error": "Image not embedded yet"}, status_code=404)
 
     similarities = matrix @ source_vec
-    top_indices = np.argsort(similarities)[::-1]
+    source_index = embed_cache.get_index().get(image_id)
+    top_indices = _top_indices_desc(similarities, limit, exclude_index=source_index)
+    top_ids = [image_ids[idx] for idx in top_indices]
     results = []
-    images_data = await db.get_images_by_ids(image_ids)
+    images_data = await db.get_images_by_ids(top_ids)
     for idx in top_indices:
         img_id = image_ids[idx]
-        if img_id == image_id:
-            continue
         img = images_data.get(img_id)
         if not img:
             continue
@@ -937,8 +1031,6 @@ async def api_similar(image_id: int, limit: int = 50):
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img_id}",
         })
-        if len(results) >= limit:
-            break
 
     return {"images": results, "source_id": image_id}
 
@@ -956,12 +1048,27 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
     if image_ids is None or len(image_ids) < 2:
         return {"pairs": []}
 
-    sim_matrix = matrix @ matrix.T
+    # Process in batches to avoid allocating a full n×n matrix (~850MB for 20k images).
+    # Each batch computes similarities for a chunk of rows against all columns.
+    BATCH = 500
+    n = len(image_ids)
     pairs = []
-    for i in range(len(image_ids)):
-        for j in range(i + 1, len(image_ids)):
-            if sim_matrix[i, j] >= threshold:
-                pairs.append((image_ids[i], image_ids[j], float(sim_matrix[i, j])))
+    for start in range(0, n, BATCH):
+        end = min(start + BATCH, n)
+        chunk_sims = matrix[start:end] @ matrix.T  # (BATCH, n) — manageable
+        for i_local in range(end - start):
+            i = start + i_local
+            # Only check upper triangle (j > i)
+            j_start = max(i + 1, 0)
+            row = chunk_sims[i_local, j_start:]
+            above = (row >= threshold).nonzero()[0]
+            for offset in above:
+                j = j_start + int(offset)
+                pairs.append((image_ids[i], image_ids[j], float(row[int(offset)])))
+                if len(pairs) >= limit:
+                    break
+            if len(pairs) >= limit:
+                break
         if len(pairs) >= limit:
             break
 
@@ -984,6 +1091,8 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
 
 
 _exif_cache: dict[int, dict] = {}
+_EXIF_CACHE_MAX = 2000
+_collections_cache = {"key": None, "data": None}
 
 @app.get("/api/image/{image_id}/exif")
 async def api_exif(image_id: int):
@@ -1103,6 +1212,11 @@ async def api_exif(image_id: int):
 
     result = {"exif": exif}
     _exif_cache[image_id] = result
+    if len(_exif_cache) > _EXIF_CACHE_MAX:
+        # Evict oldest entries
+        to_remove = list(_exif_cache.keys())[:_EXIF_CACHE_MAX // 2]
+        for k in to_remove:
+            del _exif_cache[k]
     return result
 
 
@@ -1121,8 +1235,13 @@ async def api_collections(n_clusters: int = 20):
     if image_ids is None or len(image_ids) < n_clusters:
         return {"collections": []}
 
+    cache_key = (int(n_clusters), len(image_ids))
+    if _collections_cache["key"] == cache_key and _collections_cache["data"] is not None:
+        return _collections_cache["data"]
+
+    loop = asyncio.get_running_loop()
     kmeans = KMeans(n_clusters=n_clusters, n_init=3, random_state=42)
-    labels = kmeans.fit_predict(matrix)
+    labels = await loop.run_in_executor(None, kmeans.fit_predict, matrix)
 
     # Group images by cluster and pick a representative (closest to centroid)
     images_data = await db.get_images_by_ids(image_ids)
@@ -1154,7 +1273,10 @@ async def api_collections(n_clusters: int = 20):
 
     # Sort by size descending
     collections.sort(key=lambda c: c["count"], reverse=True)
-    return {"collections": collections}
+    result = {"collections": collections}
+    _collections_cache["key"] = cache_key
+    _collections_cache["data"] = result
+    return result
 
 
 _folders_cache = {"data": None, "expires": 0}

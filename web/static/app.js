@@ -23,6 +23,8 @@ const PhotoArchive = (() => {
     const LIBRARY_NEIGHBOR_LIMIT = 24;
     const MOSAIC_NEIGHBOR_LIMIT = 8;
     const COMPARE_NEIGHBOR_PAIRS = 4;
+    const FILMSTRIP_WINDOW_RADIUS = 55;
+    const LOUPE_FULL_LOAD_DELAY_MS = 750;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
@@ -1288,18 +1290,32 @@ const PhotoArchive = (() => {
     }
 
     let _filmstripBuiltFor = null;  // track which image set the filmstrip was built for
+    let _filmstripWindowStart = 0;
+    let _filmstripWindowEnd = 0;
 
     function buildFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
-        // Only rebuild if the image set changed
-        if (_filmstripBuiltFor === libraryImages) {
+        const start = Math.max(0, lightboxIndex - FILMSTRIP_WINDOW_RADIUS);
+        const end = Math.min(libraryImages.length, lightboxIndex + FILMSTRIP_WINDOW_RADIUS + 1);
+        const windowStillUseful = (
+            _filmstripBuiltFor === libraryImages &&
+            lightboxIndex >= _filmstripWindowStart &&
+            lightboxIndex < _filmstripWindowEnd &&
+            lightboxIndex - _filmstripWindowStart > 10 &&
+            _filmstripWindowEnd - lightboxIndex > 10
+        );
+
+        if (windowStillUseful) {
             updateFilmstripActive();
             return;
         }
+
         _filmstripBuiltFor = libraryImages;
+        _filmstripWindowStart = start;
+        _filmstripWindowEnd = end;
         scroll.innerHTML = '';
-        for (let i = 0; i < libraryImages.length; i++) {
+        for (let i = start; i < end; i++) {
             const img = libraryImages[i];
             const thumb = document.createElement('div');
             thumb.className = 'filmstrip-thumb' + (i === lightboxIndex ? ' active' : '');
@@ -1316,8 +1332,12 @@ const PhotoArchive = (() => {
     function updateFilmstripActive() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
-        scroll.querySelectorAll('.filmstrip-thumb').forEach((el, i) => {
-            el.classList.toggle('active', i === lightboxIndex);
+        if (lightboxIndex < _filmstripWindowStart || lightboxIndex >= _filmstripWindowEnd) {
+            buildFilmstrip();
+            return;
+        }
+        scroll.querySelectorAll('.filmstrip-thumb').forEach((el) => {
+            el.classList.toggle('active', Number(el.dataset.idx) === lightboxIndex);
         });
         centerFilmstripActive(scroll);
     }
@@ -1330,7 +1350,7 @@ const PhotoArchive = (() => {
             const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
             const centeredLeft = active.offsetLeft + (active.offsetWidth / 2) - (scroll.clientWidth / 2);
             const targetLeft = Math.max(0, Math.min(maxScroll, centeredLeft));
-            scroll.scrollTo({ left: targetLeft, behavior: 'smooth' });
+            scroll.scrollTo({ left: targetLeft, behavior: 'auto' });
         });
     }
 
@@ -1347,9 +1367,11 @@ const PhotoArchive = (() => {
     let loupeZoomMode = 'fit';
     let loupeDisplayedTierRank = -1;
     let loupeImageToken = 0;
+    let loupeCurrentImage = null;
+    let loupeFullLoadTimer = null;
+    let loupeFullLoadToken = 0;
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
-    const LOUPE_FULL_PRELOAD_RADIUS = 1;
 
     function showLoupeImage(img) {
         const loupe = document.getElementById('loupe');
@@ -1359,6 +1381,12 @@ const PhotoArchive = (() => {
         // Pre-calculate fit dimensions from aspect ratio so all progressive
         // loads (sm/md/lg) display at the same screen size — no size jumps
         const token = ++loupeImageToken;
+        loupeCurrentImage = img;
+        loupeFullLoadToken = 0;
+        if (loupeFullLoadTimer) {
+            clearTimeout(loupeFullLoadTimer);
+            loupeFullLoadTimer = null;
+        }
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
@@ -1378,10 +1406,9 @@ const PhotoArchive = (() => {
         loupeImg.alt = img.filename || '';
         loupeImg.src = img.thumb_url;
         loupeDisplayedTierRank = 0;
-        loadLoupeTier(img, img.thumb_url, 0, token, { adoptDimensions: false });
         loadLoupeTier(img, `/api/thumb/md/${img.id}`, 1, token, { adoptDimensions: false });
         loadLoupeTier(img, `/api/thumb/lg/${img.id}`, 2, token, { adoptDimensions: false });
-        loadLoupeTier(img, `/api/full/${img.id}`, 3, token, { adoptDimensions: true });
+        scheduleLoupeFullLoad(img, token, LOUPE_FULL_LOAD_DELAY_MS);
 
         // Populate metadata overlay
         const filenameEl = document.getElementById('loupe-overlay-filename');
@@ -1435,6 +1462,7 @@ const PhotoArchive = (() => {
         if (!url) return;
         const probe = new Image();
         probe.decoding = 'async';
+        if ('fetchPriority' in probe) probe.fetchPriority = rank >= 2 ? 'high' : 'auto';
         probe.onload = () => {
             if (!isCurrentLoupeImage(img, token) || rank <= loupeDisplayedTierRank) return;
 
@@ -1449,6 +1477,24 @@ const PhotoArchive = (() => {
         };
         probe.onerror = () => {};
         probe.src = url;
+    }
+
+    function scheduleLoupeFullLoad(img, token, delayMs) {
+        if (loupeFullLoadTimer) clearTimeout(loupeFullLoadTimer);
+        loupeFullLoadTimer = setTimeout(() => {
+            loupeFullLoadTimer = null;
+            requestLoupeFullImage(img, token);
+        }, delayMs);
+    }
+
+    function requestLoupeFullImage(img = loupeCurrentImage, token = loupeImageToken) {
+        if (!img || !isCurrentLoupeImage(img, token) || loupeFullLoadToken === token) return;
+        loupeFullLoadToken = token;
+        if (loupeFullLoadTimer) {
+            clearTimeout(loupeFullLoadTimer);
+            loupeFullLoadTimer = null;
+        }
+        loadLoupeTier(img, `/api/full/${img.id}`, 3, token, { adoptDimensions: true });
     }
 
     function loupeAdoptSourceDimensions(width, height) {
@@ -1500,12 +1546,9 @@ const PhotoArchive = (() => {
                 const ni = lightboxIndex + offset;
                 if (ni < 0 || ni >= libraryImages.length) continue;
                 const neighbor = libraryImages[ni];
-                preloadImage(neighbor.thumb_url);
-                preloadImage(`/api/thumb/md/${neighbor.id}`);
-                preloadImage(`/api/thumb/lg/${neighbor.id}`);
-                if (distance <= LOUPE_FULL_PRELOAD_RADIUS) {
-                    preloadImage(`/api/full/${neighbor.id}`);
-                }
+                preloadImage(neighbor.thumb_url, 'low');
+                preloadImage(`/api/thumb/md/${neighbor.id}`, 'low');
+                preloadImage(`/api/thumb/lg/${neighbor.id}`, 'low');
             }
         }
     }
@@ -1636,6 +1679,7 @@ const PhotoArchive = (() => {
                 // 1 image pixel == 1 CSS pixel against the current highest-res basis.
                 const targetScale = 1;
                 const img = document.getElementById('loupe-img');
+                requestLoupeFullImage();
                 if (img) img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
                 loupeZoomTo(targetScale, e.clientX, e.clientY, 'one-to-one');
                 setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
@@ -1683,6 +1727,12 @@ const PhotoArchive = (() => {
         if (loupe) loupe.classList.add('hidden');
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
+        if (loupeFullLoadTimer) {
+            clearTimeout(loupeFullLoadTimer);
+            loupeFullLoadTimer = null;
+        }
+        loupeCurrentImage = null;
+        loupeFullLoadToken = 0;
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';

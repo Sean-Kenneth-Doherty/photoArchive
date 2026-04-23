@@ -26,16 +26,22 @@ MAX_DIRECT_COMPARISONS = 8    # don't propagate to images with this many+ direct
 
 
 
-def _find_similar(image_id, image_ids, matrix, threshold, max_n):
+def _find_similar(image_id, image_ids, matrix, id_to_idx, threshold, max_n):
     """Find the most similar images above threshold. Returns [(id, similarity), ...]."""
-    try:
-        idx = image_ids.index(image_id)
-    except ValueError:
+    idx = id_to_idx.get(image_id)
+    if idx is None:
         return []
 
     similarities = matrix @ matrix[idx]  # cosine sim (already L2-normalized)
-    # Sort descending, skip self
-    ranked = np.argsort(similarities)[::-1]
+    candidate_count = min(len(image_ids), max_n + 1)
+    if candidate_count <= 0:
+        return []
+    if len(image_ids) <= candidate_count:
+        ranked = np.argsort(similarities)[::-1]
+    else:
+        candidates = np.argpartition(similarities, -candidate_count)[-candidate_count:]
+        ranked = candidates[np.argsort(similarities[candidates])[::-1]]
+
     results = []
     for i in ranked:
         if image_ids[i] == image_id:
@@ -58,10 +64,11 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
         image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
             return  # no embeddings available yet
+        id_to_idx = embed_cache.get_index()
 
         # Find similar images for winner and loser
-        winner_neighbors = _find_similar(winner_id, image_ids, matrix, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
-        loser_neighbors = _find_similar(loser_id, image_ids, matrix, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+        winner_neighbors = _find_similar(winner_id, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+        loser_neighbors = _find_similar(loser_id, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
 
         if not winner_neighbors and not loser_neighbors:
             return
@@ -72,34 +79,33 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
 
         conn = await db.get_db()
         try:
-            updates = []
+            deltas = {}
 
             # Boost images similar to the winner
             for neighbor_id, similarity in winner_neighbors:
-                neighbor = neighbors.get(neighbor_id)
-                if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
-                    continue
                 # Skip if this neighbor was directly involved in the comparison
                 if neighbor_id == loser_id:
                     continue
                 boost = k * similarity * PROPAGATION_DECAY
-                new_elo = neighbor["elo"] + boost
-                updates.append((new_elo, neighbor_id))
+                deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) + boost
 
             # Penalize images similar to the loser
             for neighbor_id, similarity in loser_neighbors:
-                neighbor = neighbors.get(neighbor_id)
-                if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
-                    continue
                 if neighbor_id == winner_id:
                     continue
                 penalty = k * similarity * PROPAGATION_DECAY
-                new_elo = neighbor["elo"] - penalty
-                updates.append((new_elo, neighbor_id))
+                deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
+
+            updates = []
+            for neighbor_id, delta in deltas.items():
+                neighbor = neighbors.get(neighbor_id)
+                if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
+                    continue
+                updates.append((neighbor["elo"] + delta, neighbor_id))
 
             if updates:
                 await conn.executemany(
-                    "UPDATE images SET elo = ? WHERE id = ?",
+                    "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
@@ -122,9 +128,10 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
         image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
             return
+        id_to_idx = embed_cache.get_index()
 
         involved = {winner_id} | set(loser_ids)
-        winner_neighbors = _find_similar(winner_id, image_ids, matrix, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+        winner_neighbors = _find_similar(winner_id, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
 
         if not winner_neighbors:
             return
@@ -148,7 +155,7 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
 
             if updates:
                 await conn.executemany(
-                    "UPDATE images SET elo = ? WHERE id = ?",
+                    "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
