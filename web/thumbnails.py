@@ -1289,8 +1289,8 @@ def _thumb_config_signature() -> str:
     return f"{CACHE_VERSION}|{SIZES['sm']}|{SIZES['md']}|{SIZES['lg']}|{THUMB_QUALITY}"
 
 
-def get_pregen_status(target_total: int = 0) -> dict:
-    stats = cache_stats()
+def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
+    stats = stats or cache_stats()
     phases = {}
     for size in THUMB_TIERS:
         count = stats["disk"]["tiers"][size]["count"]

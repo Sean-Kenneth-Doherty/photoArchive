@@ -306,7 +306,7 @@ async def build_cache_status(ahead: int = 100):
     result = {
         **cache,
         "eligible_images": target_total,
-        "pregen": thumbnails.get_pregen_status(target_total),
+        "pregen": thumbnails.get_pregen_status(target_total, cache),
     }
 
     if ahead > 0:
