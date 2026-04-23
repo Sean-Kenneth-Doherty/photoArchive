@@ -15,6 +15,10 @@ body {
     min-height: 100vh;
 }
 
+body.loupe-open {
+    overflow: hidden;
+}
+
 a {
     color: #6cb4ee;
     text-decoration: none;
@@ -1395,9 +1399,13 @@ button:disabled {
     position: absolute;
     top: 0;
     left: 0;
+    max-width: none;
+    max-height: none;
     transform-origin: 0 0;
     will-change: transform;
     transition: opacity 0.15s;
+    user-select: none;
+    -webkit-user-drag: none;
 }
 
 /* Metadata overlay (top-left white text) */
@@ -1450,19 +1458,11 @@ button:disabled {
     overflow-x: auto;
     overflow-y: hidden;
     scroll-behavior: smooth;
+    scrollbar-width: none;
 }
 
 .filmstrip-scroll::-webkit-scrollbar {
-    height: 3px;
-}
-
-.filmstrip-scroll::-webkit-scrollbar-track {
-    background: #0a0a0a;
-}
-
-.filmstrip-scroll::-webkit-scrollbar-thumb {
-    background: #333;
-    border-radius: 2px;
+    display: none;
 }
 
 .filmstrip-thumb {
