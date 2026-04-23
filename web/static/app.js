@@ -1327,6 +1327,7 @@ const PhotoArchive = (() => {
             thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
             scroll.appendChild(thumb);
         }
+        centerFilmstripActive(scroll);
     }
 
     function updateFilmstripActive() {
@@ -1692,6 +1693,7 @@ const PhotoArchive = (() => {
         wrap.addEventListener('wheel', (e) => {
             e.preventDefault();
             const img = document.getElementById('loupe-img');
+            requestLoupeFullImage();
             if (img) img.style.transition = 'opacity 0.15s';
             const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
             loupeZoomTo(loupeScale * factor, e.clientX, e.clientY, 'custom');
@@ -2362,7 +2364,7 @@ const PhotoArchive = (() => {
 
     const PRELOAD_LIMIT = 200;
 
-    function preloadImage(url) {
+    function preloadImage(url, priority = 'auto') {
         if (preloaded.has(url)) return;
         // Evict oldest entries when limit reached
         if (preloaded.size >= PRELOAD_LIMIT) {
@@ -2373,6 +2375,7 @@ const PhotoArchive = (() => {
             const img = new Image();
             img.onload = resolve;
             img.onerror = resolve;
+            if ('fetchPriority' in img) img.fetchPriority = priority;
             img.src = url;
         });
         preloaded.set(url, promise);
