@@ -1319,11 +1319,19 @@ const PhotoArchive = (() => {
         scroll.querySelectorAll('.filmstrip-thumb').forEach((el, i) => {
             el.classList.toggle('active', i === lightboxIndex);
         });
-        // Scroll active thumb into view
+        centerFilmstripActive(scroll);
+    }
+
+    function centerFilmstripActive(scroll) {
         const active = scroll.querySelector('.filmstrip-thumb.active');
-        if (active) {
-            active.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
-        }
+        if (!active) return;
+
+        requestAnimationFrame(() => {
+            const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+            const centeredLeft = active.offsetLeft + (active.offsetWidth / 2) - (scroll.clientWidth / 2);
+            const targetLeft = Math.max(0, Math.min(maxScroll, centeredLeft));
+            scroll.scrollTo({ left: targetLeft, behavior: 'smooth' });
+        });
     }
 
     // Loupe zoom/pan state
@@ -1336,28 +1344,44 @@ const PhotoArchive = (() => {
     let loupeIsFit = true;
     let _loupeDragMoved = false;
     let _loupeDragging = false;
-    const loupeRefLong = 3840; // lg thumbnail long side — reference for 1:1 zoom
+    let loupeZoomMode = 'fit';
+    let loupeDisplayedTierRank = -1;
+    let loupeImageToken = 0;
+    const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
+    const LOUPE_PRELOAD_RADIUS = 3;
+    const LOUPE_FULL_PRELOAD_RADIUS = 1;
 
     function showLoupeImage(img) {
         const loupe = document.getElementById('loupe');
         const loupeImg = document.getElementById('loupe-img');
+        if (!loupe || !loupeImg) return;
 
         // Pre-calculate fit dimensions from aspect ratio so all progressive
         // loads (sm/md/lg) display at the same screen size — no size jumps
+        const token = ++loupeImageToken;
+        loupeDisplayedTierRank = -1;
         loupeIsFit = true;
+        loupeZoomMode = 'fit';
         const ar = img.aspect_ratio || 1.5;
-        const refLong = 3840;
-        loupeNatW = ar >= 1 ? refLong : Math.round(refLong * ar);
-        loupeNatH = ar >= 1 ? Math.round(refLong / ar) : refLong;
+        loupeNatW = ar >= 1 ? loupeRefLong : Math.round(loupeRefLong * ar);
+        loupeNatH = ar >= 1 ? Math.round(loupeRefLong / ar) : loupeRefLong;
+        loupeImg.style.transition = 'opacity 0.15s';
+        loupeApplyImageSize();
 
-        // Progressive loading: sm (instant) → md (fast) → lg (full quality)
+        document.body.classList.add('loupe-open');
+        loupe.classList.remove('hidden');
+        loupeCenterFit({ animate: false });
+
+        // Progressive loading: sm -> md -> lg -> original. Loads can finish
+        // out of order, so rank checks prevent a late small image from
+        // replacing a sharper one.
+        loupeImg.alt = img.filename || '';
         loupeImg.src = img.thumb_url;
-        const md = new Image();
-        md.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = md.src; };
-        md.src = `/api/thumb/md/${img.id}`;
-        const lg = new Image();
-        lg.onload = () => { if (libraryImages[lightboxIndex]?.id === img.id) loupeImg.src = lg.src; };
-        lg.src = `/api/thumb/lg/${img.id}`;
+        loupeDisplayedTierRank = 0;
+        loadLoupeTier(img, img.thumb_url, 0, token, { adoptDimensions: false });
+        loadLoupeTier(img, `/api/thumb/md/${img.id}`, 1, token, { adoptDimensions: false });
+        loadLoupeTier(img, `/api/thumb/lg/${img.id}`, 2, token, { adoptDimensions: false });
+        loadLoupeTier(img, `/api/full/${img.id}`, 3, token, { adoptDimensions: true });
 
         // Populate metadata overlay
         const filenameEl = document.getElementById('loupe-overlay-filename');
@@ -1371,30 +1395,9 @@ const PhotoArchive = (() => {
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
         if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} comparisons`;
 
-        loupe.classList.remove('hidden');
-
-        // Apply fit transform immediately so sm appears at the same size as lg
-        const wrap = document.getElementById('loupe-image-wrap');
-        if (wrap) {
-            loupeFitScale = loupeComputeFitScale();
-            loupeScale = loupeFitScale;
-            loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
-            loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
-            loupeApplyTransform();
-            wrap.style.cursor = 'zoom-in';
-        }
-
         updateFilmstripActive();
 
-        // Warm-load adjacent images at full res for instant navigation
-        for (const delta of [-1, 1]) {
-            const ni = lightboxIndex + delta;
-            if (ni >= 0 && ni < libraryImages.length) {
-                const nid = libraryImages[ni].id;
-                preloadImage(`/api/thumb/md/${nid}`);
-                preloadImage(`/api/thumb/lg/${nid}`);
-            }
-        }
+        preloadLoupeNeighbors();
 
         // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
@@ -1417,6 +1420,96 @@ const PhotoArchive = (() => {
         }).catch(() => {});
     }
 
+    function isCurrentLoupeImage(img, token) {
+        return token === loupeImageToken && libraryImages[lightboxIndex]?.id === img.id;
+    }
+
+    function loupeApplyImageSize() {
+        const img = document.getElementById('loupe-img');
+        if (!img || !loupeNatW || !loupeNatH) return;
+        img.style.width = `${loupeNatW}px`;
+        img.style.height = `${loupeNatH}px`;
+    }
+
+    function loadLoupeTier(img, url, rank, token, { adoptDimensions = false } = {}) {
+        if (!url) return;
+        const probe = new Image();
+        probe.decoding = 'async';
+        probe.onload = () => {
+            if (!isCurrentLoupeImage(img, token) || rank <= loupeDisplayedTierRank) return;
+
+            if (adoptDimensions && probe.naturalWidth > 0 && probe.naturalHeight > 0) {
+                loupeAdoptSourceDimensions(probe.naturalWidth, probe.naturalHeight);
+            }
+
+            const loupeImg = document.getElementById('loupe-img');
+            if (!loupeImg) return;
+            loupeDisplayedTierRank = rank;
+            loupeImg.src = probe.src;
+        };
+        probe.onerror = () => {};
+        probe.src = url;
+    }
+
+    function loupeAdoptSourceDimensions(width, height) {
+        const wrap = document.getElementById('loupe-image-wrap');
+        const oldW = loupeNatW;
+        const oldH = loupeNatH;
+        if (!wrap || !oldW || !oldH || width <= 0 || height <= 0) {
+            loupeNatW = width;
+            loupeNatH = height;
+            loupeApplyImageSize();
+            return;
+        }
+
+        if (Math.abs(oldW - width) < 1 && Math.abs(oldH - height) < 1) return;
+
+        const focusX = Math.max(0, Math.min(1, ((wrap.clientWidth / 2) - loupePanX) / loupeScale / oldW));
+        const focusY = Math.max(0, Math.min(1, ((wrap.clientHeight / 2) - loupePanY) / loupeScale / oldH));
+        const oldScale = loupeScale;
+        const wasFit = loupeZoomMode === 'fit' || loupeIsFit;
+        const wasOneToOne = loupeZoomMode === 'one-to-one';
+
+        loupeNatW = width;
+        loupeNatH = height;
+        loupeApplyImageSize();
+        loupeFitScale = loupeComputeFitScale();
+
+        if (wasFit) {
+            loupeScale = loupeFitScale;
+            loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
+            loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+            loupeIsFit = true;
+            loupeZoomMode = 'fit';
+        } else {
+            loupeScale = wasOneToOne ? 1 : oldScale * (oldW / loupeNatW);
+            loupePanX = (wrap.clientWidth / 2) - (focusX * loupeNatW * loupeScale);
+            loupePanY = (wrap.clientHeight / 2) - (focusY * loupeNatH * loupeScale);
+            loupeIsFit = false;
+            loupeZoomMode = wasOneToOne ? 'one-to-one' : 'custom';
+            loupeClampPan();
+        }
+
+        loupeApplyTransform();
+        wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
+    }
+
+    function preloadLoupeNeighbors() {
+        for (let distance = 1; distance <= LOUPE_PRELOAD_RADIUS; distance++) {
+            for (const offset of [-distance, distance]) {
+                const ni = lightboxIndex + offset;
+                if (ni < 0 || ni >= libraryImages.length) continue;
+                const neighbor = libraryImages[ni];
+                preloadImage(neighbor.thumb_url);
+                preloadImage(`/api/thumb/md/${neighbor.id}`);
+                preloadImage(`/api/thumb/lg/${neighbor.id}`);
+                if (distance <= LOUPE_FULL_PRELOAD_RADIUS) {
+                    preloadImage(`/api/full/${neighbor.id}`);
+                }
+            }
+        }
+    }
+
     // ==================== LOUPE ZOOM/PAN ====================
 
     function loupeComputeFitScale() {
@@ -1431,22 +1524,24 @@ const PhotoArchive = (() => {
         img.style.transform = `translate(${loupePanX}px, ${loupePanY}px) scale(${loupeScale})`;
     }
 
-    function loupeCenterFit() {
+    function loupeCenterFit({ animate = true } = {}) {
         const wrap = document.getElementById('loupe-image-wrap');
         const img = document.getElementById('loupe-img');
         if (!wrap || !img) return;
+        loupeApplyImageSize();
         loupeFitScale = loupeComputeFitScale();
         loupeScale = loupeFitScale;
         loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
         loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
         loupeIsFit = true;
-        img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
+        loupeZoomMode = 'fit';
+        if (animate) img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
         loupeApplyTransform();
         wrap.style.cursor = 'zoom-in';
-        setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
+        if (animate) setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
     }
 
-    function loupeZoomTo(newScale, pivotX, pivotY) {
+    function loupeZoomTo(newScale, pivotX, pivotY, mode = 'custom') {
         const wrap = document.getElementById('loupe-image-wrap');
         if (!wrap) return;
 
@@ -1454,15 +1549,15 @@ const PhotoArchive = (() => {
         const imgX = (pivotX - rect.left - loupePanX) / loupeScale;
         const imgY = (pivotY - rect.top - loupePanY) / loupeScale;
 
-        const oneToOne = loupeRefLong / Math.max(loupeNatW, loupeNatH, 1);
-        const minScale = Math.min(loupeFitScale, oneToOne) * 0.5;
-        const maxScale = Math.max(oneToOne * 4, loupeFitScale * 2);
+        const minScale = Math.max(0.01, Math.min(loupeFitScale, 1) * 0.5);
+        const maxScale = Math.max(4, loupeFitScale * 4);
         loupeScale = Math.max(minScale, Math.min(maxScale, newScale));
 
         loupePanX = pivotX - rect.left - imgX * loupeScale;
         loupePanY = pivotY - rect.top - imgY * loupeScale;
 
         loupeIsFit = Math.abs(loupeScale - loupeFitScale) < 0.001;
+        loupeZoomMode = loupeIsFit ? 'fit' : mode;
         loupeClampPan();
         loupeApplyTransform();
         wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
@@ -1493,28 +1588,6 @@ const PhotoArchive = (() => {
         const wrap = document.getElementById('loupe-image-wrap');
         const img = document.getElementById('loupe-img');
         if (!wrap || !img) return;
-
-        // Handle progressive image loads (sm -> md -> lg)
-        img.addEventListener('load', () => {
-            const oldNatW = loupeNatW;
-            loupeNatW = img.naturalWidth;
-            loupeNatH = img.naturalHeight;
-            loupeFitScale = loupeComputeFitScale();
-
-            if (loupeIsFit || !oldNatW) {
-                loupeScale = loupeFitScale;
-                loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
-                loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
-                loupeApplyTransform();
-                wrap.style.cursor = 'zoom-in';
-            } else {
-                // Progressive upgrade while zoomed — maintain visible area
-                const ratio = oldNatW / loupeNatW;
-                loupeScale *= ratio;
-                loupeClampPan();
-                loupeApplyTransform();
-            }
-        });
 
         // Drag to pan
         let dragStartX = 0, dragStartY = 0;
@@ -1560,11 +1633,11 @@ const PhotoArchive = (() => {
             if (_loupeDragMoved) { _loupeDragMoved = false; return; }
 
             if (loupeIsFit) {
-                // Zoom to 1:1 pixel scale (relative to lg resolution) centered on click
-                const targetScale = loupeRefLong / Math.max(loupeNatW, loupeNatH, 1);
+                // 1 image pixel == 1 CSS pixel against the current highest-res basis.
+                const targetScale = 1;
                 const img = document.getElementById('loupe-img');
                 if (img) img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
-                loupeZoomTo(targetScale, e.clientX, e.clientY);
+                loupeZoomTo(targetScale, e.clientX, e.clientY, 'one-to-one');
                 setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
             } else {
                 loupeCenterFit();
@@ -1577,7 +1650,7 @@ const PhotoArchive = (() => {
             const img = document.getElementById('loupe-img');
             if (img) img.style.transition = 'opacity 0.15s';
             const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-            loupeZoomTo(loupeScale * factor, e.clientX, e.clientY);
+            loupeZoomTo(loupeScale * factor, e.clientX, e.clientY, 'custom');
         }, { passive: false });
 
         // Recalculate fit on window resize
@@ -1585,9 +1658,9 @@ const PhotoArchive = (() => {
             if (!loupeNatW) return;
             loupeFitScale = loupeComputeFitScale();
             if (loupeIsFit) {
-                loupeScale = loupeFitScale;
-                loupePanX = (wrap.clientWidth - loupeNatW * loupeScale) / 2;
-                loupePanY = (wrap.clientHeight - loupeNatH * loupeScale) / 2;
+                loupeCenterFit({ animate: false });
+            } else {
+                loupeClampPan();
                 loupeApplyTransform();
             }
         });
@@ -1608,7 +1681,11 @@ const PhotoArchive = (() => {
     function closeLightbox() {
         const loupe = document.getElementById('loupe');
         if (loupe) loupe.classList.add('hidden');
+        document.body.classList.remove('loupe-open');
+        loupeImageToken++;
+        loupeDisplayedTierRank = -1;
         loupeIsFit = true;
+        loupeZoomMode = 'fit';
         loupeNatW = 0;
         loupeNatH = 0;
         lightboxIndex = -1;
