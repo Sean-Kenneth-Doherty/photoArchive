@@ -57,14 +57,14 @@ def _rows_to_matrix(rows, *, overallocate: bool = True):
     return image_ids, matrix
 
 
-def _db_file_signature() -> list[tuple[str, int, int]]:
+def _db_file_signature() -> list[list[str | int]]:
     signature = []
     for path in (db.DB_PATH, f"{db.DB_PATH}-wal", f"{db.DB_PATH}-shm"):
         try:
             stat = os.stat(path)
-            signature.append((os.path.basename(path), stat.st_size, stat.st_mtime_ns))
+            signature.append([os.path.basename(path), stat.st_size, stat.st_mtime_ns])
         except OSError:
-            signature.append((os.path.basename(path), -1, -1))
+            signature.append([os.path.basename(path), -1, -1])
     return signature
 
 
@@ -76,8 +76,11 @@ def _load_snapshot_sync(expected_count: int):
             return None
         if meta.get("db_signature") != _db_file_signature():
             return None
-        ids = np.load(SNAPSHOT_IDS_PATH, mmap_mode="r")
-        matrix = np.load(SNAPSHOT_MATRIX_PATH, mmap_mode="r")
+        # Load into RAM rather than returning a memmap. Search/similar should
+        # pay a predictable warmup cost instead of page-faulting during the
+        # first similarity matmul.
+        ids = np.load(SNAPSHOT_IDS_PATH)
+        matrix = np.load(SNAPSHOT_MATRIX_PATH)
         if len(ids) != expected_count or matrix.shape[0] != expected_count:
             return None
         return ids.astype(np.int64).tolist(), matrix
