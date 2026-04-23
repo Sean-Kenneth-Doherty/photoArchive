@@ -968,7 +968,7 @@ async def _run_pregen_phase(size: str) -> int:
         generated += 1
         _pregen_status["last_generated_at"] = _current_time()
         _pregen_status["generated_this_session"] += 1
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.005)  # minimal yield — HDD read is the bottleneck, not CPU
 
         if generated >= PREGENERATE_GENERATE_BATCH:
             break

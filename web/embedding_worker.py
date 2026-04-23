@@ -16,9 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-# Dedicated executor — keeps embedding GIL holds off the default pool
-# so thumbnail serving and other async tasks aren't blocked
-_embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed")
+# Dedicated executors — separate CPU prep from GPU encode
+_embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed-gpu")
+_preload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed-preload")
 
 import ai_models
 import db
@@ -31,7 +31,7 @@ if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
 EMBEDDING_DIM = 2048  # Native output dimension for Qwen3-VL-Embedding-2B
-BATCH_SIZE = 2  # Smaller batches = shorter GIL holds = less event loop blocking
+BATCH_SIZE = 4  # Back to 4 — pipelined loading keeps GPU fed without blocking
 EMBED_SPEED_WINDOW_SECONDS = 300
 EMBED_CANDIDATE_MULTIPLIER = 16
 EMBED_RETRY_SECONDS = 600
@@ -177,14 +177,12 @@ def _load_image_for_embedding(image_id: int, path: str):
     return thumbnails.load_embedding_image(path, image_id)
 
 
-def _embed_images(
-    model,
+def _preload_images(
     image_refs: list[tuple[int, str]],
-) -> tuple[list[np.ndarray | None], list[str | None]]:
-    """Embed images from file paths. Returns vectors plus per-image error strings."""
+) -> tuple[list, list[int], list[str | None]]:
+    """CPU stage: load images from SSD cache and resize. No GPU work."""
     from PIL import Image as PILImage
 
-    results = [None] * len(image_refs)
     errors = [None] * len(image_refs)
     valid = []
     valid_indices = []
@@ -195,13 +193,14 @@ def _embed_images(
             if img is None:
                 errors[i] = "md thumbnail not cached yet"
                 continue
-            # Resize to max 1024px on long side to keep VRAM reasonable
             max_side = max(img.size)
             if max_side > 1024:
                 scale = 1024 / max_side
                 img = img.resize((int(img.width * scale), int(img.height * scale)), PILImage.LANCZOS)
             if img.mode != "RGB":
-                img = img.convert("RGB")
+                converted = img.convert("RGB")
+                img.close()
+                img = converted
             valid.append(img)
             valid_indices.append(i)
         except Exception as e:
@@ -212,6 +211,15 @@ def _embed_images(
                     img.close()
                 except Exception:
                     pass
+    return valid, valid_indices, errors
+
+
+def _encode_images(
+    model, valid: list, valid_indices: list[int], n_refs: int,
+) -> tuple[list[np.ndarray | None], list[str | None]]:
+    """GPU stage: encode pre-loaded PIL images."""
+    results = [None] * n_refs
+    errors = [None] * n_refs
 
     if not valid:
         return results, errors
@@ -220,18 +228,17 @@ def _embed_images(
         embeddings = model.encode(valid, normalize_embeddings=True)
         for idx, valid_i in enumerate(valid_indices):
             results[valid_i] = embeddings[idx].astype(np.float32)
-        return results, errors
     except Exception as e:
         failure = f"{type(e).__name__}: {e}"
         for valid_i in valid_indices:
             errors[valid_i] = failure
-        return results, errors
     finally:
         for img in valid:
             try:
                 img.close()
             except Exception:
                 pass
+    return results, errors
 
 
 def encode_text(query: str) -> np.ndarray | None:
@@ -296,7 +303,7 @@ async def run_embedding_worker():
                 _loaded_model_revision = model_revision
                 _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
 
-            # Phase 1: Embed unembedded images
+            # Phase 1: Embed unembedded images with pipelined CPU/GPU
             candidates = await db.get_unembedded_images(limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER)
             unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
@@ -304,10 +311,20 @@ async def run_embedding_worker():
                 image_refs = [(row["id"], row["filepath"]) for row in unembedded]
                 embed_started = time.perf_counter()
 
-                vectors, errors = await loop.run_in_executor(
-                    _embed_executor, _embed_images, _model, image_refs
+                # CPU: preload and resize images (runs on preload thread)
+                valid, valid_indices, preload_errors = await loop.run_in_executor(
+                    _preload_executor, _preload_images, image_refs
                 )
-                await asyncio.sleep(0)  # yield to event loop after GPU work
+                await asyncio.sleep(0)  # yield between CPU and GPU stages
+
+                # GPU: encode the pre-loaded images (runs on GPU thread)
+                vectors, encode_errors = await loop.run_in_executor(
+                    _embed_executor, _encode_images, _model, valid, valid_indices, len(image_refs)
+                )
+                await asyncio.sleep(0)  # yield after GPU work
+
+                # Merge errors from both stages
+                errors = [preload_errors[i] or encode_errors[i] for i in range(len(image_refs))]
 
                 batch = []
                 failed = []
