@@ -1112,9 +1112,16 @@ async def api_collections(n_clusters: int = 20):
     return {"collections": collections}
 
 
+_folders_cache = {"data": None, "count": 0}
+
 @app.get("/api/folders")
 async def api_folders():
-    """Get folder tree with image counts."""
+    """Get folder tree with image counts (cached)."""
+    stats = await db.get_stats()
+    total = stats["kept"] + stats["maybe"]
+    if _folders_cache["data"] and _folders_cache["count"] == total:
+        return _folders_cache["data"]
+
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
@@ -1143,7 +1150,10 @@ async def api_folders():
     # Sort by path and return
     folders = [{"path": k, "count": v, "depth": k.count(os.sep)}
                for k, v in sorted(folder_counts.items())]
-    return {"folders": folders, "root": root}
+    result = {"folders": folders, "root": root}
+    _folders_cache["data"] = result
+    _folders_cache["count"] = total
+    return result
 
 
 @app.get("/api/stats")

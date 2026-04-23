@@ -31,6 +31,13 @@ CREATE INDEX IF NOT EXISTS idx_images_elo ON images(elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_comparisons ON images(comparisons);
 CREATE INDEX IF NOT EXISTS idx_comparisons_pair ON comparisons(winner_id, loser_id);
 
+-- Composite indexes for fast sorted queries with status filter
+CREATE INDEX IF NOT EXISTS idx_images_status_elo ON images(status, elo DESC);
+CREATE INDEX IF NOT EXISTS idx_images_status_elo_asc ON images(status, elo ASC);
+CREATE INDEX IF NOT EXISTS idx_images_status_id ON images(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_images_status_comparisons ON images(status, comparisons DESC);
+CREATE INDEX IF NOT EXISTS idx_images_status_filename ON images(status, filename ASC);
+
 CREATE TABLE IF NOT EXISTS embeddings (
     image_id INTEGER PRIMARY KEY REFERENCES images(id),
     embedding BLOB NOT NULL,
