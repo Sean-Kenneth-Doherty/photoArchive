@@ -453,6 +453,62 @@ async def cull_undo():
 
 # --- Mosaic Ranking API ---
 
+async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
+    """Select images that maximize visual diversity using embedding distance."""
+    import random
+    if len(candidates) <= count:
+        return candidates
+
+    try:
+        import numpy as np
+        from embedding_worker import blob_to_vec
+
+        # Get embeddings for candidates
+        all_embeddings = await db.get_all_embeddings()
+        embed_map = {r["image_id"]: blob_to_vec(r["embedding"]) for r in all_embeddings}
+
+        # Filter to candidates with embeddings
+        with_emb = [(c, embed_map[c["id"]]) for c in candidates if c["id"] in embed_map]
+        without_emb = [c for c in candidates if c["id"] not in embed_map]
+
+        if len(with_emb) < count:
+            # Not enough embeddings — fall back to random + explore
+            sample = [c for c, _ in with_emb]
+            remaining = count - len(sample)
+            if without_emb and remaining > 0:
+                sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
+            return sample
+
+        # Greedy diverse selection: pick first randomly (favor least-compared),
+        # then iteratively pick the image most dissimilar from all selected
+        explore_weights = [1.0 / (c["comparisons"] + 1) for c, _ in with_emb]
+        first = random.choices(range(len(with_emb)), weights=explore_weights, k=1)[0]
+
+        selected_indices = [first]
+        vecs = np.array([v for _, v in with_emb])
+
+        for _ in range(count - 1):
+            # Compute min similarity to any already-selected image for each candidate
+            selected_vecs = vecs[selected_indices]
+            sims = vecs @ selected_vecs.T  # (N, len(selected))
+            max_sim_to_selected = sims.max(axis=1)  # most similar selected image per candidate
+
+            # Mask already-selected
+            for si in selected_indices:
+                max_sim_to_selected[si] = 999
+
+            # Pick the one with lowest max similarity (most different from all selected)
+            next_idx = int(np.argmin(max_sim_to_selected))
+            selected_indices.append(next_idx)
+
+        return [with_emb[i][0] for i in selected_indices]
+
+    except Exception:
+        # Fallback to random if embeddings unavailable
+        import random
+        return random.sample(candidates, min(count, len(candidates)))
+
+
 @app.get("/api/mosaic/next")
 async def mosaic_next(
     n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0,
@@ -494,36 +550,31 @@ async def mosaic_next(
         img["effective_elo"] = img["elo"]
     count = min(n, len(candidates))
 
-    if strategy == "learn":
-        # AI-guided: favor images the taste model is most uncertain about
-        weights = []
-        for img in candidates:
-            u = img.get("uncertainty")
-            if u is not None:
-                weights.append(u + 0.01)  # small floor to avoid zero
-            else:
-                weights.append(1.0 / (img["comparisons"] + 1))  # fallback to explore
-    elif strategy == "explore":
-        # Favor least-compared images
-        weights = [1.0 / (img["comparisons"] + 1) for img in candidates]
-    elif strategy == "compete" and grid_elo > 0:
-        # Favor images with effective Elo close to the grid average
-        weights = [1.0 / (abs(img["effective_elo"] - grid_elo) + 50) for img in candidates]
-    elif strategy == "top":
-        # Favor highest-rated within the top 50
-        weights = [img["effective_elo"] for img in candidates]
+    if strategy == "diverse":
+        # Maximize visual diversity: pick images that are most dissimilar from each other
+        sample = await _diverse_sample(candidates, count)
     else:
-        # Random — uniform
-        weights = [1.0 for _ in candidates]
+        if strategy == "explore":
+            # Favor least-compared images
+            weights = [1.0 / (img["comparisons"] + 1) for img in candidates]
+        elif strategy == "compete" and grid_elo > 0:
+            # Favor images with effective Elo close to the grid average
+            weights = [1.0 / (abs(img["effective_elo"] - grid_elo) + 50) for img in candidates]
+        elif strategy == "top":
+            # Favor highest-rated within the top 50
+            weights = [img["effective_elo"] for img in candidates]
+        else:
+            # Random — uniform
+            weights = [1.0 for _ in candidates]
 
-    sample = []
-    indices = list(range(len(candidates)))
-    for _ in range(count):
-        if not indices:
-            break
-        chosen = random.choices(indices, weights=[weights[i] for i in indices], k=1)[0]
-        sample.append(candidates[chosen])
-        indices.remove(chosen)
+        sample = []
+        indices = list(range(len(candidates)))
+        for _ in range(count):
+            if not indices:
+                break
+            chosen = random.choices(indices, weights=[weights[i] for i in indices], k=1)[0]
+            sample.append(candidates[chosen])
+            indices.remove(chosen)
 
     result = []
     for img in sample:
