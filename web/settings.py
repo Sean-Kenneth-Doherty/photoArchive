@@ -71,8 +71,9 @@ def _derive_runtime_tuning(memory_cache_gb: float) -> dict:
         elif system_memory_gb < 16:
             user_workers = min(user_workers, 6)
 
-    prefetch_workers = _clamp(max(1, user_workers // 2), 1, 6)
     cache_aggression = max(1, min(4, int(memory_cache_gb / 0.5) if memory_cache_gb > 0 else 1))
+    prefetch_target = min(user_workers - 2, user_workers // 2 + cache_aggression - 1)
+    prefetch_workers = _clamp(max(2, prefetch_target), 2, 8)
     warm_factor = max(1, prefetch_workers * cache_aggression)
 
     return {
