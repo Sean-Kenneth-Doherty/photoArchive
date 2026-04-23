@@ -198,6 +198,18 @@ def _replace_executor(
     return replacement
 
 
+def _memory_get_fast(size: str, image_id: int) -> bytes | None:
+    """Fast memory check — no signature validation."""
+    key = (size, image_id)
+    with _cache_lock:
+        entry = _memory_cache.get(key)
+        if entry is None:
+            return None
+        _, data = entry
+        _memory_cache.move_to_end(key)
+        return data
+
+
 def _memory_get(size: str, image_id: int, source_signature: str) -> bytes | None:
     key = (size, image_id)
     global _memory_cache_bytes
@@ -401,6 +413,50 @@ def _get_disk_entry(
             conn.close()
 
 
+# In-memory index: (size, image_id) -> disk path. Built on startup, updated on writes.
+_disk_path_index: dict[tuple[str, int], str] = {}
+_disk_index_built = False
+
+
+def _build_disk_path_index():
+    """Load all cache entry paths into memory for fast lookup."""
+    global _disk_index_built
+    if not SSD_CACHE_DIR:
+        _disk_index_built = True
+        return
+    with _meta_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute(
+                "SELECT size, image_id, path FROM cache_entries WHERE cache_root = ?",
+                (SSD_CACHE_DIR,),
+            ).fetchall()
+        finally:
+            conn.close()
+    for row in rows:
+        _disk_path_index[(row["size"], row["image_id"])] = row["path"]
+    _disk_index_built = True
+
+
+def _index_disk_entry(size: str, image_id: int, path: str):
+    """Update the in-memory index when a new cache entry is written."""
+    _disk_path_index[(size, image_id)] = path
+
+
+def fast_disk_read(size: str, image_id: int) -> bytes | None:
+    """Fast path: read thumbnail from SSD via in-memory index. No SQLite, no locks, no HDD stat."""
+    if not _disk_index_built:
+        _build_disk_path_index()
+    path = _disk_path_index.get((size, image_id))
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> bytes | None:
     row = _get_disk_entry(size, image_id, source_signature)
     if row is None:
@@ -458,6 +514,7 @@ def _store_disk_entry(size: str, image_id: int, source_signature: str, path: str
             )
             _enforce_tier_budget_locked(conn, size)
             conn.commit()
+            _index_disk_entry(size, image_id, path)
         finally:
             conn.close()
 
@@ -1069,6 +1126,7 @@ def configure(config: dict):
         _prefetch_workers_count = prefetch_workers
 
     _enforce_all_disk_budgets()
+    _build_disk_path_index()
 
 
 def start_pregeneration() -> dict:

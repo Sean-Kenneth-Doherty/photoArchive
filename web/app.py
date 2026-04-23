@@ -165,18 +165,31 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
     if size not in thumbnails.SIZES:
         return JSONResponse({"error": "Invalid size"}, status_code=400)
 
+    # Fast path: check memory cache, then SSD disk cache — no DB lookup or HDD stat
+    data = thumbnails._memory_get_fast(size, image_id)
+    if data is None:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, thumbnails.fast_disk_read, size, image_id
+        )
+    if data:
+        headers = {
+            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+            "ETag": f'"{size}-{image_id}"',
+        }
+        if request.headers.get("if-none-match") == headers["ETag"]:
+            return Response(status_code=304, headers=headers)
+        return Response(content=data, media_type="image/jpeg", headers=headers)
+
+    # Slow path: need to generate from source — requires DB lookup for filepath
     image = await db.get_image_by_id(image_id)
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
-
-    headers = thumbnails.response_headers(image["filepath"], size, image_id)
-    if request.headers.get("if-none-match") == headers["ETag"]:
-        return Response(status_code=304, headers=headers)
 
     data = await thumbnails.get_thumbnail(image["filepath"], size, image_id)
     if not data:
         return JSONResponse({"error": "Thumbnail generation failed"}, status_code=500)
 
+    headers = thumbnails.response_headers(image["filepath"], size, image_id)
     return Response(content=data, media_type="image/jpeg", headers=headers)
 
 
