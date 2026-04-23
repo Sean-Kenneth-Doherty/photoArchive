@@ -24,7 +24,7 @@ const PhotoArchive = (() => {
     const MOSAIC_NEIGHBOR_LIMIT = 8;
     const COMPARE_NEIGHBOR_PAIRS = 4;
     const FILMSTRIP_WINDOW_RADIUS = 55;
-    const LOUPE_FULL_LOAD_DELAY_MS = 750;
+    const LOUPE_FULL_LOAD_DELAY_MS = 0;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
@@ -1373,6 +1373,7 @@ const PhotoArchive = (() => {
     let loupeFullLoadToken = 0;
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
+    const LOUPE_FULL_PRELOAD_RADIUS = 1;
 
     function showLoupeImage(img) {
         const loupe = document.getElementById('loupe');
@@ -1550,6 +1551,9 @@ const PhotoArchive = (() => {
                 preloadImage(neighbor.thumb_url, 'low');
                 preloadImage(`/api/thumb/md/${neighbor.id}`, 'low');
                 preloadImage(`/api/thumb/lg/${neighbor.id}`, 'low');
+                if (distance <= LOUPE_FULL_PRELOAD_RADIUS) {
+                    preloadImage(`/api/full/${neighbor.id}`, 'low');
+                }
             }
         }
     }
