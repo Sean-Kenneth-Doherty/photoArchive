@@ -82,6 +82,15 @@ async def startup():
             pass
     asyncio.create_task(_warm_embed_cache())
 
+    async def _warm_interaction_caches():
+        await asyncio.sleep(0.25)
+        await asyncio.gather(
+            _get_pairing_images(),
+            _get_past_matchups(),
+            return_exceptions=True,
+        )
+    asyncio.create_task(_warm_interaction_caches())
+
 
 async def classify_orientations_background():
     """Continuously classify unclassified images by reading just the image header."""
@@ -535,9 +544,10 @@ async def _get_pairing_images():
     _pairing_cache["valid"] = True
     return images
 
-def _invalidate_pairing_cache():
+def _invalidate_pairing_cache(*, matchups: bool = False):
     _pairing_cache["valid"] = False
-    _matchups_cache["valid"] = False
+    if matchups:
+        _matchups_cache["valid"] = False
 
 
 async def _get_past_matchups():
@@ -547,6 +557,13 @@ async def _get_past_matchups():
     _matchups_cache["data"] = matchups
     _matchups_cache["valid"] = True
     return matchups
+
+
+def _add_past_matchups(pairs: list[tuple[int, int]]):
+    if not _matchups_cache["valid"] or _matchups_cache["data"] is None:
+        return
+    for a, b in pairs:
+        _matchups_cache["data"].add((min(a, b), max(a, b)))
 
 
 def _invalidate_active_caches():
@@ -796,6 +813,7 @@ async def mosaic_pick(request: Request):
 
     # Invalidate pairing cache since Elo changed
     _invalidate_pairing_cache()
+    _add_past_matchups([(picked_id, row[1]) for row in comparison_rows])
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
     valid_loser_ids = [row[1] for row in comparison_rows]
@@ -866,6 +884,7 @@ async def submit_comparison(request: Request):
 
     # Fire-and-forget: propagate Elo to similar images via embeddings
     _invalidate_pairing_cache()
+    _add_past_matchups([(winner_id, loser_id)])
     asyncio.create_task(elo_propagation.propagate_comparison(winner_id, loser_id, k))
 
     return {
@@ -879,7 +898,7 @@ async def submit_comparison(request: Request):
 async def compare_undo():
     result = await db.undo_last_comparison()
     if result:
-        _invalidate_pairing_cache()
+        _invalidate_pairing_cache(matchups=True)
         return {"ok": True, **result}
     return JSONResponse({"error": "Nothing to undo"}, status_code=400)
 
