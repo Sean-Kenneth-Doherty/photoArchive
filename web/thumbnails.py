@@ -1030,6 +1030,8 @@ async def prefetch_images(images: list[dict], size: str, limit: int | None = Non
         filepath = img.get("filepath")
         if image_id is None or not filepath:
             continue
+        if _memory_get_entry_fast(size, image_id) is not None or fast_disk_has(size, image_id):
+            continue
         if has_cached(size, filepath, image_id):
             continue
         asyncio.create_task(
