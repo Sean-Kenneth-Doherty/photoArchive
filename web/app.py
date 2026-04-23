@@ -491,7 +491,7 @@ async def mosaic_next(
         candidates = [c for c in candidates if f"/{folder}/" in c.get("filepath", "")]
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
-        img["effective_elo"] = img["elo"] if img["comparisons"] > 0 else (img.get("predicted_elo") or img["elo"])
+        img["effective_elo"] = img["elo"]
     count = min(n, len(candidates))
 
     if strategy == "learn":
@@ -703,12 +703,10 @@ async def api_rankings(
     result = []
     for img in images:
         d = dict(img)
-        predicted = d.get("predicted_elo")
         result.append({
             "id": d["id"],
             "filename": d["filename"],
             "elo": round(d["elo"], 1),
-            "predicted_elo": round(predicted, 1) if predicted is not None else None,
             "comparisons": d["comparisons"],
             "status": d["status"],
             "aspect_ratio": d.get("aspect_ratio") or 1.5,
@@ -1148,10 +1146,6 @@ async def build_ai_status():
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
-            "SELECT COUNT(*) as c FROM images WHERE predicted_elo IS NOT NULL"
-        )
-        predicted = (await cursor.fetchone())["c"]
-        cursor = await conn.execute(
             "SELECT COUNT(*) as c FROM images WHERE comparisons > 0"
         )
         compared = (await cursor.fetchone())["c"]
@@ -1169,8 +1163,6 @@ async def build_ai_status():
         "total_kept": total_kept,
         "remaining": remaining,
         "progress_pct": progress_pct,
-        "model_trained": predicted > 0,
-        "predicted": predicted,
         "compared": compared,
         "model_installed": model_status["installed"],
         "installing": model_status["install"]["running"],

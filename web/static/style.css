@@ -1191,15 +1191,6 @@ button:disabled {
     display: none;
 }
 
-.rank-ai-tag {
-    font-size: 9px;
-    padding: 1px 4px;
-    border-radius: 3px;
-    background: rgba(108, 180, 238, 0.15);
-    color: #6cb4ee;
-    font-weight: 600;
-    margin-left: 4px;
-    vertical-align: middle;
 }
 
 /* Elo tier borders */

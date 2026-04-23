@@ -644,8 +644,8 @@ const PhotoArchive = (() => {
                 } else if (data.embedded < data.total_kept) {
                     stateEl.textContent = 'Embedding';
                     stateEl.className = 'bar-ai-state embedding';
-                } else if (data.model_trained) {
-                    stateEl.textContent = 'Trained';
+                } else if (data.embedded > 0) {
+                    stateEl.textContent = 'Ready';
                     stateEl.className = 'bar-ai-state trained';
                 } else {
                     stateEl.textContent = '';
@@ -672,20 +672,17 @@ const PhotoArchive = (() => {
                 } else if (data.worker_state === 'loading_model') {
                     modelText.textContent = data.worker_message || `Loading ${data.model_id}`;
                     modelText.className = 'ai-panel-value';
-                } else if (data.model_trained) {
-                    modelText.textContent = `Trained on ${data.compared.toLocaleString()} compared images`;
-                    modelText.className = 'ai-panel-value trained';
                 } else if (data.embedded > 0) {
-                    modelText.textContent = 'Waiting for embeddings to complete';
-                    modelText.className = 'ai-panel-value';
+                    modelText.textContent = `${data.compared.toLocaleString()} images compared · Elo propagation active`;
+                    modelText.className = 'ai-panel-value trained';
                 } else {
                     modelText.textContent = 'Not started';
                     modelText.className = 'ai-panel-value';
                 }
             }
             if (predText) {
-                if (data.predicted > 0) {
-                    predText.textContent = `${data.predicted.toLocaleString()} images have predicted ratings`;
+                if (data.compared > 0) {
+                    predText.textContent = `${data.compared.toLocaleString()} images ranked via comparisons + propagation`;
                 } else {
                     predText.textContent = 'None yet';
                 }
@@ -1020,7 +1017,7 @@ const PhotoArchive = (() => {
             addRequest(buildRankingsUrl({ sort: sortDesc ? sortKey.asc : sortKey.desc }));
         }
 
-        addRequest(buildRankingsUrl({ sort: rankingsSort.startsWith('ai') ? 'elo' : 'ai' }));
+        addRequest(buildRankingsUrl({ sort: rankingsSort === 'elo' ? 'comparisons' : 'elo' }));
 
         for (const neighborState of buildFilterNeighborStates().slice(0, 3)) {
             addRequest(buildRankingsUrl({ filterState: neighborState }));
@@ -1059,7 +1056,6 @@ const PhotoArchive = (() => {
 
     const SORT_KEYS = {
         'elo':         { desc: 'elo',           asc: 'elo_asc' },
-        'ai':          { desc: 'ai',            asc: 'ai_asc' },
         'comparisons': { desc: 'comparisons',   asc: 'least_compared' },
         'newest':      { desc: 'newest',        asc: 'oldest' },
         'filename':    { desc: 'filename_desc', asc: 'filename' },
@@ -1223,7 +1219,7 @@ const PhotoArchive = (() => {
             return;
         }
         const grid = document.getElementById('rankings-grid');
-        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc' || rankingsSort === 'ai');
+        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
         const rowH = thumbHeight;
 
         for (let i = 0; i < data.images.length; i++) {
@@ -1244,8 +1240,8 @@ const PhotoArchive = (() => {
                 else { openLightbox(img); }
             };
 
-            const eloLabel = img.comparisons > 0 ? `${img.elo}` : (img.predicted_elo ? `~${img.predicted_elo}` : `${img.elo}`);
-            const sourceTag = img.comparisons === 0 && img.predicted_elo ? '<span class="rank-ai-tag">AI</span>' : '';
+            const eloLabel = `${img.elo}`;
+            const sourceTag = '';
             const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
 
             const infoLine = showRank

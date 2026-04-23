@@ -227,7 +227,7 @@ async def get_kept_images_for_pairing():
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons, predicted_elo, uncertainty, orientation, aspect_ratio FROM images "
+            "SELECT id, filename, filepath, elo, comparisons, orientation, aspect_ratio FROM images "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
         )
         return await cursor.fetchall()
@@ -294,8 +294,6 @@ async def undo_last_comparison():
 RANKING_SORTS = {
     "elo": "elo DESC",
     "elo_asc": "elo ASC",
-    "ai": "COALESCE(CASE WHEN comparisons > 0 THEN elo ELSE predicted_elo END, elo) DESC",
-    "ai_asc": "COALESCE(CASE WHEN comparisons > 0 THEN elo ELSE predicted_elo END, elo) ASC",
     "comparisons": "comparisons DESC",
     "least_compared": "comparisons ASC",
     "filename": "filename ASC",
@@ -337,7 +335,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
         where = " AND ".join(conditions)
         params.extend([limit, offset])
         cursor = await db.execute(
-            f"SELECT id, filename, filepath, elo, comparisons, status, predicted_elo, aspect_ratio FROM images "
+            f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio FROM images "
             f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params,
         )
