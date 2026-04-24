@@ -826,6 +826,12 @@ const PhotoArchive = (() => {
     function handleCompareKey(e) {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            window.location.href = '/library';
+            return;
+        }
+
         if (compareMode === 'mosaic') {
             const cells = document.querySelectorAll('.mosaic-cell');
             if (!cells.length) return;
@@ -1207,6 +1213,9 @@ const PhotoArchive = (() => {
             } else if (e.key === 'Escape' && selectedLibraryIndex >= 0) {
                 e.preventDefault();
                 deselectLibraryCard(cards);
+            } else if (e.key === 'Tab') {
+                e.preventDefault();
+                window.location.href = '/compare';
             }
         });
 
@@ -1396,7 +1405,18 @@ const PhotoArchive = (() => {
         cards.forEach(c => c.classList.remove('kb-selected'));
         selectedLibraryIndex = index;
         cards[index].classList.add('kb-selected');
-        cards[index].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        scrollCardFullyVisible(cards[index]);
+    }
+
+    function scrollCardFullyVisible(el) {
+        const rect = el.getBoundingClientRect();
+        const barHeight = document.querySelector('.bottom-bar')?.offsetHeight || 48;
+        const viewBottom = window.innerHeight - barHeight;
+        if (rect.bottom > viewBottom) {
+            window.scrollBy({ top: rect.bottom - viewBottom + 8, behavior: 'smooth' });
+        } else if (rect.top < 0) {
+            window.scrollBy({ top: rect.top - 8, behavior: 'smooth' });
+        }
     }
 
     function deselectLibraryCard(cards) {

@@ -157,17 +157,29 @@ a:hover {
 }
 
 .bar-link {
-    color: #666;
-    font-size: 12px;
-    transition: color 0.15s;
+    color: #555;
+    font-size: 14px;
+    font-weight: 500;
+    padding: 6px 16px;
+    border-radius: 4px;
+    transition: color 0.15s, background 0.15s;
 }
 
 .bar-link:hover {
-    color: #aaa;
+    color: #ccc;
+    background: rgba(255,255,255,0.06);
+}
+
+.bar-link.active {
+    color: #fff;
+    font-weight: 600;
 }
 
 .bar-nav {
     margin-left: auto;
+    display: flex;
+    gap: 4px;
+    align-items: center;
 }
 
 .bar-hints {
@@ -873,8 +885,8 @@ button:disabled {
 }
 
 .mosaic-cell.kb-selected {
-    border-color: #6cb4ee;
-    box-shadow: 0 0 12px rgba(108, 180, 238, 0.3);
+    border-color: #fff;
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.2);
 }
 
 .mosaic-cell.mosaic-picked {
@@ -1198,7 +1210,7 @@ button:disabled {
 }
 
 .rank-card.kb-selected {
-    outline: 2px solid #6cb4ee;
+    outline: 2px solid #fff;
     outline-offset: -2px;
     opacity: 1;
 }
