@@ -443,7 +443,8 @@ const PhotoArchive = (() => {
         // using the same justified flex layout as the library
         const gap = 3;
         const containerW = grid.clientWidth || window.innerWidth;
-        const containerH = grid.clientHeight || (window.innerHeight - 60);
+        const barH = document.querySelector('.bottom-bar')?.offsetHeight || 60;
+        const containerH = grid.clientHeight || (window.innerHeight - barH);
         const n = mosaicImages.length;
 
         // Simulate row packing to find the right row height
@@ -535,11 +536,16 @@ const PhotoArchive = (() => {
             showToast('Failed to save pick — check connection');
         });
 
-        // Update stats in one smooth roll using precomputed propagation count
+        // Update stats using precomputed propagation count if available
         const propagated = mosaicPropagationCounts[id] || 0;
         compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length + propagated;
         updateCompareProgress();
-        if (propagated > 0) showPropagationBadge(propagated);
+        if (propagated > 0) {
+            showPropagationBadge(propagated);
+        } else {
+            // Precompute not ready yet — fall back to polling
+            setTimeout(() => fetchPropagationCount(0), 600);
+        }
 
         // Green flash + scale pulse on the picked cell
         const cells = document.querySelectorAll('.mosaic-cell');
