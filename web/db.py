@@ -371,7 +371,7 @@ STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
                        orientation: str = "", compared: str = "", min_stars: int = 0,
-                       folder: str = ""):
+                       folder: str = "", id_filter: set = None):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -397,17 +397,33 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             conditions.append("filepath LIKE ?")
             params.append(f"%/{folder}/%")
 
+        if id_filter is not None:
+            if not id_filter:
+                return []
+            placeholders = ",".join("?" * len(id_filter))
+            conditions.append(f"id IN ({placeholders})")
+            params.extend(id_filter)
+
         where = " AND ".join(conditions)
         params.extend([limit, offset])
-        index_name = RANKING_INDEXES.get(sort, "idx_images_active_elo")
-        if orientation in ("landscape", "portrait") and sort == "elo":
-            index_name = "idx_images_active_orientation_elo"
-        cursor = await db.execute(
-            f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
-            f"FROM images INDEXED BY {index_name} "
-            f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-            params,
-        )
+
+        # Skip index hint when using id_filter — SQLite picks the right plan
+        if id_filter is not None:
+            cursor = await db.execute(
+                f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+                f"FROM images WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                params,
+            )
+        else:
+            index_name = RANKING_INDEXES.get(sort, "idx_images_active_elo")
+            if orientation in ("landscape", "portrait") and sort == "elo":
+                index_name = "idx_images_active_orientation_elo"
+            cursor = await db.execute(
+                f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+                f"FROM images INDEXED BY {index_name} "
+                f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                params,
+            )
         return await cursor.fetchall()
     finally:
         await db.close()

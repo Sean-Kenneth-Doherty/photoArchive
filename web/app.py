@@ -1019,12 +1019,35 @@ async def compare_undo():
 async def api_rankings(
     limit: int = 100, offset: int = 0, sort: str = "elo",
     orientation: str = "", compared: str = "", min_stars: int = 0,
-    folder: str = "",
+    folder: str = "", q: str = "",
 ):
+    # When a search query is present, pre-filter to images above similarity threshold
+    search_ids = None
+    search_scores = {}
+    if q.strip():
+        try:
+            import embedding_worker
+            import embed_cache
+            text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, q)
+            if text_vec is not None:
+                image_ids, matrix = await embed_cache.get_matrix()
+                if image_ids is not None:
+                    config = settings.get_settings()
+                    threshold = config.get("search_similarity_threshold", 0.35)
+                    similarities = matrix @ text_vec
+                    mask = similarities >= threshold
+                    search_ids = set()
+                    for i in range(len(image_ids)):
+                        if mask[i]:
+                            search_ids.add(image_ids[i])
+                            search_scores[image_ids[i]] = float(similarities[i])
+        except Exception:
+            pass
+
     images = await db.get_rankings(
         limit=limit, offset=offset, sort=sort,
         orientation=orientation, compared=compared, min_stars=min_stars,
-        folder=folder,
+        folder=folder, id_filter=search_ids,
     )
     if images:
         await thumbnails.prefetch_images(
@@ -1035,7 +1058,7 @@ async def api_rankings(
     result = []
     for img in images:
         d = dict(img)
-        result.append({
+        entry = {
             "id": d["id"],
             "filename": d["filename"],
             "elo": round(d["elo"], 1),
@@ -1043,7 +1066,10 @@ async def api_rankings(
             "status": d["status"],
             "aspect_ratio": d.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{d['id']}",
-        })
+        }
+        if search_scores:
+            entry["similarity"] = round(search_scores.get(d["id"], 0), 4)
+        result.append(entry)
     return {"images": result}
 
 
