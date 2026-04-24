@@ -120,9 +120,10 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
 
 async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
     """
-    Propagate after a mosaic pick. The winner beat all losers, so boost
-    images similar to the winner. For losers, apply a lighter penalty
-    since they only lost to the best image, not to each other.
+    Propagate after a mosaic pick. Boost images similar to the winner,
+    and penalize images similar to the losers. This makes each mosaic
+    pick dramatically more powerful by also affecting look-alikes of
+    every image on the grid.
     """
     try:
         image_ids, matrix = await embed_cache.get_matrix()
@@ -131,27 +132,53 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
         id_to_idx = embed_cache.get_index()
 
         involved = {winner_id} | set(loser_ids)
-        winner_neighbors = _find_similar(winner_id, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
 
-        if not winner_neighbors:
+        # Find neighbors for winner AND all losers
+        winner_neighbors = _find_similar(winner_id, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+        loser_neighbor_lists = []
+        for lid in loser_ids:
+            loser_neighbors = _find_similar(lid, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+            loser_neighbor_lists.append(loser_neighbors)
+
+        all_neighbor_ids = set()
+        for nid, _ in winner_neighbors:
+            all_neighbor_ids.add(nid)
+        for ln in loser_neighbor_lists:
+            for nid, _ in ln:
+                all_neighbor_ids.add(nid)
+
+        if not all_neighbor_ids:
             return
 
-        all_neighbor_ids = list({nid for nid, _ in winner_neighbors})
-        neighbors = await db.get_images_by_ids(all_neighbor_ids)
+        neighbors = await db.get_images_by_ids(list(all_neighbor_ids))
 
         conn = await db.get_db()
         try:
-            updates = []
+            deltas = {}
+
+            # Boost images similar to the winner
             for neighbor_id, similarity in winner_neighbors:
+                if neighbor_id in involved:
+                    continue
+                boost = k * similarity * PROPAGATION_DECAY
+                deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) + boost
+
+            # Penalize images similar to losers (scaled down since each
+            # loser only lost to the winner, not to each other)
+            loser_scale = 1.0 / max(len(loser_ids), 1)
+            for loser_neighbors in loser_neighbor_lists:
+                for neighbor_id, similarity in loser_neighbors:
+                    if neighbor_id in involved:
+                        continue
+                    penalty = k * similarity * PROPAGATION_DECAY * loser_scale
+                    deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
+
+            updates = []
+            for neighbor_id, delta in deltas.items():
                 neighbor = neighbors.get(neighbor_id)
                 if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
                     continue
-                if neighbor_id in involved:
-                    continue
-                # Boost proportional to similarity and K
-                boost = k * similarity * PROPAGATION_DECAY
-                new_elo = neighbor["elo"] + boost
-                updates.append((new_elo, neighbor_id))
+                updates.append((neighbor["elo"] + delta, neighbor_id))
 
             if updates:
                 await conn.executemany(
@@ -159,7 +186,8 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
                     updates,
                 )
                 await conn.commit()
-                log.debug(f"Propagated mosaic win to {len(updates)} neighbors of {winner_id}")
+                log.debug(f"Propagated mosaic to {len(updates)} neighbors "
+                         f"(winner={winner_id}, {len(loser_ids)} losers)")
         finally:
             await conn.close()
 
