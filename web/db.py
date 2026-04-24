@@ -197,7 +197,7 @@ async def insert_images_batch(rows: list[tuple[str, str]]):
     db = await get_db()
     try:
         await db.executemany(
-            "INSERT OR IGNORE INTO images (filename, filepath) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO images (filename, filepath, status) VALUES (?, ?, 'kept')",
             rows,
         )
         await db.commit()
