@@ -692,21 +692,26 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
         # Build embedding vectors for all candidates
         cand_matrix = matrix[cand_indices]  # (N_cand, dim)
 
-        # Seed: pick the image most dissimilar to the centroid (most unique)
-        centroid = cand_matrix.mean(axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid /= norm
-        dists = 1.0 - cand_matrix @ centroid
-        first = int(np.argmax(dists))
+        # Comparison-count bias: soft preference for less-compared images
+        # Weight = 1/(comparisons+1), so unranked=1.0, 10 comparisons=0.09, 50=0.02
+        comp_bias = np.array([1.0 / (c["comparisons"] + 1) for c in cand_items])
+
+        # Seed: randomly pick from the least-compared quartile for variety
+        quartile_threshold = np.percentile(comp_bias, 75)
+        seed_candidates = np.where(comp_bias >= quartile_threshold)[0]
+        first = int(random.choice(seed_candidates))
         selected = [first]
 
-        # Greedy farthest-point: incrementally track max similarity
+        # Greedy farthest-point with comparison-count bias
+        # Score = diversity_distance * (1 + comp_bias) — least-compared images
+        # break ties, but visual diversity still dominates
         max_sim = cand_matrix @ cand_matrix[first]  # (N_cand,)
 
         for _ in range(count - 1):
             max_sim[selected[-1]] = 999.0
-            next_pick = int(np.argmin(max_sim))
+            # Lower score = better: high similarity is bad, low comparisons is good
+            score = max_sim - comp_bias * 0.15
+            next_pick = int(np.argmin(score))
             selected.append(next_pick)
             new_sims = cand_matrix @ cand_matrix[next_pick]
             np.maximum(max_sim, new_sims, out=max_sim)
