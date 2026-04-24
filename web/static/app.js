@@ -537,6 +537,9 @@ const PhotoArchive = (() => {
         compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length;
         updateCompareProgress();
 
+        // Poll for propagation count after a short delay (background task needs time)
+        setTimeout(() => fetchPropagationCount(), 500);
+
         // Green flash + scale pulse on the picked cell
         const cells = document.querySelectorAll('.mosaic-cell');
         const pickedCell = cells[idx];
@@ -771,6 +774,8 @@ const PhotoArchive = (() => {
         }
     }
 
+    let _propagationBadgeTimer = null;
+
     function updateCompareProgress() {
         const total = compareStats.total_comparisons || 0;
         const kept = compareStats.kept || 0;
@@ -778,6 +783,28 @@ const PhotoArchive = (() => {
         const poolEl = document.getElementById('compare-stat-pool');
         if (compEl) compEl.textContent = total.toLocaleString();
         if (poolEl) poolEl.textContent = kept.toLocaleString();
+    }
+
+    function fetchPropagationCount() {
+        fetch('/api/propagation/last').then(r => r.json()).then(data => {
+            if (data.count > 0) showPropagationBadge(data.count);
+        }).catch(() => {});
+    }
+
+    function showPropagationBadge(count) {
+        let badge = document.getElementById('propagation-badge');
+        if (!badge) {
+            const compEl = document.getElementById('compare-stat-comparisons');
+            if (!compEl) return;
+            badge = document.createElement('span');
+            badge.id = 'propagation-badge';
+            badge.className = 'propagation-badge';
+            compEl.after(badge);
+        }
+        badge.textContent = `+${count}`;
+        badge.classList.add('visible');
+        clearTimeout(_propagationBadgeTimer);
+        _propagationBadgeTimer = setTimeout(() => badge.classList.remove('visible'), 3000);
     }
 
     async function submitComparison(side) {
@@ -807,6 +834,7 @@ const PhotoArchive = (() => {
                 compareStats.total_comparisons = (compareStats.total_comparisons || 0) + 1;
                 compareIndex++;
                 showComparePair();
+                setTimeout(() => fetchPropagationCount(), 500);
             }
         } finally {
             compareBusy = false;

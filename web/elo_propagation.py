@@ -18,6 +18,9 @@ import embed_cache
 
 log = logging.getLogger("elo_propagation")
 
+# Last propagation result (read by /api/propagation/last)
+last_propagation_count = 0
+
 # Tuning parameters
 SIMILARITY_THRESHOLD = 0.75   # minimum cosine similarity to propagate
 MAX_NEIGHBORS = 20            # max images to adjust per winner/loser
@@ -115,14 +118,18 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
                     continue
                 updates.append((neighbor["elo"] + delta, neighbor_id))
 
+            global last_propagation_count
             if updates:
                 await conn.executemany(
                     "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
+                last_propagation_count = len(updates)
                 log.debug(f"Propagated Elo to {len(updates)} neighbors "
                          f"(winner={winner_id}, loser={loser_id})")
+            else:
+                last_propagation_count = 0
         finally:
             await conn.close()
 
@@ -194,14 +201,18 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
                     continue
                 updates.append((neighbor["elo"] + delta, neighbor_id))
 
+            global last_propagation_count
             if updates:
                 await conn.executemany(
                     "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
+                last_propagation_count = len(updates)
                 log.debug(f"Propagated mosaic to {len(updates)} neighbors "
                          f"(winner={winner_id}, {len(loser_ids)} losers)")
+            else:
+                last_propagation_count = 0
         finally:
             await conn.close()
 

@@ -120,6 +120,19 @@ a:hover {
     margin: 0 2px;
 }
 
+.propagation-badge {
+    color: #4a9;
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 4px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+.propagation-badge.visible {
+    opacity: 1;
+}
+
 .bar-ai {
     color: #888;
 }

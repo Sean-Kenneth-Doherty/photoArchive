@@ -886,6 +886,12 @@ async def mosaic_pick(request: Request):
     return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(comparison_rows)}
 
 
+@app.get("/api/propagation/last")
+async def propagation_last():
+    """Return the number of images affected by the last Elo propagation."""
+    return {"count": elo_propagation.last_propagation_count}
+
+
 # --- Compare API ---
 
 @app.get("/api/compare/next")
