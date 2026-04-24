@@ -1044,6 +1044,32 @@ async def api_rankings(
         except Exception:
             pass
 
+    # Similarity sort: fetch all matches, sort in Python, then paginate
+    if sort == "similarity" and search_scores:
+        images = await db.get_rankings(
+            limit=len(search_ids), offset=0, sort="elo",
+            orientation=orientation, compared=compared, min_stars=min_stars,
+            folder=folder, id_filter=search_ids,
+        )
+        all_results = []
+        for img in images:
+            d = dict(img)
+            all_results.append({
+                "id": d["id"], "filename": d["filename"],
+                "elo": round(d["elo"], 1), "comparisons": d["comparisons"],
+                "status": d["status"], "aspect_ratio": d.get("aspect_ratio") or 1.5,
+                "thumb_url": f"/api/thumb/sm/{d['id']}",
+                "similarity": round(search_scores.get(d["id"], 0), 4),
+            })
+        all_results.sort(key=lambda x: x["similarity"], reverse=(sort == "similarity"))
+        page = all_results[offset:offset + limit]
+        if page:
+            await thumbnails.prefetch_images(
+                [{"id": r["id"], "filepath": ""} for r in page], "sm",
+                limit=min(len(page), 48),
+            )
+        return {"images": page}
+
     images = await db.get_rankings(
         limit=limit, offset=offset, sort=sort,
         orientation=orientation, compared=compared, min_stars=min_stars,
