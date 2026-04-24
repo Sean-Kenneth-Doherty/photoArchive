@@ -20,6 +20,8 @@ log = logging.getLogger("elo_propagation")
 
 # Last propagation result (read by /api/propagation/last)
 last_propagation_count = 0
+_prediction_cache_key = None
+_prediction_cache_counts = None
 
 # Tuning parameters
 SIMILARITY_THRESHOLD = 0.70   # minimum cosine similarity to propagate
@@ -47,6 +49,11 @@ def _find_similar(image_id, image_ids, matrix, id_to_idx, threshold, max_n):
         return []
 
     similarities = matrix @ matrix[idx]  # cosine sim (already L2-normalized)
+    return _rank_similar_from_scores(image_id, image_ids, similarities, threshold, max_n)
+
+
+def _rank_similar_from_scores(image_id, image_ids, similarities, threshold, max_n):
+    """Rank precomputed similarity scores. Returns [(id, similarity), ...]."""
     candidate_count = min(len(image_ids), max_n + 1)
     if candidate_count <= 0:
         return []
@@ -69,9 +76,38 @@ def _find_similar(image_id, image_ids, matrix, id_to_idx, threshold, max_n):
     return results
 
 
+def _find_similar_batch(image_ids_to_find, image_ids, matrix, id_to_idx, threshold, max_n):
+    """Find similar images for many source IDs using one matrix multiply."""
+    valid_ids = []
+    valid_indices = []
+    for image_id in image_ids_to_find:
+        idx = id_to_idx.get(image_id)
+        if idx is not None:
+            valid_ids.append(image_id)
+            valid_indices.append(idx)
+
+    results_by_id = {image_id: [] for image_id in image_ids_to_find}
+    if not valid_indices:
+        return results_by_id
+
+    grid_matrix = matrix[valid_indices]
+    similarity_rows = grid_matrix @ matrix.T  # cosine sim (already L2-normalized)
+
+    for image_id, similarities in zip(valid_ids, similarity_rows):
+        results_by_id[image_id] = _rank_similar_from_scores(
+            image_id, image_ids, similarities, threshold, max_n
+        )
+    return results_by_id
+
+
 async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
     """Precompute how many images would be affected if each grid image were the winner.
     Returns {image_id: predicted_count} for each image in grid_ids."""
+    global _prediction_cache_key, _prediction_cache_counts
+    cache_key = tuple(grid_ids)
+    if _prediction_cache_key == cache_key and _prediction_cache_counts is not None:
+        return dict(_prediction_cache_counts)
+
     try:
         image_ids, matrix = await embed_cache.get_matrix()
         if image_ids is None:
@@ -80,9 +116,14 @@ async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
 
         grid_set = set(grid_ids)
         # Precompute neighbors for every grid image
-        neighbors_by_id = {}
-        for gid in grid_ids:
-            neighbors_by_id[gid] = _find_similar(gid, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+        neighbors_by_id = _find_similar_batch(
+            grid_ids,
+            image_ids,
+            matrix,
+            id_to_idx,
+            SIMILARITY_THRESHOLD,
+            MAX_NEIGHBORS,
+        )
 
         # For filtering: fetch comparison counts for all potential neighbors
         all_neighbor_ids = set()
@@ -113,6 +154,8 @@ async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
                     if n and n["comparisons"] < MAX_DIRECT_COMPARISONS:
                         affected.add(nid)
             result[winner_id] = len(affected)
+        _prediction_cache_key = cache_key
+        _prediction_cache_counts = dict(result)
         return result
     except Exception as e:
         log.warning(f"Propagation prediction error: {e}")

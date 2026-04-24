@@ -675,17 +675,42 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
         # Use id_to_idx for O(1) lookups instead of building a full dict copy
         id_to_idx = embed_cache._cache.get("id_to_idx") or {}
 
+        # Bound the expensive per-candidate work for large libraries. The final
+        # diversity pool is only 500 images, so a 5k search window keeps the same
+        # broad random/exploratory behavior without building arrays over 100k+ rows.
+        SEARCH_POOL = max(5000, count * 40)
+        search_candidates = candidates
+        if len(candidates) > SEARCH_POOL:
+            search_candidates = random.sample(candidates, SEARCH_POOL)
+
         # Filter candidates to those with embeddings, get their matrix indices
         cand_indices = []  # index into matrix
         cand_items = []    # corresponding candidate dicts
         without_emb = []
-        for c in candidates:
+        for c in search_candidates:
             idx = id_to_idx.get(c["id"])
             if idx is not None:
                 cand_indices.append(idx)
                 cand_items.append(c)
             else:
                 without_emb.append(c)
+
+        # If embeddings are sparse, fall back to scanning the full candidate set
+        # so the function still returns enough images instead of letting the cap
+        # change behavior for partially embedded libraries.
+        if len(cand_items) < count and search_candidates is not candidates:
+            seen = {c["id"] for c in search_candidates}
+            for c in candidates:
+                if c["id"] in seen:
+                    continue
+                idx = id_to_idx.get(c["id"])
+                if idx is not None:
+                    cand_indices.append(idx)
+                    cand_items.append(c)
+                else:
+                    without_emb.append(c)
+                if len(cand_items) >= count:
+                    break
 
         if len(cand_items) < count:
             sample = list(cand_items)
@@ -694,22 +719,78 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
                 sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
             return sample
 
-        # Subsample a random pool — skip building the full candidate matrix
+        # Subsample a random pool — skip building the full candidate matrix.
+        # Use comparison-count strata instead of np.random.choice(..., p=weights):
+        # it keeps the least-compared bias, but avoids normalizing/probability
+        # sampling across every candidate.
         POOL = min(500, len(cand_items))
-        comp_counts = np.array([c["comparisons"] for c in cand_items])
-        comp_bias_all = 1.0 / (comp_counts + 1)
+        comp_counts = np.fromiter(
+            (c["comparisons"] for c in cand_items),
+            dtype=np.float32,
+            count=len(cand_items),
+        )
 
         if len(cand_items) > POOL:
-            weights = comp_bias_all / comp_bias_all.sum()
-            pool_idx = np.random.choice(len(cand_items), size=POOL, replace=False, p=weights)
+            bucket_defs = (
+                comp_counts == 0,
+                (comp_counts > 0) & (comp_counts <= 2),
+                (comp_counts > 2) & (comp_counts <= 5),
+                (comp_counts > 5) & (comp_counts <= 10),
+                comp_counts > 10,
+            )
+            bucket_indices = [np.flatnonzero(mask) for mask in bucket_defs]
+            bucket_weights = np.array(
+                [
+                    float((1.0 / (comp_counts[idx] + 1.0)).sum()) if len(idx) else 0.0
+                    for idx in bucket_indices
+                ],
+                dtype=np.float64,
+            )
+
+            if bucket_weights.sum() > 0:
+                raw_quotas = bucket_weights / bucket_weights.sum() * POOL
+                quotas = np.minimum(
+                    np.floor(raw_quotas).astype(int),
+                    [len(idx) for idx in bucket_indices],
+                )
+                remaining = POOL - int(quotas.sum())
+                fractions = raw_quotas - np.floor(raw_quotas)
+                for bucket in np.argsort(fractions)[::-1]:
+                    if remaining <= 0:
+                        break
+                    capacity = len(bucket_indices[bucket]) - quotas[bucket]
+                    if capacity <= 0:
+                        continue
+                    take = min(remaining, capacity)
+                    quotas[bucket] += take
+                    remaining -= take
+
+                selected_idx = []
+                for idx, quota in zip(bucket_indices, quotas):
+                    if quota <= 0:
+                        continue
+                    selected_idx.extend(random.sample(idx.tolist(), int(quota)))
+
+                if len(selected_idx) < POOL:
+                    selected_set = set(selected_idx)
+                    remaining_idx = [i for i in range(len(cand_items)) if i not in selected_set]
+                    selected_idx.extend(random.sample(remaining_idx, POOL - len(selected_idx)))
+                pool_idx = np.array(selected_idx, dtype=np.intp)
+                np.random.shuffle(pool_idx)
+            else:
+                pool_idx = np.array(random.sample(range(len(cand_items)), POOL), dtype=np.intp)
         else:
             pool_idx = np.arange(len(cand_items))
 
         # Build matrix only for the pool (500 x 2048 instead of 20k x 2048)
-        pool_matrix_idx = [cand_indices[i] for i in pool_idx]
+        pool_matrix_idx = np.fromiter(
+            (cand_indices[int(i)] for i in pool_idx),
+            dtype=np.intp,
+            count=len(pool_idx),
+        )
         pool_matrix = matrix[pool_matrix_idx]
-        pool_items = [cand_items[i] for i in pool_idx]
-        pool_bias = comp_bias_all[pool_idx]
+        pool_items = [cand_items[int(i)] for i in pool_idx]
+        pool_bias = 1.0 / (comp_counts[pool_idx] + 1.0)
 
         # Random seed for variety
         first = random.randrange(len(pool_items))
