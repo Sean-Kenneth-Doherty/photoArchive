@@ -689,32 +689,29 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
                 sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
             return sample
 
-        # Subsample candidates to ~200 for fast diversity computation
-        # (running greedy diversity on 20k vectors is too slow)
-        POOL_SIZE = min(200, len(cand_items))
-        if len(cand_items) > POOL_SIZE:
-            explore_weights = [1.0 / (c["comparisons"] + 1) for c in cand_items]
-            pool_indices = random.choices(range(len(cand_items)), weights=explore_weights, k=POOL_SIZE)
-            pool_indices = list(set(pool_indices))  # deduplicate
-        else:
-            pool_indices = list(range(len(cand_items)))
+        # Build embedding vectors for all candidates
+        cand_matrix = matrix[cand_indices]  # (N_cand, dim)
 
-        pool_matrix_indices = [cand_indices[i] for i in pool_indices]
-        vecs = matrix[pool_matrix_indices]
-        pool_items = [cand_items[i] for i in pool_indices]
-
-        # Greedy diverse selection on the small pool
-        first = random.randrange(len(pool_items))
+        # Seed: pick the image most dissimilar to the centroid (most unique)
+        centroid = cand_matrix.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid /= norm
+        dists = 1.0 - cand_matrix @ centroid
+        first = int(np.argmax(dists))
         selected = [first]
 
-        for _ in range(count - 1):
-            selected_vecs = vecs[selected]
-            max_sim = (vecs @ selected_vecs.T).max(axis=1)
-            for si in selected:
-                max_sim[si] = 999
-            selected.append(int(np.argmin(max_sim)))
+        # Greedy farthest-point: incrementally track max similarity
+        max_sim = cand_matrix @ cand_matrix[first]  # (N_cand,)
 
-        return [pool_items[i] for i in selected]
+        for _ in range(count - 1):
+            max_sim[selected[-1]] = 999.0
+            next_pick = int(np.argmin(max_sim))
+            selected.append(next_pick)
+            new_sims = cand_matrix @ cand_matrix[next_pick]
+            np.maximum(max_sim, new_sims, out=max_sim)
+
+        return [cand_items[i] for i in selected]
 
     except Exception:
         # Fallback to random if embeddings unavailable

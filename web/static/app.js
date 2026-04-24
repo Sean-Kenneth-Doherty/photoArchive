@@ -801,7 +801,7 @@ const PhotoArchive = (() => {
             badge.className = 'propagation-badge';
             compEl.after(badge);
         }
-        badge.textContent = `+${count}`;
+        badge.textContent = `+${count} similar`;
         badge.classList.add('visible');
         clearTimeout(_propagationBadgeTimer);
         _propagationBadgeTimer = setTimeout(() => badge.classList.remove('visible'), 3000);
