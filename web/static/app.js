@@ -856,8 +856,13 @@ const PhotoArchive = (() => {
                 }
             } else if (e.key === 'Enter' && selectedMosaicIndex >= 0 && selectedMosaicIndex < mosaicImages.length) {
                 e.preventDefault();
+                const keepIdx = selectedMosaicIndex;
                 mosaicClick(mosaicImages[selectedMosaicIndex].id);
-                deselectMosaicCell();
+                // Re-select after swap animation so the cursor stays in place
+                setTimeout(() => {
+                    const cells = document.querySelectorAll('.mosaic-cell');
+                    if (keepIdx < cells.length) selectMosaicCell(keepIdx, cells);
+                }, 200);
             } else if (e.key === 'Escape' && selectedMosaicIndex >= 0) {
                 e.preventDefault();
                 deselectMosaicCell(cells);
