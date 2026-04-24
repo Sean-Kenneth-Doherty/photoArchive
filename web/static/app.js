@@ -401,7 +401,7 @@ const PhotoArchive = (() => {
     let mosaicImages = []; // currently visible images [{id, filename, elo, thumb_url}, ...]
     let mosaicAge = []; // how many clicks each image has survived on the board
     let mosaicPickCount = 0;
-    let mosaicStrategy = 'explore';
+    let mosaicStrategy = 'diverse';
 
     function mosaicGridElo() {
         if (mosaicImages.length === 0) return 0;
@@ -533,12 +533,9 @@ const PhotoArchive = (() => {
             showToast('Failed to save pick — check connection');
         });
 
-        // Update stats immediately (N-1 comparisons per click)
-        compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length;
-        updateCompareProgress();
-
-        // Poll for propagation count after a short delay (background task needs time)
-        setTimeout(() => fetchPropagationCount(), 500);
+        // Defer stats update until propagation count arrives so it's one smooth roll
+        const directCount = otherIds.length;
+        setTimeout(() => fetchPropagationCount(directCount), 600);
 
         // Green flash + scale pulse on the picked cell
         const cells = document.querySelectorAll('.mosaic-cell');
@@ -800,7 +797,7 @@ const PhotoArchive = (() => {
     function rollUpCounter(el, from, to) {
         if (_rollupAnim) cancelAnimationFrame(_rollupAnim);
         const diff = to - from;
-        const duration = Math.min(600, Math.max(200, Math.abs(diff) * 4));
+        const duration = Math.min(1200, Math.max(400, Math.abs(diff) * 6));
         const start = performance.now();
 
         function tick(now) {
@@ -817,14 +814,21 @@ const PhotoArchive = (() => {
         _rollupAnim = requestAnimationFrame(tick);
     }
 
-    function fetchPropagationCount() {
+    function fetchPropagationCount(directCount = 0) {
         fetch('/api/propagation/last').then(r => r.json()).then(data => {
-            if (data.count > 0) {
-                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + data.count;
+            const total = directCount + (data.count || 0);
+            if (total > 0) {
+                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + total;
                 updateCompareProgress();
-                showPropagationBadge(data.count);
+                if (data.count > 0) showPropagationBadge(data.count);
             }
-        }).catch(() => {});
+        }).catch(() => {
+            // Propagation fetch failed — still apply direct count
+            if (directCount > 0) {
+                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + directCount;
+                updateCompareProgress();
+            }
+        });
     }
 
     function showPropagationBadge(count) {
@@ -867,10 +871,9 @@ const PhotoArchive = (() => {
                     pair.right.elo = result.winner_elo;
                     pair.left.elo = result.loser_elo;
                 }
-                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + 1;
                 compareIndex++;
                 showComparePair();
-                setTimeout(() => fetchPropagationCount(), 500);
+                setTimeout(() => fetchPropagationCount(1), 600);
             }
         } finally {
             compareBusy = false;
