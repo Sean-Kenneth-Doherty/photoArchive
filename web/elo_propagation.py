@@ -69,6 +69,56 @@ def _find_similar(image_id, image_ids, matrix, id_to_idx, threshold, max_n):
     return results
 
 
+async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
+    """Precompute how many images would be affected if each grid image were the winner.
+    Returns {image_id: predicted_count} for each image in grid_ids."""
+    try:
+        image_ids, matrix = await embed_cache.get_matrix()
+        if image_ids is None:
+            return {gid: 0 for gid in grid_ids}
+        id_to_idx = embed_cache.get_index()
+
+        grid_set = set(grid_ids)
+        # Precompute neighbors for every grid image
+        neighbors_by_id = {}
+        for gid in grid_ids:
+            neighbors_by_id[gid] = _find_similar(gid, image_ids, matrix, id_to_idx, SIMILARITY_THRESHOLD, MAX_NEIGHBORS)
+
+        # For filtering: fetch comparison counts for all potential neighbors
+        all_neighbor_ids = set()
+        for nlist in neighbors_by_id.values():
+            for nid, _ in nlist:
+                if nid not in grid_set:
+                    all_neighbor_ids.add(nid)
+        neighbor_data = await db.get_images_by_ids(list(all_neighbor_ids)) if all_neighbor_ids else {}
+
+        result = {}
+        for winner_id in grid_ids:
+            affected = set()
+            # Winner neighbors
+            for nid, _ in neighbors_by_id[winner_id]:
+                if nid in grid_set:
+                    continue
+                n = neighbor_data.get(nid)
+                if n and n["comparisons"] < MAX_DIRECT_COMPARISONS:
+                    affected.add(nid)
+            # Loser neighbors (everyone else on the grid)
+            for loser_id in grid_ids:
+                if loser_id == winner_id:
+                    continue
+                for nid, _ in neighbors_by_id[loser_id]:
+                    if nid in grid_set:
+                        continue
+                    n = neighbor_data.get(nid)
+                    if n and n["comparisons"] < MAX_DIRECT_COMPARISONS:
+                        affected.add(nid)
+            result[winner_id] = len(affected)
+        return result
+    except Exception as e:
+        log.warning(f"Propagation prediction error: {e}")
+        return {gid: 0 for gid in grid_ids}
+
+
 async def propagate_comparison(winner_id: int, loser_id: int, k: float):
     """
     After a direct comparison, propagate scaled Elo changes to similar images.

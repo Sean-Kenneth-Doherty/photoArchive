@@ -889,6 +889,17 @@ async def propagation_last():
     return {"count": elo_propagation.last_propagation_count}
 
 
+@app.post("/api/propagation/predict")
+async def propagation_predict(request: Request):
+    """Precompute propagation counts for each possible winner in a grid."""
+    body = await request.json()
+    grid_ids = body.get("grid_ids", [])
+    if not grid_ids:
+        return {"counts": {}}
+    counts = await elo_propagation.predict_propagation(grid_ids)
+    return {"counts": {str(k): v for k, v in counts.items()}}
+
+
 # --- Compare API ---
 
 @app.get("/api/compare/next")

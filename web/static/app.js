@@ -402,6 +402,7 @@ const PhotoArchive = (() => {
     let mosaicAge = []; // how many clicks each image has survived on the board
     let mosaicPickCount = 0;
     let mosaicStrategy = 'diverse';
+    let mosaicPropagationCounts = {}; // precomputed: {imageId: predictedCount}
 
     function mosaicGridElo() {
         if (mosaicImages.length === 0) return 0;
@@ -428,6 +429,7 @@ const PhotoArchive = (() => {
         mosaicBusy = false;
         renderMosaic();
         mosaicFillReplacements();
+        precomputePropagation();
         scheduleCompareNeighborWarmup('mosaic');
         scheduleCrossViewWarmup('compare');
     }
@@ -533,9 +535,11 @@ const PhotoArchive = (() => {
             showToast('Failed to save pick — check connection');
         });
 
-        // Defer stats update until propagation count arrives so it's one smooth roll
-        const directCount = otherIds.length;
-        setTimeout(() => fetchPropagationCount(directCount), 600);
+        // Update stats in one smooth roll using precomputed propagation count
+        const propagated = mosaicPropagationCounts[id] || 0;
+        compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length + propagated;
+        updateCompareProgress();
+        if (propagated > 0) showPropagationBadge(propagated);
 
         // Green flash + scale pulse on the picked cell
         const cells = document.querySelectorAll('.mosaic-cell');
@@ -577,8 +581,9 @@ const PhotoArchive = (() => {
 
             mosaicBusy = false;
 
-            // Refill replacement buffer in the background
+            // Refill replacement buffer and recompute propagation for new grid
             mosaicFillReplacements();
+            precomputePropagation();
 
             if (mosaicImages.length < 2) {
                 showCompareEmpty();
@@ -812,6 +817,21 @@ const PhotoArchive = (() => {
             }
         }
         _rollupAnim = requestAnimationFrame(tick);
+    }
+
+    function precomputePropagation() {
+        const gridIds = mosaicImages.map(img => img.id);
+        if (!gridIds.length) return;
+        fetch('/api/propagation/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ grid_ids: gridIds }),
+        }).then(r => r.json()).then(data => {
+            mosaicPropagationCounts = {};
+            for (const [id, count] of Object.entries(data.counts || {})) {
+                mosaicPropagationCounts[parseInt(id)] = count;
+            }
+        }).catch(() => {});
     }
 
     function fetchPropagationCount(directCount = 0) {
