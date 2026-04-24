@@ -694,39 +694,39 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
                 sample.extend(random.sample(without_emb, min(remaining, len(without_emb))))
             return sample
 
-        # Build embedding vectors for all candidates
-        cand_matrix = matrix[cand_indices]  # (N_cand, dim)
-
-        # Comparison-count bias: soft preference for less-compared images
-        comp_bias = np.array([1.0 / (c["comparisons"] + 1) for c in cand_items])
-
-        # Subsample a fresh random pool each call — this is what creates variety
-        # between refreshes. Pool is large enough for good diversity (500 from 20k)
+        # Subsample a random pool — skip building the full candidate matrix
         POOL = min(500, len(cand_items))
+        comp_counts = np.array([c["comparisons"] for c in cand_items])
+        comp_bias_all = 1.0 / (comp_counts + 1)
+
         if len(cand_items) > POOL:
-            # Weighted sample: least-compared images 10x more likely
-            weights = comp_bias / comp_bias.sum()
+            weights = comp_bias_all / comp_bias_all.sum()
             pool_idx = np.random.choice(len(cand_items), size=POOL, replace=False, p=weights)
-            cand_matrix = cand_matrix[pool_idx]
-            comp_bias = comp_bias[pool_idx]
-            cand_items = [cand_items[i] for i in pool_idx]
+        else:
+            pool_idx = np.arange(len(cand_items))
+
+        # Build matrix only for the pool (500 x 2048 instead of 20k x 2048)
+        pool_matrix_idx = [cand_indices[i] for i in pool_idx]
+        pool_matrix = matrix[pool_matrix_idx]
+        pool_items = [cand_items[i] for i in pool_idx]
+        pool_bias = comp_bias_all[pool_idx]
 
         # Random seed for variety
-        first = random.randrange(len(cand_items))
+        first = random.randrange(len(pool_items))
         selected = [first]
 
         # Greedy farthest-point with comparison-count bias
-        max_sim = cand_matrix @ cand_matrix[first]
+        max_sim = pool_matrix @ pool_matrix[first]
 
         for _ in range(count - 1):
             max_sim[selected[-1]] = 999.0
-            score = max_sim - comp_bias * 0.15
+            score = max_sim - pool_bias * 0.15
             next_pick = int(np.argmin(score))
             selected.append(next_pick)
-            new_sims = cand_matrix @ cand_matrix[next_pick]
+            new_sims = pool_matrix @ pool_matrix[next_pick]
             np.maximum(max_sim, new_sims, out=max_sim)
 
-        return [cand_items[i] for i in selected]
+        return [pool_items[i] for i in selected]
 
     except Exception:
         # Fallback to random if embeddings unavailable
