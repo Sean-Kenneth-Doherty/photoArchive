@@ -787,7 +787,11 @@ const PhotoArchive = (() => {
 
     function fetchPropagationCount() {
         fetch('/api/propagation/last').then(r => r.json()).then(data => {
-            if (data.count > 0) showPropagationBadge(data.count);
+            if (data.count > 0) {
+                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + data.count;
+                updateCompareProgress();
+                showPropagationBadge(data.count);
+            }
         }).catch(() => {});
     }
 
