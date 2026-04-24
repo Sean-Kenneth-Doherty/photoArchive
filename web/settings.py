@@ -24,6 +24,7 @@ DEFAULT_SETTINGS = {
     "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
     "embed_model_revision": "main",
     "embed_model_dir": _default_model_dir("Qwen/Qwen3-VL-Embedding-2B"),
+    "search_similarity_threshold": 0.35,
 }
 
 INT_RANGES = {
@@ -36,6 +37,7 @@ INT_RANGES = {
 
 FLOAT_RANGES = {
     "memory_cache_gb": (0.0, 64.0),
+    "search_similarity_threshold": (0.1, 0.8),
 }
 
 _lock = threading.Lock()
