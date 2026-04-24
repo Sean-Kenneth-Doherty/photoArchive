@@ -1130,9 +1130,8 @@ async def get_full_image_path(filepath: str, image_id: int) -> str:
 
 
 def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
-    """Load an image for embedding, ONLY from SSD-cached md thumbnails.
-    Returns None if md thumbnail is not cached yet — the embedding worker
-    should skip this image and retry later after pre-generation catches up."""
+    """Load an image for embedding. Prefers SSD-cached md thumbnails for speed,
+    but falls back to reading the original file from HDD if no cache exists."""
     # Try fast path first (no HDD stat)
     data = _memory_get_fast("md", image_id)
     if data is None:
@@ -1145,17 +1144,31 @@ def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
         if data is None:
             data = _read_disk_thumbnail("md", image_id, source_signature)
 
-    if data is None:
-        return None  # Not cached — skip, don't read from HDD
+    if data is not None:
+        with Image.open(io.BytesIO(data)) as source:
+            source.load()
+            img = source.copy()
+        if img.mode != "RGB":
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
+        return img
 
-    with Image.open(io.BytesIO(data)) as source:
-        source.load()
-        img = source.copy()
-    if img.mode != "RGB":
-        converted = img.convert("RGB")
-        img.close()
-        img = converted
-    return img
+    # No cached thumbnail — load original from HDD and resize to md
+    try:
+        md_size = SIZES["md"]
+        img = _load_source_image(filepath, md_size, prefer_draft=False)
+        resized = _resize_to_long_side(img, md_size)
+        if resized is not img:
+            img.close()
+        img = resized
+        if img.mode != "RGB":
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
+        return img
+    except Exception:
+        return None
 
 
 async def flush_orientation_updates():

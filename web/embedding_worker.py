@@ -308,7 +308,6 @@ async def run_embedding_worker():
             # Phase 1: Embed unembedded images with pipelined CPU/GPU
             candidates = await db.get_unembedded_images(
                 limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER,
-                md_cache_root=thumbnails.SSD_CACHE_DIR,
             )
             unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
