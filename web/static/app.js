@@ -852,16 +852,9 @@ const PhotoArchive = (() => {
     }
 
     function showPropagationBadge(count) {
-        let badge = document.getElementById('propagation-badge');
-        if (!badge) {
-            const compEl = document.getElementById('compare-stat-comparisons');
-            if (!compEl) return;
-            badge = document.createElement('span');
-            badge.id = 'propagation-badge';
-            badge.className = 'propagation-badge';
-            compEl.after(badge);
-        }
-        badge.textContent = `+${count} similar`;
+        const badge = document.getElementById('propagation-badge');
+        if (!badge) return;
+        badge.textContent = ` +${count} similar`;
         badge.classList.add('visible');
         clearTimeout(_propagationBadgeTimer);
         _propagationBadgeTimer = setTimeout(() => badge.classList.remove('visible'), 3000);
