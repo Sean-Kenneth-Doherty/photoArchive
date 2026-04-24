@@ -444,7 +444,7 @@ const PhotoArchive = (() => {
         const gap = 3;
         const containerW = grid.clientWidth || window.innerWidth;
         const barH = document.querySelector('.bottom-bar')?.offsetHeight || 60;
-        const containerH = grid.clientHeight || (window.innerHeight - barH);
+        const containerH = window.innerHeight - barH - 4;
         const n = mosaicImages.length;
 
         // Simulate row packing to find the right row height
@@ -543,8 +543,8 @@ const PhotoArchive = (() => {
         if (propagated > 0) {
             showPropagationBadge(propagated);
         } else {
-            // Precompute not ready yet — fall back to polling
-            setTimeout(() => fetchPropagationCount(0), 600);
+            // Precompute not ready — poll immediately
+            fetchPropagationCount(0);
         }
 
         // Green flash + scale pulse on the picked cell
@@ -808,7 +808,7 @@ const PhotoArchive = (() => {
     function rollUpCounter(el, from, to) {
         if (_rollupAnim) cancelAnimationFrame(_rollupAnim);
         const diff = to - from;
-        const duration = Math.min(1200, Math.max(400, Math.abs(diff) * 6));
+        const duration = Math.min(2000, Math.max(600, Math.abs(diff) * 10));
         const start = performance.now();
 
         function tick(now) {
@@ -892,7 +892,7 @@ const PhotoArchive = (() => {
                 }
                 compareIndex++;
                 showComparePair();
-                setTimeout(() => fetchPropagationCount(1), 600);
+                fetchPropagationCount(1);
             }
         } finally {
             compareBusy = false;
