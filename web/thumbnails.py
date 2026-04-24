@@ -156,9 +156,12 @@ def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
     full_reserve = int(total * 0.05)
     thumb_budget = total - full_reserve
 
-    # Estimate per-image sizes from current cache, or use defaults
+    # Estimated per-image sizes (calibrated from real cache data at JPEG q=92)
     avg_bytes = {"sm": 33_700, "md": 479_000, "lg": 2_100_000}
-    with _meta_lock:
+
+    # Estimate image count from current cache entries if available
+    total_images = 150_000  # safe default for large archives
+    try:
         conn = _db_connect()
         for size in THUMB_TIERS:
             row = conn.execute(
@@ -168,15 +171,17 @@ def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
             ).fetchone()
             if row and row["n"] > 100:
                 avg_bytes[size] = int(row["total"] / row["n"])
-        total_images = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE status IN ('kept', 'maybe')"
-        ).fetchone()[0]
+        row = conn.execute("SELECT COUNT(*) FROM images WHERE status IN ('kept', 'maybe')").fetchone()
+        if row:
+            total_images = max(row[0], 1)
         conn.close()
+    except Exception:
+        pass  # use defaults on any DB error
 
     # Fill smallest first: sm needs X GB, md needs Y GB, lg gets the rest
     remaining = thumb_budget
     for size in THUMB_TIERS:  # sm, md, lg
-        needed = avg_bytes[size] * max(total_images, 1)
+        needed = avg_bytes[size] * total_images
         allocations[size] = min(needed, remaining)
         remaining = max(0, remaining - allocations[size])
 
