@@ -2587,7 +2587,7 @@ const PhotoArchive = (() => {
             const stats = await statsRes.json();
             const folderInput = document.getElementById('scan-folder');
             const totalEl = document.getElementById('scan-total-images');
-            if (totalEl) totalEl.textContent = (stats.total || 0).toLocaleString();
+            if (totalEl) totalEl.textContent = (stats.total_images || 0).toLocaleString();
             // Infer folder from DB
             try {
                 const folderRes = await fetch('/api/scan/folder');
@@ -2629,15 +2629,15 @@ const PhotoArchive = (() => {
                 const res = await fetch('/api/scan/status');
                 const data = await res.json();
                 const countEl = document.getElementById('scan-progress-count');
-                if (countEl) countEl.textContent = (data.found || 0).toLocaleString();
+                if (countEl) countEl.textContent = (data.total_found || 0).toLocaleString();
                 const totalEl = document.getElementById('scan-total-images');
-                if (totalEl) totalEl.textContent = (data.total || 0).toLocaleString();
+                if (totalEl) totalEl.textContent = (data.total_inserted || 0).toLocaleString();
                 if (!data.scanning) {
                     clearInterval(_scanPoller);
                     _scanPoller = null;
                     if (btn) { btn.disabled = false; btn.textContent = 'Scan Folder'; }
                     if (progress) progress.classList.add('hidden');
-                    setSettingsStatus(`Scan complete. ${(data.total || 0).toLocaleString()} images in database.`, 'success');
+                    setSettingsStatus(`Scan complete. ${(data.total_inserted || 0).toLocaleString()} images in database.`, 'success');
                 }
             } catch {}
         }, 1000);
