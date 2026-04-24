@@ -693,23 +693,28 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
         cand_matrix = matrix[cand_indices]  # (N_cand, dim)
 
         # Comparison-count bias: soft preference for less-compared images
-        # Weight = 1/(comparisons+1), so unranked=1.0, 10 comparisons=0.09, 50=0.02
         comp_bias = np.array([1.0 / (c["comparisons"] + 1) for c in cand_items])
 
-        # Seed: randomly pick from the least-compared quartile for variety
-        quartile_threshold = np.percentile(comp_bias, 75)
-        seed_candidates = np.where(comp_bias >= quartile_threshold)[0]
-        first = int(random.choice(seed_candidates))
+        # Subsample a fresh random pool each call — this is what creates variety
+        # between refreshes. Pool is large enough for good diversity (500 from 20k)
+        POOL = min(500, len(cand_items))
+        if len(cand_items) > POOL:
+            # Weighted sample: least-compared images 10x more likely
+            weights = comp_bias / comp_bias.sum()
+            pool_idx = np.random.choice(len(cand_items), size=POOL, replace=False, p=weights)
+            cand_matrix = cand_matrix[pool_idx]
+            comp_bias = comp_bias[pool_idx]
+            cand_items = [cand_items[i] for i in pool_idx]
+
+        # Random seed for variety
+        first = random.randrange(len(cand_items))
         selected = [first]
 
         # Greedy farthest-point with comparison-count bias
-        # Score = diversity_distance * (1 + comp_bias) — least-compared images
-        # break ties, but visual diversity still dominates
-        max_sim = cand_matrix @ cand_matrix[first]  # (N_cand,)
+        max_sim = cand_matrix @ cand_matrix[first]
 
         for _ in range(count - 1):
             max_sim[selected[-1]] = 999.0
-            # Lower score = better: high similarity is bad, low comparisons is good
             score = max_sim - comp_bias * 0.15
             next_pick = int(np.argmin(score))
             selected.append(next_pick)
