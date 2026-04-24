@@ -156,36 +156,13 @@ def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
     full_reserve = int(total * 0.05)
     thumb_budget = total - full_reserve
 
-    # Estimated per-image sizes (calibrated from real cache data at JPEG q=92)
-    avg_bytes = {"sm": 33_700, "md": 479_000, "lg": 2_100_000}
-
-    # Estimate image count from current cache entries if available
-    total_images = 150_000  # safe default for large archives
-    try:
-        conn = _db_connect()
-        for size in THUMB_TIERS:
-            row = conn.execute(
-                "SELECT COUNT(*) as n, COALESCE(SUM(size_bytes), 0) as total "
-                "FROM cache_entries WHERE cache_root = ? AND size = ?",
-                (SSD_CACHE_DIR, size),
-            ).fetchone()
-            if row and row["n"] > 100:
-                avg_bytes[size] = int(row["total"] / row["n"])
-        row = conn.execute("SELECT COUNT(*) FROM images WHERE status IN ('kept', 'maybe')").fetchone()
-        if row:
-            total_images = max(row[0], 1)
-        conn.close()
-    except Exception:
-        pass  # use defaults on any DB error
-
-    # Fill smallest first: sm needs X GB, md needs Y GB, lg gets the rest
-    remaining = thumb_budget
-    for size in THUMB_TIERS:  # sm, md, lg
-        needed = avg_bytes[size] * total_images
-        allocations[size] = min(needed, remaining)
-        remaining = max(0, remaining - allocations[size])
-
-    allocations[FULL_TIER] = full_reserve + remaining
+    # Fixed proportions calibrated for large photo archives:
+    # sm is tiny (~1% of budget), md moderate (~15%), lg dominates (~79%)
+    # This ensures sm is always fully cached for grid browsing.
+    proportions = {"sm": 0.01, "md": 0.15, "lg": 0.79}
+    for size in THUMB_TIERS:
+        allocations[size] = int(thumb_budget * proportions[size])
+    allocations[FULL_TIER] = full_reserve
     return allocations
 
 
