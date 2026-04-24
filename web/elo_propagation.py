@@ -20,9 +20,20 @@ log = logging.getLogger("elo_propagation")
 
 # Tuning parameters
 SIMILARITY_THRESHOLD = 0.75   # minimum cosine similarity to propagate
-MAX_NEIGHBORS = 10            # max images to adjust per winner/loser
+MAX_NEIGHBORS = 20            # max images to adjust per winner/loser
 PROPAGATION_DECAY = 0.3       # scale factor (0.3 = propagated change is 30% of direct)
 MAX_DIRECT_COMPARISONS = 8    # don't propagate to images with this many+ direct comparisons
+
+
+def _nonlinear_weight(similarity: float) -> float:
+    """Remap similarity to a cubic curve so near-identical images (0.99)
+    get strong propagation while barely-qualifying ones (0.75) get almost none.
+
+    Linear:  0.75→0.75, 0.90→0.90, 0.99→0.99  (flat, everything gets a lot)
+    Cubic:   0.75→0.00, 0.90→0.22, 0.99→0.89  (steep falloff for weak matches)
+    """
+    t = (similarity - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)
+    return t * t * t  # cubic
 
 
 
@@ -83,17 +94,18 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
 
             # Boost images similar to the winner
             for neighbor_id, similarity in winner_neighbors:
-                # Skip if this neighbor was directly involved in the comparison
                 if neighbor_id == loser_id:
                     continue
-                boost = k * similarity * PROPAGATION_DECAY
+                weight = _nonlinear_weight(similarity)
+                boost = k * weight * PROPAGATION_DECAY
                 deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) + boost
 
             # Penalize images similar to the loser
             for neighbor_id, similarity in loser_neighbors:
                 if neighbor_id == winner_id:
                     continue
-                penalty = k * similarity * PROPAGATION_DECAY
+                weight = _nonlinear_weight(similarity)
+                penalty = k * weight * PROPAGATION_DECAY
                 deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
 
             updates = []
@@ -160,7 +172,8 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
             for neighbor_id, similarity in winner_neighbors:
                 if neighbor_id in involved:
                     continue
-                boost = k * similarity * PROPAGATION_DECAY
+                weight = _nonlinear_weight(similarity)
+                boost = k * weight * PROPAGATION_DECAY
                 deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) + boost
 
             # Penalize images similar to losers (scaled down since each
@@ -170,7 +183,8 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
                 for neighbor_id, similarity in loser_neighbors:
                     if neighbor_id in involved:
                         continue
-                    penalty = k * similarity * PROPAGATION_DECAY * loser_scale
+                    weight = _nonlinear_weight(similarity)
+                    penalty = k * weight * PROPAGATION_DECAY * loser_scale
                     deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
 
             updates = []
