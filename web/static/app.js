@@ -1301,7 +1301,7 @@ const PhotoArchive = (() => {
         sentinel.style.height = '1px';
         document.querySelector('.rankings-grid')?.after(sentinel);
         const scrollObserver = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting && !rankingsLoading && !rankingsExhausted && !searchQuery) {
+            if (entries[0].isIntersecting && !rankingsLoading && !rankingsExhausted) {
                 loadRankings();
             }
         }, { rootMargin: '600px' });
@@ -1364,16 +1364,12 @@ const PhotoArchive = (() => {
                     searchQuery = e.target.value.trim();
                     const clearBtn = document.getElementById('search-clear');
                     if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
-                    // Switch to search mode or back to sort mode
+                    // Search is a filter — reload rankings with the query
                     rankingsOffset = 0;
-                    document.getElementById('rankings-grid').innerHTML = '';
-                    const sortToggles = document.getElementById('sort-toggles');
-                    if (sortToggles) sortToggles.style.opacity = searchQuery ? '0.3' : '1';
-                    if (searchQuery) {
-                        loadSearchResults();
-                    } else {
-                        loadRankings();
-                    }
+                    rankingsExhausted = false;
+                    libraryImages = [];
+                    rankingsLoading = false;
+                    loadRankings(true);
                 }, 300);
             });
             input.addEventListener('keydown', (e) => {
@@ -1434,7 +1430,6 @@ const PhotoArchive = (() => {
     }
 
     function setRankingsSort(sort) {
-        if (searchQuery) return;
         rankingsSort = sort;
         rankingsOffset = 0;
         rankingsExhausted = false;
@@ -1445,7 +1440,6 @@ const PhotoArchive = (() => {
     }
 
     function setSortField(field) {
-        if (searchQuery) return;
         sortField = field;
         sortDesc = true; // reset to desc when changing field
         updateSortDirIcon();
@@ -1474,6 +1468,7 @@ const PhotoArchive = (() => {
         const requestOffset = rankingsOffset;
         const limit = currentLibraryPageSize();
         let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
+        if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
         const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
         if (!data) {
             rankingsLoading = false;
