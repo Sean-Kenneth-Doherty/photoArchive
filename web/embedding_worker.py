@@ -31,7 +31,7 @@ if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
 EMBEDDING_DIM = 2048  # Native output dimension for Qwen3-VL-Embedding-2B
-BATCH_SIZE = 4  # Back to 4 — pipelined loading keeps GPU fed without blocking
+BATCH_SIZE = 8  # 8 images per batch — RTX 2060 SUPER has headroom with int4 model
 EMBED_SPEED_WINDOW_SECONDS = 300
 EMBED_CANDIDATE_MULTIPLIER = 16
 EMBED_RETRY_SECONDS = 600
