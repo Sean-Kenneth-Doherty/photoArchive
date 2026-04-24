@@ -141,21 +141,46 @@ def _ensure_disk_cache_dirs():
 
 
 def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
+    """Allocate SSD budget using a fill-from-smallest strategy.
+
+    Prioritizes sm (always 100%), then md, then lg with remainder.
+    This ensures grid browsing is always fast before investing in
+    loupe-quality cache. Full-res tier gets 5% reserved.
+    """
     allocations = {tier: 0 for tier in ALL_TIERS}
     total = max(0, int(total_bytes))
-    # Target proportions — scaled to actual budget if budget is smaller
-    targets = {
-        "sm": 1 * 1024 * 1024 * 1024,
-        "md": 15 * 1024 * 1024 * 1024,
-        "lg": 55 * 1024 * 1024 * 1024,
-    }
-    target_sum = sum(targets.values())
-    # Reserve at least 10% for full tier, rest split proportionally among thumb tiers
-    thumb_budget = min(total, int(total * 0.9)) if total < target_sum else target_sum
-    scale = thumb_budget / target_sum if target_sum > 0 else 0
-    for tier in THUMB_TIERS:
-        allocations[tier] = int(targets[tier] * scale)
-    allocations[FULL_TIER] = max(0, total - sum(allocations[t] for t in THUMB_TIERS))
+    if total <= 0:
+        return allocations
+
+    # Reserve 5% for full-res cache (used in loupe 1:1 view)
+    full_reserve = int(total * 0.05)
+    thumb_budget = total - full_reserve
+
+    # Estimate per-image sizes from current cache, or use defaults
+    avg_bytes = {"sm": 33_700, "md": 479_000, "lg": 2_100_000}
+    with _meta_lock:
+        conn = _db_connect()
+        for size in THUMB_TIERS:
+            row = conn.execute(
+                "SELECT COUNT(*) as n, COALESCE(SUM(size_bytes), 0) as total "
+                "FROM cache_entries WHERE cache_root = ? AND size = ?",
+                (SSD_CACHE_DIR, size),
+            ).fetchone()
+            if row and row["n"] > 100:
+                avg_bytes[size] = int(row["total"] / row["n"])
+        total_images = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE status IN ('kept', 'maybe')"
+        ).fetchone()[0]
+        conn.close()
+
+    # Fill smallest first: sm needs X GB, md needs Y GB, lg gets the rest
+    remaining = thumb_budget
+    for size in THUMB_TIERS:  # sm, md, lg
+        needed = avg_bytes[size] * max(total_images, 1)
+        allocations[size] = min(needed, remaining)
+        remaining = max(0, remaining - allocations[size])
+
+    allocations[FULL_TIER] = full_reserve + remaining
     return allocations
 
 
@@ -419,10 +444,14 @@ def _enforce_tier_budget_locked(conn: sqlite3.Connection, size: str):
     if total <= budget:
         return
 
+    # Evict least-valuable images first: low Elo, low comparisons, oldest access.
+    # This keeps your best-ranked photos in fast cache.
     evict_rows = conn.execute(
-        "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
-        "WHERE cache_root = ? AND size = ? "
-        "ORDER BY last_accessed ASC, image_id ASC",
+        "SELECT c.cache_root, c.size, c.image_id, c.path, c.size_bytes "
+        "FROM cache_entries c "
+        "LEFT JOIN images i ON c.image_id = i.id "
+        "WHERE c.cache_root = ? AND c.size = ? "
+        "ORDER BY COALESCE(i.elo, 1200) ASC, c.last_accessed ASC",
         (SSD_CACHE_DIR, size),
     ).fetchall()
     for row in evict_rows:
