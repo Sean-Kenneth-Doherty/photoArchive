@@ -889,7 +889,10 @@ async def mosaic_pick(request: Request):
 # --- Compare API ---
 
 @app.get("/api/compare/next")
-async def compare_next(n: int = 5, mode: str = "swiss"):
+async def compare_next(
+    n: int = 5, mode: str = "swiss",
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+):
     if mode == "topn":
         images = await db.get_top_images(limit=50)
     else:
@@ -899,6 +902,25 @@ async def compare_next(n: int = 5, mode: str = "swiss"):
         return {"pairs": [], "total_kept": len(images)}
 
     image_dicts = [dict(img) for img in images]
+
+    # Apply filters
+    if orientation in ("landscape", "portrait"):
+        image_dicts = [c for c in image_dicts if c.get("orientation") == orientation]
+    if compared == "compared":
+        image_dicts = [c for c in image_dicts if c["comparisons"] > 0]
+    elif compared == "uncompared":
+        image_dicts = [c for c in image_dicts if c["comparisons"] == 0]
+    elif compared == "confident":
+        image_dicts = [c for c in image_dicts if c["comparisons"] >= 10]
+    if min_stars > 0:
+        from db import STAR_THRESHOLDS
+        threshold = STAR_THRESHOLDS.get(min_stars, 0)
+        image_dicts = [c for c in image_dicts if c["elo"] >= threshold]
+    if folder:
+        image_dicts = [c for c in image_dicts if f"/{folder}/" in c.get("filepath", "")]
+
+    if len(image_dicts) < 2:
+        return {"pairs": [], "total_kept": len(image_dicts)}
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 

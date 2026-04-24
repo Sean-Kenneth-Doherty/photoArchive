@@ -1084,7 +1084,7 @@ const PhotoArchive = (() => {
     }
 
     function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS) {
-        return `/api/compare/next?n=${n}&mode=${mode}`;
+        return `/api/compare/next?n=${n}&mode=${mode}${filterParams()}`;
     }
 
     function currentLibraryPageSize() {
