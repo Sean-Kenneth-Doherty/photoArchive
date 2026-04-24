@@ -397,7 +397,7 @@ const PhotoArchive = (() => {
 
     // ==================== MOSAIC RANKING MODE ====================
 
-    const MOSAIC_SIZE = 12;
+    let mosaicSize = 12;
     let mosaicImages = []; // currently visible images [{id, filename, elo, thumb_url}, ...]
     let mosaicAge = []; // how many clicks each image has survived on the board
     let mosaicPickCount = 0;
@@ -409,7 +409,7 @@ const PhotoArchive = (() => {
     }
 
     async function loadMosaicBatch() {
-        const url = buildMosaicUrl({ n: MOSAIC_SIZE });
+        const url = buildMosaicUrl({ n: mosaicSize });
         const data = takeWarmCache(`compare:${url}`) || await fetchWarmJson(url);
         if (!data) return;
         compareStats = data.stats || {};
@@ -619,12 +619,16 @@ const PhotoArchive = (() => {
         document.addEventListener('keydown', handleCompareKey);
         document.getElementById('compare-left').addEventListener('click', () => submitComparison('left'));
         document.getElementById('compare-right').addEventListener('click', () => submitComparison('right'));
+        // Set slider to match default mosaic size (12 images → slider ~168)
+        const slider = document.getElementById('thumb-size');
+        if (slider) {
+            const t = (24 - mosaicSize) / 20; // invert: size→t
+            slider.value = Math.round(120 + t * 280);
+        }
         setCompareMode('mosaic');
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
-        // Load folder list for filter dropdown
         loadFolderList();
-        // Star hover preview
         initStarHover();
     }
 
@@ -1069,7 +1073,7 @@ const PhotoArchive = (() => {
                 strategy: 'explore',
                 filterState: { orientation: '', compared: '', rating: '', folder: '' },
                 gridElo: 0,
-                n: MOSAIC_SIZE,
+                n: mosaicSize,
             });
             const requests = [{
                 url: compareUrl,
@@ -1918,10 +1922,22 @@ const PhotoArchive = (() => {
 
     function setThumbSize(value) {
         thumbHeight = parseInt(value);
-        // Use CSS custom property to avoid per-card layout thrashing
+
+        // Compare page: slider controls mosaic grid size
+        const mosaicGrid = document.getElementById('mosaic-grid');
+        if (mosaicGrid) {
+            // Map slider 120-400 → mosaic count 24-4 (small thumb = more images)
+            const t = (thumbHeight - 120) / (400 - 120); // 0..1
+            const newSize = Math.round(24 - t * 20);     // 24 down to 4
+            if (newSize !== mosaicSize) {
+                mosaicSize = newSize;
+                loadMosaicBatch();
+            }
+            return;
+        }
+
+        // Library page: slider controls card height
         document.documentElement.style.setProperty('--thumb-height', thumbHeight + 'px');
-        // Cards that need explicit flex-basis still need individual updates,
-        // but batch reads first, then writes to avoid interleaved reflows.
         const cards = document.querySelectorAll('.rank-card');
         const updates = [];
         for (const card of cards) {
