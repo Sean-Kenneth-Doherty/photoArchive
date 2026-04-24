@@ -1274,6 +1274,7 @@ const PhotoArchive = (() => {
         'comparisons': { desc: 'comparisons',   asc: 'least_compared' },
         'newest':      { desc: 'newest',        asc: 'oldest' },
         'filename':    { desc: 'filename_desc', asc: 'filename' },
+        'similarity':  { desc: 'similarity',    asc: 'similarity' },
     };
 
     async function initLibrary() {
@@ -1364,6 +1365,7 @@ const PhotoArchive = (() => {
                     searchQuery = e.target.value.trim();
                     const clearBtn = document.getElementById('search-clear');
                     if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
+                    updateSimilaritySortOption();
                     // Search is a filter — reload rankings with the query
                     rankingsOffset = 0;
                     rankingsExhausted = false;
@@ -1380,14 +1382,36 @@ const PhotoArchive = (() => {
 
     function initRankings() { initLibrary(); }
 
+    function updateSimilaritySortOption() {
+        const select = document.getElementById('sort-field');
+        if (!select) return;
+        let opt = select.querySelector('option[value="similarity"]');
+        if (searchQuery) {
+            if (!opt) {
+                opt = document.createElement('option');
+                opt.value = 'similarity';
+                opt.textContent = 'Similarity';
+                select.appendChild(opt);
+            }
+        } else {
+            if (opt) {
+                // If similarity was selected, switch back to elo
+                if (select.value === 'similarity') {
+                    select.value = 'elo';
+                    setSortField('elo');
+                }
+                opt.remove();
+            }
+        }
+    }
+
     function clearSearch() {
         searchQuery = '';
         const input = document.getElementById('search-input');
         const clearBtn = document.getElementById('search-clear');
-        const sortToggles = document.getElementById('sort-toggles');
         if (input) input.value = '';
         if (clearBtn) clearBtn.classList.add('hidden');
-        if (sortToggles) sortToggles.style.opacity = '1';
+        updateSimilaritySortOption();
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
