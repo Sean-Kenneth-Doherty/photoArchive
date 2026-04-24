@@ -411,7 +411,8 @@ const PhotoArchive = (() => {
 
     async function loadMosaicBatch() {
         const url = buildMosaicUrl({ n: mosaicSize });
-        const data = takeWarmCache(`compare:${url}`) || await fetchWarmJson(url);
+        // Never use warm cache for diverse strategy — each load should be fresh
+        const data = (mosaicStrategy !== 'diverse' ? takeWarmCache(`compare:${url}`) : null) || await fetchWarmJson(url);
         if (!data) return;
         compareStats = data.stats || {};
         updateCompareProgress();
