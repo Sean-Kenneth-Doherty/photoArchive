@@ -775,14 +775,46 @@ const PhotoArchive = (() => {
     }
 
     let _propagationBadgeTimer = null;
+    let _rollupAnim = null;
+    let _displayedComparisons = -1;
 
     function updateCompareProgress() {
         const total = compareStats.total_comparisons || 0;
         const kept = compareStats.kept || 0;
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
-        if (compEl) compEl.textContent = total.toLocaleString();
         if (poolEl) poolEl.textContent = kept.toLocaleString();
+        if (!compEl) return;
+
+        if (_displayedComparisons < 0) {
+            // First load — no animation
+            _displayedComparisons = total;
+            compEl.textContent = total.toLocaleString();
+            return;
+        }
+        if (total === _displayedComparisons) return;
+        rollUpCounter(compEl, _displayedComparisons, total);
+        _displayedComparisons = total;
+    }
+
+    function rollUpCounter(el, from, to) {
+        if (_rollupAnim) cancelAnimationFrame(_rollupAnim);
+        const diff = to - from;
+        const duration = Math.min(600, Math.max(200, Math.abs(diff) * 4));
+        const start = performance.now();
+
+        function tick(now) {
+            const t = Math.min((now - start) / duration, 1);
+            const eased = 1 - (1 - t) * (1 - t); // ease-out quad
+            const current = Math.round(from + diff * eased);
+            el.textContent = current.toLocaleString();
+            if (t < 1) {
+                _rollupAnim = requestAnimationFrame(tick);
+            } else {
+                _rollupAnim = null;
+            }
+        }
+        _rollupAnim = requestAnimationFrame(tick);
     }
 
     function fetchPropagationCount() {
