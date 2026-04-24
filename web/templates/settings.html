@@ -81,6 +81,10 @@
         <section class="settings-card settings-card-wide">
             <h2>Cache</h2>
             <p class="settings-card-copy">RAM and SSD budgets live here. Worker counts, warm-up depth, and browser cache policy are tuned automatically for this desktop.</p>
+            <div class="settings-metric-list" id="cache-tier-guide" style="margin-bottom: 12px; padding: 8px; background: #1a1a1a; border-radius: 4px;">
+                <div style="color: #888; font-size: 11px; margin-bottom: 4px;">Recommended tiers for your archive (calculated from actual image sizes):</div>
+                <div id="cache-tier-table" style="font-family: monospace; font-size: 11px; color: #aaa; white-space: pre;"></div>
+            </div>
             <label class="settings-field">
                 <span>RAM budget (GB)</span>
                 <input id="memory_cache_gb" type="number" min="0" max="64" step="0.25">

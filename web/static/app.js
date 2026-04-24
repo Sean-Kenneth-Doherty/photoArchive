@@ -2439,6 +2439,37 @@ const PhotoArchive = (() => {
         renderAutoTuningStatus(data.settings);
         renderModelStatus(data.model_status);
         renderAISettingsStatus(data.ai_status);
+        renderCacheTierGuide(data.cache_stats);
+    }
+
+    function renderCacheTierGuide(cs) {
+        const el = document.getElementById('cache-tier-table');
+        if (!el || !cs?.disk?.tiers?.sm) return;
+        const t = cs.disk.tiers;
+        const total = t.sm.progress_total || 1;
+        const smAvg = t.sm.count > 0 ? t.sm.used_bytes / t.sm.count : 33000;
+        const mdAvg = t.md.count > 0 ? t.md.used_bytes / t.md.count : 480000;
+        const lgAvg = t.lg.count > 0 ? t.lg.used_bytes / t.lg.count : 2100000;
+        const smFull = (smAvg * total / 1e9).toFixed(0);
+        const mdFull = (mdAvg * total / 1e9).toFixed(0);
+        const lgFull = (lgAvg * total / 1e9).toFixed(0);
+        const allFull = (+smFull + +mdFull + +lgFull);
+        const n = total.toLocaleString();
+
+        const lines = [
+            `${n} images: sm=${smFull}GB  md=${mdFull}GB  lg=${lgFull}GB  total=${allFull}GB`,
+            ``,
+            `SSD:   50GB → browse thumbnails only`,
+            `      100GB → smooth browsing + partial loupe`,
+            `      200GB → fast loupe for most images`,
+            `      ${allFull > 400 ? allFull : 400}GB → everything cached (zero HDD reads)`,
+            ``,
+            `RAM:  0.5GB → recent images only`,
+            `      2GB  → all small thumbnails in memory`,
+            `      4GB  → fast grid + some loupe`,
+            `      8GB  → power browsing`,
+        ];
+        el.textContent = lines.join('\n');
     }
 
     function renderModelStatus(modelStatus) {
