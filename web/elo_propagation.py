@@ -22,10 +22,10 @@ log = logging.getLogger("elo_propagation")
 last_propagation_count = 0
 
 # Tuning parameters
-SIMILARITY_THRESHOLD = 0.75   # minimum cosine similarity to propagate
-MAX_NEIGHBORS = 20            # max images to adjust per winner/loser
+SIMILARITY_THRESHOLD = 0.70   # minimum cosine similarity to propagate
+MAX_NEIGHBORS = 100           # long tail — cubic scaling makes weak matches near-zero anyway
 PROPAGATION_DECAY = 0.3       # scale factor (0.3 = propagated change is 30% of direct)
-MAX_DIRECT_COMPARISONS = 8    # don't propagate to images with this many+ direct comparisons
+MAX_DIRECT_COMPARISONS = 50   # allow propagation to well-compared images (cubic scaling keeps it safe)
 
 
 def _nonlinear_weight(similarity: float) -> float:
