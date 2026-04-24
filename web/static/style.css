@@ -138,7 +138,7 @@ a:hover {
 }
 
 .bar-btn {
-    padding: 4px 10px;
+    padding: 6px 12px;
     font-size: 11px;
     background: #333;
     color: #ccc;
@@ -1100,12 +1100,12 @@ button:disabled {
 
 .bar-search-input {
     width: 140px;
-    padding: 4px 24px 4px 8px;
+    padding: 6px 24px 6px 8px;
     background: #2a2a2a;
     border: 1px solid #3a3a3a;
     border-radius: 4px;
     color: #e0e0e0;
-    font-size: 11px;
+    font-size: 12px;
     outline: none;
     transition: border-color 0.15s, width 0.2s;
 }
@@ -1298,14 +1298,14 @@ button:disabled {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: 30px;
+    height: 30px;
     background: none;
     color: #666;
     border: none;
-    border-radius: 0;
+    border-radius: 4px;
     cursor: pointer;
-    transition: color 0.15s;
+    transition: color 0.15s, background 0.15s;
 }
 
 .filter-icon:hover {
@@ -1336,9 +1336,9 @@ button:disabled {
     background: none;
     border: none;
     color: #555;
-    font-size: 12px;
+    font-size: 14px;
     cursor: pointer;
-    padding: 1px 0;
+    padding: 6px 2px;
     line-height: 1;
     transition: color 0.1s;
 }
@@ -1358,7 +1358,7 @@ button:disabled {
 
 /* Bar filter selects */
 .bar-select {
-    padding: 3px 6px;
+    padding: 5px 8px;
     font-size: 11px;
     background: #333;
     color: #ccc;
@@ -1385,10 +1385,19 @@ button:disabled {
 
 .bar-slider::-webkit-slider-thumb {
     -webkit-appearance: none;
-    width: 14px;
-    height: 14px;
+    width: 16px;
+    height: 16px;
     border-radius: 50%;
     background: #6cb4ee;
+    cursor: pointer;
+}
+
+.bar-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #6cb4ee;
+    border: none;
     cursor: pointer;
 }
 
