@@ -25,6 +25,9 @@ const PhotoArchive = (() => {
     const COMPARE_NEIGHBOR_PAIRS = 4;
     const FILMSTRIP_WINDOW_RADIUS = 55;
     const LOUPE_FULL_LOAD_DELAY_MS = 0;
+    const LOUPE_TIER_LABELS = ['Thumbnail (sm)', 'Medium (md)', 'Large (lg)', 'Original'];
+    let selectedLibraryIndex = -1;
+    let selectedMosaicIndex = -1;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
@@ -432,6 +435,7 @@ const PhotoArchive = (() => {
     function renderMosaic() {
         const grid = document.getElementById('mosaic-grid');
         grid.innerHTML = '';
+        selectedMosaicIndex = -1;
 
         // Calculate row height to fit all images in the viewport
         // using the same justified flex layout as the library
@@ -820,11 +824,82 @@ const PhotoArchive = (() => {
     }
 
     function handleCompareKey(e) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+        if (compareMode === 'mosaic') {
+            const cells = document.querySelectorAll('.mosaic-cell');
+            if (!cells.length) return;
+
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (selectedMosaicIndex < 0) {
+                    selectMosaicCell(0, cells);
+                    return;
+                }
+                if (e.key === 'ArrowRight') {
+                    selectMosaicCell(Math.min(selectedMosaicIndex + 1, cells.length - 1), cells);
+                } else if (e.key === 'ArrowLeft') {
+                    selectMosaicCell(Math.max(selectedMosaicIndex - 1, 0), cells);
+                } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    const target = findMosaicCellInDirection(cells, selectedMosaicIndex, e.key === 'ArrowDown' ? 1 : -1);
+                    selectMosaicCell(target, cells);
+                }
+            } else if (e.key === 'Enter' && selectedMosaicIndex >= 0 && selectedMosaicIndex < mosaicImages.length) {
+                e.preventDefault();
+                mosaicClick(mosaicImages[selectedMosaicIndex].id);
+                deselectMosaicCell();
+            } else if (e.key === 'Escape' && selectedMosaicIndex >= 0) {
+                e.preventDefault();
+                deselectMosaicCell(cells);
+            }
+            if (e.key === 'ArrowUp' && selectedMosaicIndex < 0) {
+                e.preventDefault();
+                undoComparison();
+            }
+            return;
+        }
+
+        // Swiss/A-B mode
         switch (e.key) {
             case 'ArrowLeft': submitComparison('left'); break;
             case 'ArrowRight': submitComparison('right'); break;
             case 'ArrowUp': undoComparison(); break;
         }
+    }
+
+    function selectMosaicCell(index, cells) {
+        if (!cells) cells = document.querySelectorAll('.mosaic-cell');
+        if (index < 0 || index >= cells.length) return;
+        cells.forEach(c => c.classList.remove('kb-selected'));
+        selectedMosaicIndex = index;
+        cells[index].classList.add('kb-selected');
+    }
+
+    function deselectMosaicCell(cells) {
+        if (!cells) cells = document.querySelectorAll('.mosaic-cell');
+        cells.forEach(c => c.classList.remove('kb-selected'));
+        selectedMosaicIndex = -1;
+    }
+
+    function findMosaicCellInDirection(cells, currentIdx, direction) {
+        const current = cells[currentIdx];
+        if (!current) return currentIdx;
+        const rect = current.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        let best = currentIdx;
+        let bestDist = Infinity;
+
+        for (let i = 0; i < cells.length; i++) {
+            if (i === currentIdx) continue;
+            const r = cells[i].getBoundingClientRect();
+            const isTarget = direction > 0 ? r.top > rect.bottom - 5 : r.bottom < rect.top + 5;
+            if (!isTarget) continue;
+            const dx = (r.left + r.width / 2) - centerX;
+            const dy = (r.top + r.height / 2) - (rect.top + rect.height / 2);
+            const dist = Math.abs(dx) + Math.abs(dy) * 0.1;
+            if (dist < bestDist) { bestDist = dist; best = i; }
+        }
+        return best;
     }
 
     function setCompareMode(mode) {
@@ -1095,11 +1170,44 @@ const PhotoArchive = (() => {
 
         // Loupe keyboard navigation
         document.addEventListener('keydown', (e) => {
+            // Don't intercept when typing in an input
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
             const loupe = document.getElementById('loupe');
-            if (!loupe || loupe.classList.contains('hidden')) return;
-            if (e.key === 'ArrowRight') { e.preventDefault(); lightboxNext(); }
-            else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxPrev(); }
-            else if (e.key === 'Escape') { closeLightbox(); }
+            const loupeOpen = loupe && !loupe.classList.contains('hidden');
+
+            if (loupeOpen) {
+                if (e.key === 'ArrowRight') { e.preventDefault(); lightboxNext(); }
+                else if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxPrev(); }
+                else if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); closeLightbox(); }
+                return;
+            }
+
+            // Grid keyboard navigation
+            const cards = document.querySelectorAll('.rank-card');
+            if (!cards.length) return;
+
+            if (e.key === 'ArrowRight' || e.key === 'ArrowLeft' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (selectedLibraryIndex < 0) {
+                    selectLibraryCard(0, cards);
+                    return;
+                }
+                if (e.key === 'ArrowRight') {
+                    selectLibraryCard(Math.min(selectedLibraryIndex + 1, cards.length - 1), cards);
+                } else if (e.key === 'ArrowLeft') {
+                    selectLibraryCard(Math.max(selectedLibraryIndex - 1, 0), cards);
+                } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    const target = findCardInDirection(cards, selectedLibraryIndex, e.key === 'ArrowDown' ? 1 : -1);
+                    selectLibraryCard(target, cards);
+                }
+            } else if (e.key === 'Enter' && selectedLibraryIndex >= 0 && selectedLibraryIndex < libraryImages.length) {
+                e.preventDefault();
+                openLightbox(libraryImages[selectedLibraryIndex]);
+            } else if (e.key === 'Escape' && selectedLibraryIndex >= 0) {
+                e.preventDefault();
+                deselectLibraryCard(cards);
+            }
         });
 
         // Loupe zoom/pan interaction
@@ -1230,7 +1338,7 @@ const PhotoArchive = (() => {
             return;
         }
         const grid = document.getElementById('rankings-grid');
-        if (clearFirst) grid.innerHTML = '';
+        if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; }
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
         const rowH = thumbHeight;
 
@@ -1280,6 +1388,42 @@ const PhotoArchive = (() => {
             scheduleLibraryNeighborWarmup();
             if (requestOffset === 0) scheduleCrossViewWarmup('library');
         }
+    }
+
+    function selectLibraryCard(index, cards) {
+        if (!cards) cards = document.querySelectorAll('.rank-card');
+        if (index < 0 || index >= cards.length) return;
+        cards.forEach(c => c.classList.remove('kb-selected'));
+        selectedLibraryIndex = index;
+        cards[index].classList.add('kb-selected');
+        cards[index].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    function deselectLibraryCard(cards) {
+        if (!cards) cards = document.querySelectorAll('.rank-card');
+        cards.forEach(c => c.classList.remove('kb-selected'));
+        selectedLibraryIndex = -1;
+    }
+
+    function findCardInDirection(cards, currentIdx, direction) {
+        const current = cards[currentIdx];
+        if (!current) return currentIdx;
+        const rect = current.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        let best = currentIdx;
+        let bestDist = Infinity;
+
+        for (let i = 0; i < cards.length; i++) {
+            if (i === currentIdx) continue;
+            const r = cards[i].getBoundingClientRect();
+            const isBelow = direction > 0 ? r.top > rect.bottom - 5 : r.bottom < rect.top + 5;
+            if (!isBelow) continue;
+            const dx = (r.left + r.width / 2) - centerX;
+            const dy = (r.top + r.height / 2) - (rect.top + rect.height / 2);
+            const dist = Math.abs(dx) + Math.abs(dy) * 0.1;
+            if (dist < bestDist) { bestDist = dist; best = i; }
+        }
+        return best;
     }
 
     function openLightbox(img) {
@@ -1416,9 +1560,11 @@ const PhotoArchive = (() => {
         const filenameEl = document.getElementById('loupe-overlay-filename');
         const exifEl = document.getElementById('loupe-overlay-exif');
         const statsEl = document.getElementById('loupe-overlay-stats');
+        const tierEl = document.getElementById('loupe-overlay-tier');
 
         if (filenameEl) filenameEl.textContent = img.filename;
         if (exifEl) exifEl.textContent = '';
+        if (tierEl) tierEl.textContent = LOUPE_TIER_LABELS[0];
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
@@ -1476,6 +1622,9 @@ const PhotoArchive = (() => {
             if (!loupeImg) return;
             loupeDisplayedTierRank = rank;
             loupeImg.src = probe.src;
+
+            const tierEl = document.getElementById('loupe-overlay-tier');
+            if (tierEl) tierEl.textContent = LOUPE_TIER_LABELS[rank] || `Tier ${rank}`;
         };
         probe.onerror = () => {};
         probe.src = url;

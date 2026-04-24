@@ -872,6 +872,11 @@ button:disabled {
     border-color: #444;
 }
 
+.mosaic-cell.kb-selected {
+    border-color: #6cb4ee;
+    box-shadow: 0 0 12px rgba(108, 180, 238, 0.3);
+}
+
 .mosaic-cell.mosaic-picked {
     border-color: #4a9;
     transform: scale(1.04);
@@ -1192,6 +1197,16 @@ button:disabled {
     opacity: 0.85;
 }
 
+.rank-card.kb-selected {
+    outline: 2px solid #6cb4ee;
+    outline-offset: -2px;
+    opacity: 1;
+}
+
+.rank-card.kb-selected .rank-card-info {
+    opacity: 1;
+}
+
 .rank-card img {
     width: calc(100% - 4px);
     height: calc(100% - 4px);
@@ -1439,6 +1454,13 @@ button:disabled {
     color: rgba(255,255,255,0.6);
     font-size: 12px;
     margin-top: 2px;
+}
+
+#loupe-overlay-tier {
+    color: rgba(255,255,255,0.35);
+    font-size: 11px;
+    margin-top: 4px;
+    font-family: monospace;
 }
 
 /* Filmstrip */
