@@ -154,9 +154,8 @@ async def shutdown():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    stats = await db.get_stats()
-    folder = await db.get_scan_folder()
-    return templates.TemplateResponse(request, "index.html", {"stats": stats, "folder": folder})
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/library", status_code=302)
 
 
 @app.get("/cull", response_class=HTMLResponse)
