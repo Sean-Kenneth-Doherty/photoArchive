@@ -1,5 +1,8 @@
+# Personal data
 elo_ratings.json
-.codex
+blacklist.json
+
+# Runtime / caches
 web/.venv/
 web/.cache/
 web/.embedcache/
@@ -10,9 +13,9 @@ web/settings.local.json
 web/*.db
 web/*.db-shm
 web/*.db-wal
-web/photoranker.db
-web/photoarchive.db
-web/photoarchive.db-shm
-web/photoarchive.db-wal
 __pycache__/
+
+# Tools
+.codex
 .gstack/
+.claude/
