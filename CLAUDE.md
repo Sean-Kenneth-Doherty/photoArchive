@@ -27,7 +27,7 @@ cd web && python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Arch Linux enforces PEP 668 — never use system pip directly.
 
-Photos are on an external HDD at `/run/media/sean/Expansion/Photos/Exported Edits`. The HDD is slow, so prefetching and caching are critical throughout.
+Photos can be on any mounted drive. The app is designed for slow HDDs with aggressive thumbnail caching and prefetching.
 
 ## Architecture
 
