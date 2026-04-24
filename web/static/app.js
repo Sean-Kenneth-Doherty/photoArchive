@@ -625,6 +625,7 @@ const PhotoArchive = (() => {
             const t = (24 - mosaicSize) / 20; // invert: size→t
             slider.value = Math.round(120 + t * 280);
         }
+        restoreFilters();
         setCompareMode('mosaic');
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
@@ -973,6 +974,41 @@ const PhotoArchive = (() => {
     let lightboxIndex = -1;
     let filters = { orientation: '', compared: '', rating: '', folder: '' };
 
+    function saveFilters() {
+        try { sessionStorage.setItem('pa_filters', JSON.stringify(filters)); } catch {}
+    }
+
+    function restoreFilters() {
+        try {
+            const saved = sessionStorage.getItem('pa_filters');
+            if (!saved) return;
+            const parsed = JSON.parse(saved);
+            Object.assign(filters, parsed);
+
+            // Restore UI state for filter icons
+            if (filters.orientation) {
+                document.querySelectorAll('.filter-icon').forEach(btn => {
+                    if (btn.title?.toLowerCase() === filters.orientation) btn.classList.add('active');
+                });
+            }
+            if (filters.compared) {
+                const titles = { compared: 'Ranked', uncompared: 'Unranked', confident: 'High confidence (10+)' };
+                document.querySelectorAll('.filter-icon').forEach(btn => {
+                    if (btn.title === titles[filters.compared]) btn.classList.add('active');
+                });
+            }
+            if (filters.rating) {
+                document.querySelectorAll('.filter-star').forEach(s => {
+                    s.classList.toggle('lit', Number(s.dataset.star) <= filters.rating);
+                });
+            }
+            if (filters.folder) {
+                const sel = document.getElementById('filter-folder');
+                if (sel) sel.value = filters.folder;
+            }
+        } catch {}
+    }
+
     function filterParams(state = filters) {
         let p = '';
         if (state.orientation) p += `&orientation=${state.orientation}`;
@@ -1156,6 +1192,7 @@ const PhotoArchive = (() => {
     async function initLibrary() {
         rankingsOffset = 0;
         rankingsExhausted = false;
+        restoreFilters();
 
         // Fire all init requests in parallel — don't block on rankings
         const rankingsPromise = loadRankings();
@@ -1971,6 +2008,7 @@ const PhotoArchive = (() => {
 
     function setFilter(key, value) {
         filters[key] = value;
+        saveFilters();
         reloadForFilters();
     }
 
@@ -1983,6 +2021,7 @@ const PhotoArchive = (() => {
             filters[key] = value;
             btn.classList.add('active');
         }
+        saveFilters();
         reloadForFilters();
     }
 
@@ -1995,6 +2034,7 @@ const PhotoArchive = (() => {
             s.classList.toggle('lit', lit);
             s.textContent = lit ? '★' : '☆';
         });
+        saveFilters();
         reloadForFilters();
     }
 
