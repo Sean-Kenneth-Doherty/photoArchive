@@ -2317,6 +2317,7 @@ const PhotoArchive = (() => {
         'ssd_cache_dir',
         'ssd_cache_gb',
         'pregenerate_on_idle',
+        'search_similarity_threshold',
     ];
     let settingsPoller = null;
 
@@ -2581,12 +2582,65 @@ const PhotoArchive = (() => {
 
         try {
             await loadSettingsPage(false);
+            // Load scan folder and stats
+            const statsRes = await fetch('/api/stats');
+            const stats = await statsRes.json();
+            const folderInput = document.getElementById('scan-folder');
+            const totalEl = document.getElementById('scan-total-images');
+            if (totalEl) totalEl.textContent = (stats.total || 0).toLocaleString();
+            // Infer folder from DB
+            try {
+                const folderRes = await fetch('/api/scan/folder');
+                const folderData = await folderRes.json();
+                if (folderInput && folderData.folder) folderInput.value = folderData.folder;
+            } catch {}
+
             setSettingsStatus('Ready. Save to apply changes immediately.', 'muted');
             if (settingsPoller) clearInterval(settingsPoller);
             settingsPoller = setInterval(() => refreshSettingsMeta().catch(() => {}), 5000);
         } catch (err) {
             setSettingsStatus(`Could not load settings: ${err.message}`, 'error');
         }
+    }
+
+    let _scanPoller = null;
+    async function startScan() {
+        const folderInput = document.getElementById('scan-folder');
+        const folder = folderInput?.value?.trim();
+        if (!folder) return;
+
+        const btn = document.getElementById('scan-btn');
+        if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+        const progress = document.getElementById('scan-progress');
+        if (progress) progress.classList.remove('hidden');
+
+        try {
+            await fetch('/api/scan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ folder }),
+            });
+        } catch {}
+
+        // Poll scan status
+        if (_scanPoller) clearInterval(_scanPoller);
+        _scanPoller = setInterval(async () => {
+            try {
+                const res = await fetch('/api/scan/status');
+                const data = await res.json();
+                const countEl = document.getElementById('scan-progress-count');
+                if (countEl) countEl.textContent = (data.found || 0).toLocaleString();
+                const totalEl = document.getElementById('scan-total-images');
+                if (totalEl) totalEl.textContent = (data.total || 0).toLocaleString();
+                if (!data.scanning) {
+                    clearInterval(_scanPoller);
+                    _scanPoller = null;
+                    if (btn) { btn.disabled = false; btn.textContent = 'Scan Folder'; }
+                    if (progress) progress.classList.add('hidden');
+                    setSettingsStatus(`Scan complete. ${(data.total || 0).toLocaleString()} images in database.`, 'success');
+                }
+            } catch {}
+        }, 1000);
     }
 
     async function saveSettings() {
@@ -2783,5 +2837,6 @@ const PhotoArchive = (() => {
         startCachePregeneration,
         stopCachePregeneration,
         installAIModel,
+        startScan,
     };
 })();

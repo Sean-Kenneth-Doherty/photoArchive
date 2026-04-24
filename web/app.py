@@ -227,6 +227,12 @@ async def scan_status():
     return scanner.scan_state
 
 
+@app.get("/api/scan/folder")
+async def scan_folder():
+    folder = await db.get_scan_folder()
+    return {"folder": folder or ""}
+
+
 # --- Thumbnail ---
 
 @app.get("/api/thumb/{size}/{image_id}")
