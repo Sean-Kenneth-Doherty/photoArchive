@@ -18,7 +18,7 @@ DEFAULT_SETTINGS = {
     "thumb_size_lg": 3840,
     "thumb_quality": 92,
     "ssd_cache_dir": os.path.join(WEB_DIR, ".thumbcache"),
-    "ssd_cache_gb": 10,
+    "ssd_cache_gb": 100,
     "memory_cache_gb": 0.5,
     "pregenerate_on_idle": True,
     "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
