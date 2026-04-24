@@ -554,6 +554,21 @@ button:disabled {
     padding: 0;
 }
 
+.cull-done {
+    padding: 80px 24px;
+    text-align: center;
+    color: #999;
+}
+
+.cull-done h2 {
+    color: #e0e0e0;
+    margin-bottom: 8px;
+}
+
+.cull-done a {
+    color: #6cb4ee;
+}
+
 /* Navbar center slot (cull progress + filename) */
 .nav-center {
     display: flex;
