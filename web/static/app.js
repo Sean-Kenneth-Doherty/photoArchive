@@ -1518,7 +1518,42 @@ const PhotoArchive = (() => {
         rankingsLoading = false;
         rankingsLoadPromise = null;
         selectedLibraryIndex = -1;
+        hideLibraryEmptyState();
         if (clearBatch) clearBatchSelection();
+    }
+
+    function hasActiveLibraryFilters() {
+        return Object.values(currentFilterState()).some(Boolean);
+    }
+
+    function hideLibraryEmptyState() {
+        document.getElementById('library-empty')?.classList.add('hidden');
+    }
+
+    function updateLibraryEmptyState() {
+        const empty = document.getElementById('library-empty');
+        const text = document.getElementById('library-empty-text');
+        const action = document.getElementById('library-empty-action');
+        if (!empty || !text || !action) return;
+        if (libraryImages.length > 0) {
+            empty.classList.add('hidden');
+            return;
+        }
+
+        empty.classList.remove('hidden');
+        if (hasActiveTextSearch(searchQuery)) {
+            text.textContent = `No results for '${searchQuery}'`;
+            action.textContent = 'Clear Search';
+            action.onclick = () => clearSearch();
+        } else if (hasActiveLibraryFilters()) {
+            text.textContent = 'No photos match these filters';
+            action.textContent = 'Clear Filters';
+            action.onclick = () => clearLibraryFilters();
+        } else {
+            text.textContent = 'No photos in your catalog yet';
+            action.textContent = 'Scan Folder';
+            action.onclick = () => { window.location.href = '/catalog'; };
+        }
     }
 
     function libraryScrollRoot() {
@@ -2243,6 +2278,7 @@ const PhotoArchive = (() => {
                 if (requestOffset === 0) scheduleCrossViewWarmup('library');
                 if (isDateScrubberActive()) setupScrubberScrollObserver();
             }
+            updateLibraryEmptyState();
             return data.images.length;
         } finally {
             if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
@@ -3419,6 +3455,22 @@ const PhotoArchive = (() => {
 
     function setFilter(key, value) {
         filters[key] = value;
+        updateMetadataFilterButton();
+        saveFilters();
+        reloadForFilters();
+    }
+
+    function clearLibraryFilters() {
+        filters = { ...EMPTY_FILTERS };
+        document.querySelectorAll('.bar-filters .filter-icon').forEach(btn => btn.classList.remove('active'));
+        document.querySelectorAll('.filter-star').forEach(s => {
+            s.classList.remove('lit', 'hovered');
+            s.textContent = '☆';
+        });
+        ['filter-folder', 'filter-taken', 'filter-type', 'filter-camera', 'filter-lens'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.value = '';
+        });
         updateMetadataFilterButton();
         saveFilters();
         reloadForFilters();

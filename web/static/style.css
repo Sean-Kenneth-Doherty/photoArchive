@@ -2044,6 +2044,23 @@ body.library-shell.date-scrubber-active .rankings-grid {
     flex-grow: 999;
 }
 
+.library-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-lg);
+    padding: var(--space-2xl);
+    min-height: 200px;
+}
+
+.library-empty.hidden { display: none; }
+
+.library-empty-text {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
 .rank-card {
     position: relative;
     cursor: pointer;
