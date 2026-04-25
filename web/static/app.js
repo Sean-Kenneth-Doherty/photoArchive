@@ -628,16 +628,25 @@ const PhotoArchive = (() => {
 
     function showToast(msg) {
         updateBottomBarHeightVar();
-        let toast = document.getElementById('mosaic-toast');
-        if (!toast) {
-            toast = document.createElement('div');
-            toast.id = 'mosaic-toast';
-            toast.className = 'toast';
-            document.body.appendChild(toast);
+        let container = document.getElementById('toast-container');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'toast-container';
+            container.className = 'toast-container';
+            document.body.appendChild(container);
         }
+        const toast = document.createElement('div');
+        toast.className = 'toast-item';
         toast.textContent = msg;
-        toast.classList.add('visible');
-        setTimeout(() => toast.classList.remove('visible'), 3000);
+        container.prepend(toast);
+        while (container.children.length > 3) {
+            container.lastElementChild?.remove();
+        }
+        requestAnimationFrame(() => toast.classList.add('visible'));
+        setTimeout(() => {
+            toast.classList.remove('visible');
+            setTimeout(() => toast.remove(), 300);
+        }, 3000);
     }
 
     function showConfirmModal(title, text, onConfirm) {
