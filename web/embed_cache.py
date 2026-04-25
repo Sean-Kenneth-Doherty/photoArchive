@@ -168,12 +168,12 @@ async def get_matrix():
         ):
             return _cache["image_ids"], _matrix_view()
 
-        current_count = _get_embedding_count_sync()
+        current_count = await asyncio.to_thread(_get_embedding_count_sync)
         _cache["checked_at"] = now
         if _cache["matrix"] is not None and _cache["count"] == current_count:
             return _cache["image_ids"], _matrix_view()
 
-        image_ids, matrix = _load_embeddings_sync(current_count)
+        image_ids, matrix = await asyncio.to_thread(_load_embeddings_sync, current_count)
         if not image_ids or matrix is None:
             _cache.update({
                 "image_ids": None,
