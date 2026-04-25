@@ -221,7 +221,7 @@ a:hover {
 }
 
 .bar-hints {
-    color: #555;
+    color: #7a7a7a;
     font-size: 12px;
 }
 
@@ -425,7 +425,7 @@ button:disabled {
     padding: 6px 14px;
     font-size: 12px;
     background: transparent;
-    color: #666;
+    color: #808080;
     border: none;
     border-radius: 4px;
     cursor: pointer;
@@ -1644,7 +1644,7 @@ button:disabled {
 }
 
 .bar-search-input::placeholder {
-    color: #555;
+    color: #777;
 }
 
 .search-clear-sm {
@@ -1687,7 +1687,7 @@ button:disabled {
 }
 
 .library-search input::placeholder {
-    color: #555;
+    color: #777;
 }
 
 .search-clear {
