@@ -1067,7 +1067,11 @@ const PhotoArchive = (() => {
                 } else if (compareMode === 'mosaic') {
                     showToast(`Undid ${Number(result.comparisons_undone || 1)} comparison${Number(result.comparisons_undone || 1) === 1 ? '' : 's'}`);
                 }
+            } else {
+                showToast('Undo failed');
             }
+        } catch {
+            showToast('Undo failed');
         } finally {
             compareBusy = false;
         }
@@ -4075,7 +4079,7 @@ const PhotoArchive = (() => {
                     flag: 'unflagged',
                     ...exif,
                 });
-            }).catch(() => {});
+            }).catch(() => showToast('Could not open image'));
         }
     }
 
@@ -4267,6 +4271,7 @@ const PhotoArchive = (() => {
         } catch (err) {
             setScanBusy(false);
             setSettingsStatus(`Add folder failed: ${err.message}`, 'error');
+            showToast('Add folder failed');
         }
     }
 
@@ -4279,6 +4284,7 @@ const PhotoArchive = (() => {
             pollScanUntilDone();
         } catch (err) {
             setSettingsStatus(`Scan failed to start: ${err.message}`, 'error');
+            showToast('Scan failed to start');
         }
     }
 
@@ -4327,6 +4333,7 @@ const PhotoArchive = (() => {
             );
         } catch (err) {
             setSettingsStatus(`Remove failed: ${err.message}`, 'error');
+            showToast('Remove failed');
         }
     }
 
@@ -4353,6 +4360,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Folder selected. Add + Scan when ready.', 'success');
         } catch (err) {
             setSettingsStatus(`Folder chooser unavailable: ${err.message}. Paste a folder path instead.`, 'error');
+            showToast('Folder chooser failed');
         } finally {
             if (button) button.disabled = false;
         }
@@ -4368,6 +4376,7 @@ const PhotoArchive = (() => {
         } catch (err) {
             const errEl = document.getElementById('directory-browser-error');
             if (errEl) errEl.textContent = err.message;
+            showToast('Directory browse failed');
         }
     }
 
@@ -5086,6 +5095,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Saved. New requests are using the updated runtime settings.', 'success');
         } catch (err) {
             setSettingsStatus(`Save failed: ${err.message}`, 'error');
+            showToast('Save failed');
         }
     }
 
@@ -5104,6 +5114,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Defaults restored. Runtime settings were updated.', 'success');
         } catch (err) {
             setSettingsStatus(`Reset failed: ${err.message}`, 'error');
+            showToast('Reset failed');
         }
     }
 
@@ -5122,6 +5133,7 @@ const PhotoArchive = (() => {
             );
         } catch (err) {
             setSettingsStatus(`Cache clear failed: ${err.message}`, 'error');
+            showToast('Cache clear failed');
         }
     }
 
@@ -5137,6 +5149,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Pre-generation is running.', 'success');
         } catch (err) {
             setSettingsStatus(`Could not start pre-generation: ${err.message}`, 'error');
+            showToast('Could not start pre-generation');
         }
     }
 
@@ -5152,6 +5165,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Pre-generation paused.', 'success');
         } catch (err) {
             setSettingsStatus(`Could not pause pre-generation: ${err.message}`, 'error');
+            showToast('Could not pause pre-generation');
         }
     }
 
@@ -5167,6 +5181,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Embeddings paused. Current in-flight batch may finish first.', 'success');
         } catch (err) {
             setSettingsStatus(`Could not pause embeddings: ${err.message}`, 'error');
+            showToast('Could not pause embeddings');
         }
     }
 
@@ -5182,6 +5197,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Embeddings resumed.', 'success');
         } catch (err) {
             setSettingsStatus(`Could not resume embeddings: ${err.message}`, 'error');
+            showToast('Could not resume embeddings');
         }
     }
 
@@ -5211,6 +5227,7 @@ const PhotoArchive = (() => {
             setSettingsStatus('Model install started. The AI worker will pick it up automatically when the download finishes.', 'success');
         } catch (err) {
             setSettingsStatus(`Model install failed to start: ${err.message}`, 'error');
+            showToast('Model install failed to start');
         }
     }
 
