@@ -1674,6 +1674,7 @@ const PhotoArchive = (() => {
             return;
         }
         if (requestGeneration !== libraryRequestGeneration) {
+            rankingsLoading = false;
             return;
         }
         if (requestOffset === 0 && typeof data.total_images === 'number') {
