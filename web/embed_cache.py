@@ -115,7 +115,8 @@ def _get_embedding_count_sync() -> int:
         return conn.execute(
             "SELECT COUNT(*) FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
-            "WHERE i.status IN ('kept', 'maybe')"
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
         ).fetchone()[0]
     finally:
         conn.close()
@@ -131,7 +132,8 @@ def _load_embeddings_sync(expected_count: int):
         rows = conn.execute(
             "SELECT e.image_id, e.embedding FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
-            "WHERE i.status IN ('kept', 'maybe')"
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
         ).fetchall()
     finally:
         conn.close()

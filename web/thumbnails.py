@@ -269,9 +269,9 @@ def _cache_archive_estimates() -> dict:
             conn = _db_connect()
             row = conn.execute(
                 "SELECT "
-                "SUM(CASE WHEN status IN ('kept', 'maybe') THEN 1 ELSE 0 END) AS active_images, "
-                "COUNT(*) AS total_images "
-                "FROM images"
+                "SUM(CASE WHEN s.included = 1 AND s.online = 1 THEN 1 ELSE 0 END) AS active_images, "
+                "SUM(CASE WHEN s.included = 1 AND s.online = 1 THEN 1 ELSE 0 END) AS total_images "
+                "FROM images i LEFT JOIN catalog_sources s ON s.id = i.source_id"
             ).fetchone()
             active_images = int(row["active_images"] or 0)
             total_images = int(row["total_images"] or 0)
@@ -590,6 +590,15 @@ def _clear_memory_tiers(tiers: tuple[str, ...]):
             if key[0] not in tiers:
                 continue
             _memory_remove_locked(key)
+
+
+def _clear_memory_image_ids(image_ids: set[int]):
+    if not image_ids:
+        return
+    with _cache_lock:
+        for key in list(_memory_cache.keys()):
+            if key[1] in image_ids:
+                _memory_remove_locked(key)
 
 
 def _memory_stats() -> dict:
@@ -1592,7 +1601,9 @@ async def _cache_target_total() -> int:
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
-            "SELECT COUNT(*) AS c FROM images WHERE status IN ('kept', 'maybe')"
+            "SELECT COUNT(*) AS c FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
         )
         row = await cursor.fetchone()
         return int(row["c"] if row else 0)
@@ -1606,10 +1617,10 @@ async def _pregen_candidate_batch(size: str, offset: int, limit: int):
         cursor = await conn.execute(
             "SELECT i.id, i.filepath, c.source_signature "
             "FROM images i "
-            "INDEXED BY idx_images_active_filepath "
+            "JOIN catalog_sources s ON s.id = i.source_id "
             "LEFT JOIN cache_entries c "
             "  ON c.cache_root = ? AND c.size = ? AND c.image_id = i.id "
-            "WHERE i.status IN ('kept', 'maybe') "
+            "WHERE s.included = 1 AND s.online = 1 "
             "ORDER BY i.filepath ASC "
             "LIMIT ? OFFSET ?",
             (SSD_CACHE_DIR, size, limit, offset),
@@ -1860,6 +1871,45 @@ def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
         "overall_images_per_min": round(overall_rate, 2),
         "eta_seconds": eta_seconds,
         "replacement_mode": replacement_mode,
+    }
+
+
+def purge_image_cache(image_ids: list[int]) -> dict:
+    """Remove RAM/disk cache entries for catalog images that are being purged."""
+    ids = {int(image_id) for image_id in image_ids or [] if int(image_id) > 0}
+    if not ids:
+        return {"memory_entries_removed": 0, "disk_entries_removed": 0, "disk_files_removed": 0}
+
+    memory_before = len(_memory_cache)
+    _clear_memory_image_ids(ids)
+    memory_removed = max(0, memory_before - len(_memory_cache))
+    _flush_write_queue()
+
+    disk_entries_removed = 0
+    disk_files_removed = 0
+    with _meta_lock:
+        conn = _db_connect()
+        id_list = list(ids)
+        for start in range(0, len(id_list), 500):
+            chunk = id_list[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT cache_root, size, image_id, path, size_bytes "
+                f"FROM cache_entries WHERE image_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                if os.path.exists(row["path"]):
+                    disk_files_removed += 1
+                _remove_cache_entry_locked(conn, row)
+                disk_entries_removed += 1
+        conn.commit()
+    _tier_byte_totals.clear()
+    _source_stat_cache.clear()
+    return {
+        "memory_entries_removed": memory_removed,
+        "disk_entries_removed": disk_entries_removed,
+        "disk_files_removed": disk_files_removed,
     }
 
 
