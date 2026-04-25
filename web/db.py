@@ -1065,6 +1065,7 @@ def _ranking_filter_parts(
     folder: str = "", flag: str = "", date_taken: str = "",
     file_type: str = "", camera: str = "", lens: str = "",
     visible_thumb_size: str = "", cache_root: str = "",
+    text_query: str = "",
 ) -> tuple[list[str], list]:
     conditions = ["s.included = 1", "s.online = 1"]
     params = []
@@ -1122,6 +1123,31 @@ def _ranking_filter_parts(
         conditions.append("i.lens = ?")
         params.append(lens)
 
+    if text_query:
+        escaped = (
+            text_query.strip().lower()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        if escaped:
+            pattern = f"%{escaped}%"
+            fields = (
+                "i.filename",
+                "i.filepath",
+                "i.date_taken",
+                "i.camera_make",
+                "i.camera_model",
+                "i.lens",
+                "i.file_ext",
+            )
+            conditions.append(
+                "("
+                + " OR ".join(f"LOWER(COALESCE({field}, '')) LIKE ? ESCAPE '\\'" for field in fields)
+                + ")"
+            )
+            params.extend([pattern] * len(fields))
+
     if visible_thumb_size and cache_root:
         conditions.append(
             "EXISTS ("
@@ -1165,7 +1191,8 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
                        folder: str = "", flag: str = "", date_taken: str = "",
                        file_type: str = "", camera: str = "", lens: str = "",
                        id_filter: set = None,
-                       visible_thumb_size: str = "", cache_root: str = ""):
+                       visible_thumb_size: str = "", cache_root: str = "",
+                       text_query: str = ""):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -1174,6 +1201,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
             visible_thumb_size=visible_thumb_size, cache_root=cache_root,
+            text_query=text_query,
         )
 
         if id_filter is not None:
@@ -1205,7 +1233,8 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
                          folder: str = "", flag: str = "", date_taken: str = "",
                          file_type: str = "", camera: str = "", lens: str = "",
                          id_filter: set = None,
-                         visible_thumb_size: str = "", cache_root: str = "") -> int:
+                         visible_thumb_size: str = "", cache_root: str = "",
+                         text_query: str = "") -> int:
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
@@ -1213,6 +1242,7 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
             visible_thumb_size=visible_thumb_size, cache_root=cache_root,
+            text_query=text_query,
         )
         if id_filter is not None:
             if not id_filter:

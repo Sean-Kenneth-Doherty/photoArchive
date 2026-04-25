@@ -68,6 +68,14 @@ def _positive_int(value) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
 def _ranking_signal_count(image: dict) -> int:
     return int(image.get("comparisons") or 0) + int(image.get("propagated_updates") or 0)
 
@@ -1913,15 +1921,24 @@ async def api_rankings(
     folder: str = "", flag: str = "", date_taken: str = "", file_type: str = "",
     camera: str = "", lens: str = "", q: str = "",
 ):
+    limit = _clamp_int(limit, 100, 1, 500)
+    offset = _clamp_int(offset, 0, 0, 1_000_000)
     # When a search query is present, pre-filter to images above similarity threshold
     search_ids = None
     search_scores = {}
+    search_mode = ""
+    text_query = ""
     search_active = bool(q.strip())
     if search_active:
+        normalized_query = q.strip()
         try:
             import embedding_worker
             import embed_cache
-            text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, q)
+            text_vec = await asyncio.get_event_loop().run_in_executor(
+                None,
+                embedding_worker.encode_text,
+                normalized_query,
+            )
             if text_vec is not None:
                 image_ids, matrix = await embed_cache.get_matrix()
                 if image_ids is not None:
@@ -1937,7 +1954,12 @@ async def api_rankings(
         except Exception:
             pass
         if search_ids is None:
-            search_ids = set()
+            text_query = normalized_query
+            search_mode = "metadata"
+        else:
+            search_mode = "embedding"
+
+    db_sort = "elo" if sort == "similarity" and not search_scores else sort
 
     # Similarity sort: fetch all matches, sort in Python, then paginate
     if sort == "similarity" and search_scores:
@@ -1947,6 +1969,7 @@ async def api_rankings(
                 folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
                 camera=camera, lens=lens,
                 id_filter=search_ids,
+                text_query=text_query,
             ),
             db.count_rankings(
                 orientation=orientation, compared=compared, min_stars=min_stars,
@@ -1954,6 +1977,7 @@ async def api_rankings(
                 camera=camera, lens=lens,
                 id_filter=search_ids,
                 visible_thumb_size="sm", cache_root=_cache_root(),
+                text_query=text_query,
             ),
         )
         images = await db.get_rankings(
@@ -1963,6 +1987,7 @@ async def api_rankings(
             camera=camera, lens=lens,
             id_filter=search_ids,
             visible_thumb_size="sm", cache_root=_cache_root(),
+            text_query=text_query,
         )
         all_results = []
         for img in images:
@@ -1988,16 +2013,19 @@ async def api_rankings(
             "images": page,
             **_visibility_counts(total_images, visible_images),
             "total_kept": total_images,
+            "search_mode": search_mode,
+            "ai_unavailable": False,
         }
 
     images, visible_images, total_images = await asyncio.gather(
         db.get_rankings(
-            limit=limit, offset=offset, sort=sort,
+            limit=limit, offset=offset, sort=db_sort,
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
             camera=camera, lens=lens,
             id_filter=search_ids,
             visible_thumb_size="sm", cache_root=_cache_root(),
+            text_query=text_query,
         ),
         db.count_rankings(
             orientation=orientation, compared=compared, min_stars=min_stars,
@@ -2005,12 +2033,14 @@ async def api_rankings(
             camera=camera, lens=lens,
             id_filter=search_ids,
             visible_thumb_size="sm", cache_root=_cache_root(),
+            text_query=text_query,
         ),
         db.count_rankings(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
             camera=camera, lens=lens,
             id_filter=search_ids,
+            text_query=text_query,
         ),
     )
     if images:
@@ -2044,6 +2074,8 @@ async def api_rankings(
         "images": result,
         **_visibility_counts(total_images, visible_images),
         "total_kept": total_images,
+        "search_mode": search_mode,
+        "ai_unavailable": bool(search_active and text_query),
     }
 
 
@@ -2130,23 +2162,71 @@ async def export_rankings(format: str = "json", ids: str = ""):
 @app.get("/api/search")
 async def api_search(q: str = "", limit: int = 50):
     """Search images by text query using embedding similarity."""
-    if not q.strip():
+    query = q.strip()
+    if not query:
         return {"images": [], "query": q, **_visibility_counts(0, 0)}
-    limit = max(1, min(int(limit), 500))
+    limit = _clamp_int(limit, 50, 1, 500)
+
+    async def metadata_fallback(reason: str):
+        rows, visible_images, total_images = await asyncio.gather(
+            db.get_rankings(
+                limit=limit,
+                offset=0,
+                sort="elo",
+                visible_thumb_size="sm",
+                cache_root=_cache_root(),
+                text_query=query,
+            ),
+            db.count_rankings(
+                visible_thumb_size="sm",
+                cache_root=_cache_root(),
+                text_query=query,
+            ),
+            db.count_rankings(text_query=query),
+        )
+        result = []
+        for img in rows:
+            d = dict(img)
+            result.append({
+                "id": d["id"],
+                "filename": d["filename"],
+                "elo": round(d["elo"], 1),
+                "comparisons": d["comparisons"],
+                "propagated_updates": d.get("propagated_updates") or 0,
+                "flag": d.get("flag") or "unflagged",
+                "similarity": None,
+                "aspect_ratio": d.get("aspect_ratio") or 1.5,
+                **_metadata_payload(d),
+                "thumb_url": f"/api/thumb/sm/{d['id']}",
+            })
+        if rows:
+            await thumbnails.prefetch_images(
+                [dict(img) for img in rows],
+                "sm",
+                limit=min(len(rows), 48),
+            )
+        return {
+            "images": result,
+            "query": q,
+            "search_mode": "metadata",
+            "ai_unavailable": True,
+            "fallback_reason": reason,
+            **_visibility_counts(total_images, visible_images),
+        }
 
     try:
         import embedding_worker
         import embed_cache
     except ImportError:
-        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
+        return await metadata_fallback("embeddings_unavailable")
 
-    text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, q)
+    text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, query)
     if text_vec is None:
-        return JSONResponse({"error": "Model still loading"}, status_code=503)
+        return await metadata_fallback("model_loading")
 
     image_ids, matrix = await embed_cache.get_matrix()
     if image_ids is None:
-        return {"images": [], "query": q, **_visibility_counts(0, 0)}
+        return await metadata_fallback("embeddings_not_indexed")
 
     similarities = matrix @ text_vec
     ranked_indices = _top_indices_desc(similarities, len(image_ids))
@@ -2175,6 +2255,8 @@ async def api_search(q: str = "", limit: int = 50):
     return {
         "images": result,
         "query": q,
+        "search_mode": "embedding",
+        "ai_unavailable": False,
         **_visibility_counts(len(ranked_ids), visible_images),
     }
 

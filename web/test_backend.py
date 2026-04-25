@@ -405,6 +405,45 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total_images"], 4)
         self.assertEqual(result["hidden_pending_thumbnails"], 2)
 
+    async def test_rankings_search_uses_metadata_fallback_when_ai_is_cold(self):
+        source = await self._source()
+        visible_match = await self._image(source["id"], "sunset-visible.jpg")
+        hidden_match = await self._image(source["id"], "sunset-hidden.jpg")
+        visible_miss = await self._image(source["id"], "portrait-visible.jpg")
+        await self._cache_entry(visible_match, "sm")
+        await self._cache_entry(visible_miss, "sm")
+
+        embedding_worker.encode_text = lambda _query: None
+
+        result = await app_module.api_rankings(q="sunset", sort="similarity", limit=10)
+
+        self.assertEqual([img["id"] for img in result["images"]], [visible_match])
+        self.assertEqual(result["search_mode"], "metadata")
+        self.assertTrue(result["ai_unavailable"])
+        self.assertEqual(result["visible_images"], 1)
+        self.assertEqual(result["total_images"], 2)
+        self.assertEqual(result["hidden_pending_thumbnails"], 1)
+        self.assertNotIn(hidden_match, [img["id"] for img in result["images"]])
+
+    async def test_search_endpoint_uses_metadata_fallback_when_ai_is_cold(self):
+        source = await self._source()
+        visible_match = await self._image(source["id"], "sunset-visible.jpg")
+        hidden_match = await self._image(source["id"], "sunset-hidden.jpg")
+        await self._cache_entry(visible_match, "sm")
+
+        embedding_worker.encode_text = lambda _query: None
+
+        result = await app_module.api_search(q="sunset", limit=10)
+
+        self.assertEqual([img["id"] for img in result["images"]], [visible_match])
+        self.assertIsNone(result["images"][0]["similarity"])
+        self.assertEqual(result["search_mode"], "metadata")
+        self.assertTrue(result["ai_unavailable"])
+        self.assertEqual(result["visible_images"], 1)
+        self.assertEqual(result["total_images"], 2)
+        self.assertEqual(result["hidden_pending_thumbnails"], 1)
+        self.assertNotIn(hidden_match, [img["id"] for img in result["images"]])
+
     async def test_similar_skips_uncached_sm_results_and_fills_later_visible_matches(self):
         source = await self._source()
         source_image = await self._image(source["id"], "source.jpg")

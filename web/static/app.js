@@ -1607,14 +1607,14 @@ const PhotoArchive = (() => {
             card.title = imageMetadataTitle(img);
             card.onclick = () => openLightbox(img);
 
-            const simPct = (img.similarity * 100).toFixed(0);
+            const simLabel = similarityLabel(img);
 
             card.innerHTML = `
                 <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
                 ${flagBadge(img.flag)}
                 <div class="rank-card-info">
                     <span class="rank-elo">${escapeHtml(img.elo)} Elo</span>
-                    <span class="rank-similarity">${escapeHtml(simPct)}% match</span>
+                    <span class="rank-similarity">${escapeHtml(simLabel)}</span>
                 </div>
             `;
             grid.appendChild(card);
@@ -1730,6 +1730,11 @@ const PhotoArchive = (() => {
         if (flag === 'picked') return '<div class="rank-flag flag-picked">P</div>';
         if (flag === 'rejected') return '<div class="rank-flag flag-rejected">X</div>';
         return '';
+    }
+
+    function similarityLabel(img) {
+        const similarity = Number(img?.similarity);
+        return Number.isFinite(similarity) ? `${(similarity * 100).toFixed(0)}% match` : 'metadata match';
     }
 
     function updateImageFlagLocal(imageId, flag) {
@@ -3025,7 +3030,7 @@ const PhotoArchive = (() => {
         for (let i = 0; i < data.images.length; i++) {
             const simg = data.images[i];
             const ar = simg.aspect_ratio || 1.5;
-            const simPct = (simg.similarity * 100).toFixed(0);
+            const simLabel = similarityLabel(simg);
 
             const card = document.createElement('div');
             card.className = 'rank-card' + (flagClass(simg.flag) ? ' ' + flagClass(simg.flag) : '');
@@ -3041,7 +3046,7 @@ const PhotoArchive = (() => {
                 ${flagBadge(simg.flag)}
                 <div class="rank-card-info">
                     <span class="rank-elo">${escapeHtml(simg.elo)} Elo</span>
-                    <span class="rank-similarity">${escapeHtml(simPct)}% match</span>
+                    <span class="rank-similarity">${escapeHtml(simLabel)}</span>
                 </div>
             `;
             grid.appendChild(card);
