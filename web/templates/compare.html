@@ -66,7 +66,7 @@
     <div class="bar-section compare-search-active hidden" id="compare-search-active">
         <span class="compare-search-label">Search</span>
         <span class="compare-search-query" id="compare-search-query"></span>
-        <button type="button" class="compare-search-clear" onclick="PhotoArchive.clearSearch()" title="Clear search">&times;</button>
+        <button type="button" class="compare-search-clear" onclick="PhotoArchive.clearSearch()" title="Clear search" aria-label="Clear search">&times;</button>
     </div>
     <div class="bar-divider"></div>
     <div class="bar-section bar-ai" id="bar-ai" onclick="PhotoArchive.toggleAIPanel()" style="cursor:pointer">
@@ -79,7 +79,7 @@
     <div class="ai-panel hidden" id="ai-panel">
         <div class="ai-panel-header">
             <span class="ai-panel-title">Active Learning</span>
-            <span class="ai-panel-close" onclick="PhotoArchive.toggleAIPanel()">&times;</span>
+            <span class="ai-panel-close" onclick="PhotoArchive.toggleAIPanel()" aria-label="Close AI panel">&times;</span>
         </div>
         <div class="ai-panel-body">
             <div class="ai-panel-row">

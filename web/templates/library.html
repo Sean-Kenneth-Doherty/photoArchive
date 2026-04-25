@@ -42,7 +42,7 @@
             <option value="camera">Camera</option>
             <option value="filename">Filename</option>
         </select>
-        <button type="button" class="filter-icon sort-dir-btn" id="sort-dir-btn" onclick="PhotoArchive.toggleSortDir()" title="Toggle sort direction">
+        <button type="button" class="filter-icon sort-dir-btn" id="sort-dir-btn" onclick="PhotoArchive.toggleSortDir()" title="Toggle sort direction" aria-label="Toggle sort direction">
             <svg width="14" height="14" viewBox="0 0 14 14">
                 <path d="M4 2v10M4 10l-2.5-2.5M4 10l2.5-2.5M10 12V2M10 4l-2.5 2.5M10 4l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
@@ -52,7 +52,7 @@
     <div class="bar-section bar-search">
         <input type="text" id="search-input" class="bar-search-input" placeholder="Search..."
                autocomplete="off" spellcheck="false">
-        <button type="button" class="search-clear-sm hidden" id="search-clear" onclick="PhotoArchive.clearSearch()">&times;</button>
+        <button type="button" class="search-clear-sm hidden" id="search-clear" onclick="PhotoArchive.clearSearch()" aria-label="Clear search">&times;</button>
     </div>
     <div class="bar-divider"></div>
     {% include '_filters.html' %}
