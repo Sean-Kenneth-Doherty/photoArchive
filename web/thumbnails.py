@@ -598,6 +598,7 @@ def _mark_source_missing_from_error(filepath: str, image_id: int, exc: Exception
         db.mark_image_missing_sync(image_id)
     except Exception as mark_error:
         print(f"Failed to mark missing image {image_id} for {filepath}: {mark_error}")
+        return False
     return True
 
 
@@ -1743,8 +1744,15 @@ async def prefetch_images(
         filepath = img.get("filepath")
         if image_id is None or not filepath:
             continue
-        source_signature = _build_source_signature(filepath, size, image_id)
         require_current = _replace_stale_thumbnails
+        if not require_current and _memory_get_entry_fast(size, image_id) is not None:
+            continue
+        if not require_current and fast_disk_has(size, image_id):
+            if hot:
+                touch_cached_signature(size, image_id, None)
+            continue
+
+        source_signature = _build_source_signature(filepath, size, image_id)
         if require_current:
             if _memory_get(size, image_id, source_signature) is not None:
                 continue
@@ -1752,12 +1760,6 @@ async def prefetch_images(
                 if hot:
                     touch_cached_signature(size, image_id, source_signature)
                 continue
-        elif _memory_get_entry_fast(size, image_id) is not None:
-            continue
-        if not require_current and fast_disk_has(size, image_id):
-            if hot:
-                touch_cached_signature(size, image_id, None)
-            continue
         if has_cached(size, filepath, image_id):
             if hot:
                 touch_cached(size, filepath, image_id)

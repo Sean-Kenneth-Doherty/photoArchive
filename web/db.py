@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS cache_metadata (
 _stats_cache = {"data": None, "expires": 0}
 _filter_options_cache = {"data": None, "expires": 0}
 _cached_image_ids_cache: dict[tuple[str, str], dict] = {}
+_rankable_image_ids_cache = {"ids": frozenset(), "expires": 0}
 CACHED_IMAGE_IDS_TTL_SECONDS = 5.0
 
 
@@ -252,6 +253,7 @@ def _chunked(values: list[int], chunk_size: int = 500):
 def _invalidate_stats_cache():
     _stats_cache["data"] = None
     _stats_cache["expires"] = 0
+    _invalidate_rankable_image_ids_cache()
 
 
 def _invalidate_filter_options_cache():
@@ -270,6 +272,11 @@ def invalidate_cached_image_ids_cache(cache_root: str | None = None, size: str |
         if size is not None and key_size != size:
             continue
         _cached_image_ids_cache.pop(key, None)
+
+
+def _invalidate_rankable_image_ids_cache():
+    _rankable_image_ids_cache["ids"] = frozenset()
+    _rankable_image_ids_cache["expires"] = 0
 
 
 def invalidate_stats_cache():
@@ -1409,6 +1416,49 @@ async def get_cached_image_id_set(size: str, cache_root: str) -> frozenset[int]:
     return frozen
 
 
+async def get_rankable_image_id_set() -> frozenset[int]:
+    """Return active ranking image IDs with a short TTL for hot count paths."""
+    now = _time.time()
+    if now < _rankable_image_ids_cache["expires"]:
+        return _rankable_image_ids_cache["ids"]
+
+    ids: set[int] = set()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT i.id FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1 "
+            "AND i.status IN ('kept', 'maybe') AND i.missing_at IS NULL"
+        )
+        ids.update(int(row["id"]) for row in await cursor.fetchall())
+    finally:
+        await db.close()
+    frozen = frozenset(ids)
+    _rankable_image_ids_cache["ids"] = frozen
+    _rankable_image_ids_cache["expires"] = now + CACHED_IMAGE_IDS_TTL_SECONDS
+    return frozen
+
+
+def _has_ranking_count_filters(
+    orientation: str,
+    compared: str,
+    min_stars: int,
+    folder: str,
+    flag: str,
+    date_taken: str,
+    file_type: str,
+    camera: str,
+    lens: str,
+    id_filter: set | None,
+    text_query: str,
+) -> bool:
+    return bool(
+        orientation or compared or min_stars > 0 or folder or flag or date_taken
+        or file_type or camera or lens or id_filter is not None or text_query
+    )
+
+
 async def _count_rankings_with_id_filter(
     conn,
     conditions: list[str],
@@ -1482,6 +1532,16 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
                          id_filter: set = None,
                          visible_thumb_size: str = "", cache_root: str = "",
                          text_query: str = "") -> int:
+    if not _has_ranking_count_filters(
+        orientation, compared, min_stars, folder, flag, date_taken,
+        file_type, camera, lens, id_filter, text_query,
+    ):
+        rankable_ids = await get_rankable_image_id_set()
+        if visible_thumb_size and cache_root:
+            cached_ids = await get_cached_image_id_set(visible_thumb_size, cache_root)
+            return len(rankable_ids & cached_ids)
+        return len(rankable_ids)
+
     db = await get_db()
     try:
         cached_id_filter = None
