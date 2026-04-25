@@ -3170,6 +3170,7 @@ const PhotoArchive = (() => {
         'ssd_cache_dir',
         'ssd_cache_gb',
         'pregenerate_on_idle',
+        'embed_batch_size',
         'search_similarity_threshold',
     ];
     const THUMB_OUTPUT_FIELDS = ['thumb_size_sm', 'thumb_size_md', 'thumb_size_lg', 'thumb_quality'];
