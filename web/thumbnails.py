@@ -1393,6 +1393,37 @@ def _queue_orientation(image_id: int, img: Image.Image):
         _orientation_queue[image_id] = (orientation, aspect_ratio)
 
 
+def _thumbnail_jpeg_bytes(variant: Image.Image, size: str) -> bytes:
+    buf = io.BytesIO()
+    variant.save(
+        buf,
+        "JPEG",
+        quality=THUMB_QUALITY,
+        progressive=(size != "sm"),
+    )
+    return buf.getvalue()
+
+
+def _encode_and_cache_thumbnail(
+    size: str,
+    image_id: int,
+    source_signature: str,
+    variant: Image.Image,
+    *,
+    hot: bool,
+) -> tuple[Image.Image, bytes, bool]:
+    if variant.mode != "RGB":
+        converted = variant.convert("RGB")
+        variant.close()
+        variant = converted
+
+    data = _thumbnail_jpeg_bytes(variant, size)
+    _memory_put(size, image_id, source_signature, data)
+    written = _write_thumbnail_to_disk(size, image_id, source_signature, data, hot=hot)
+    _thumbnail_retry_after.pop((size, image_id, source_signature), None)
+    return variant, data, written
+
+
 def _planned_thumbnail_sizes(
     filepath: str,
     image_id: int,
@@ -1465,29 +1496,16 @@ def _generate_missing_thumbnails_sync(
         _queue_orientation(image_id, img)
 
         current = img
-        for index, size in enumerate(needed_sizes):
-            if index == 0:
-                variant = _resize_to_long_side(current, SIZES[size])
-            else:
-                variant = _resize_to_long_side(current, SIZES[size])
-
-            if variant.mode != "RGB":
-                converted = variant.convert("RGB")
-                variant.close()
-                variant = converted
-
-            buf = io.BytesIO()
-            variant.save(
-                buf,
-                "JPEG",
-                quality=THUMB_QUALITY,
-                progressive=(size != "sm"),
-            )
-            data = buf.getvalue()
+        for size in needed_sizes:
+            variant = _resize_to_long_side(current, SIZES[size])
             source_signature = _build_source_signature(filepath, size, image_id)
-            _memory_put(size, image_id, source_signature, data)
-            _write_thumbnail_to_disk(size, image_id, source_signature, data, hot=hot)
-            _thumbnail_retry_after.pop((size, image_id, source_signature), None)
+            variant, data, _written = _encode_and_cache_thumbnail(
+                size,
+                image_id,
+                source_signature,
+                variant,
+                hot=hot,
+            )
             if size == requested_size:
                 requested_data = data
 
@@ -1561,23 +1579,15 @@ def _generate_thumbnail_set_sync(
                 continue
 
             variant = _resize_to_long_side(current, SIZES[size])
-            if variant.mode != "RGB":
-                converted = variant.convert("RGB")
-                variant.close()
-                variant = converted
-
-            buf = io.BytesIO()
-            variant.save(
-                buf,
-                "JPEG",
-                quality=THUMB_QUALITY,
-                progressive=(size != "sm"),
+            variant, _data, written = _encode_and_cache_thumbnail(
+                size,
+                image_id,
+                source_signature,
+                variant,
+                hot=hot,
             )
-            data = buf.getvalue()
-            _memory_put(size, image_id, source_signature, data)
-            if _write_thumbnail_to_disk(size, image_id, source_signature, data, hot=hot):
+            if written:
                 metrics["thumbnails_written"] += 1
-            _thumbnail_retry_after.pop((size, image_id, source_signature), None)
 
             if current is not img:
                 current.close()
