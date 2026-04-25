@@ -16,6 +16,7 @@ import ai_models
 import db
 import elo_propagation
 import pairing
+import photo_metadata
 import resource_governor
 import scanner
 import settings
@@ -87,6 +88,7 @@ async def startup():
     thumbnails.configure(settings.load_settings())
     asyncio.create_task(thumbnails.run_prefetch_worker())
     asyncio.create_task(classify_orientations_background())
+    asyncio.create_task(scan_metadata_background())
     try:
         import embedding_worker
         asyncio.create_task(embedding_worker.run_embedding_worker())
@@ -144,6 +146,76 @@ async def classify_orientations_background():
         except Exception as e:
             print(f"Orientation classifier error: {e}")
             await asyncio.sleep(5)
+
+
+def _metadata_update_tuple(image_id: int, metadata: dict):
+    width = metadata.get("width")
+    height = metadata.get("height")
+    orientation = None
+    aspect_ratio = None
+    if width and height:
+        try:
+            width_num = int(width)
+            height_num = int(height)
+            if height_num > 0:
+                orientation = "landscape" if width_num >= height_num else "portrait"
+                aspect_ratio = round(width_num / height_num, 4)
+        except Exception:
+            pass
+
+    return (
+        metadata.get("date_taken") or None,
+        metadata.get("camera_make") or None,
+        metadata.get("camera_model") or None,
+        metadata.get("lens") or None,
+        metadata.get("file_ext") or None,
+        metadata.get("file_size"),
+        metadata.get("file_modified_at"),
+        width,
+        height,
+        time.time(),
+        photo_metadata.METADATA_EXTRACTOR_VERSION,
+        orientation,
+        aspect_ratio,
+        metadata.get("latitude"),
+        metadata.get("longitude"),
+        image_id,
+    )
+
+
+async def scan_metadata_background():
+    """Backfill EXIF/file metadata used for library filters and sorts."""
+    loop = asyncio.get_event_loop()
+
+    def _extract_batch(rows):
+        updates = []
+        for row in rows:
+            metadata = photo_metadata.extract_image_metadata(row["filepath"])
+            updates.append(_metadata_update_tuple(row["id"], metadata))
+        return updates
+
+    while True:
+        try:
+            decision = resource_governor.get_background_decision(thumbnails.get_idle_seconds())
+            if decision.pause:
+                await asyncio.sleep(decision.sleep_seconds)
+                continue
+
+            batch_limit = max(10, min(100, int(100 * max(decision.intensity, 0.1))))
+            rows = await db.get_images_needing_metadata(
+                limit=batch_limit,
+                metadata_version=photo_metadata.METADATA_EXTRACTOR_VERSION,
+            )
+            if not rows:
+                await asyncio.sleep(10)
+                continue
+            updates = await loop.run_in_executor(None, _extract_batch, rows)
+            await db.batch_update_metadata(updates)
+            _invalidate_pairing_cache()
+            await asyncio.sleep(max(0.05, decision.embedding_pause_seconds))
+        except Exception as e:
+            print(f"Metadata scanner error: {e}")
+            await asyncio.sleep(10)
 
 
 @app.on_event("shutdown")
@@ -921,7 +993,38 @@ async def api_set_image_flag(image_id: int, request: Request):
         return JSONResponse({"error": "Image not found"}, status_code=404)
 
     await db.set_image_flag(image_id, flag)
+    _invalidate_pairing_cache()
     return {"ok": True, "id": image_id, "flag": flag}
+
+
+@app.post("/api/images/flag")
+async def api_batch_set_flag(request: Request):
+    body = await request.json()
+    flag = body.get("flag", "unflagged")
+    image_ids = body.get("image_ids", [])
+    if flag not in ("picked", "unflagged", "rejected"):
+        return JSONResponse({"error": "Invalid flag"}, status_code=400)
+    if not image_ids or not isinstance(image_ids, list):
+        return JSONResponse({"error": "image_ids must be a non-empty list"}, status_code=400)
+
+    normalized_ids = []
+    seen_ids = set()
+    for value in image_ids:
+        try:
+            image_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if image_id <= 0 or image_id in seen_ids:
+            continue
+        seen_ids.add(image_id)
+        normalized_ids.append(image_id)
+
+    if not normalized_ids:
+        return JSONResponse({"error": "No valid image ids"}, status_code=400)
+
+    count = await db.batch_set_image_flags(normalized_ids, flag)
+    _invalidate_pairing_cache()
+    return {"ok": True, "count": count, "flag": flag}
 
 
 @app.post("/api/settings")
@@ -1063,6 +1166,61 @@ def _top_indices_desc(values, limit: int, exclude_index: int | None = None):
 
     candidates = np.argpartition(values, -limit)[-limit:]
     return candidates[np.argsort(values[candidates])[::-1]]
+
+
+def _camera_label(image: dict) -> str:
+    return " ".join(
+        str(part).strip()
+        for part in (image.get("camera_make"), image.get("camera_model"))
+        if part
+    ).strip()
+
+
+def _metadata_payload(image: dict) -> dict:
+    return {
+        "date_taken": image.get("date_taken"),
+        "camera_make": image.get("camera_make"),
+        "camera_model": image.get("camera_model"),
+        "lens": image.get("lens"),
+        "file_ext": image.get("file_ext"),
+        "file_size": image.get("file_size"),
+        "file_modified_at": image.get("file_modified_at"),
+        "width": image.get("width"),
+        "height": image.get("height"),
+        "latitude": image.get("latitude"),
+        "longitude": image.get("longitude"),
+        "created_at": image.get("created_at"),
+    }
+
+
+def _filter_by_metadata(
+    images: list[dict],
+    date_taken: str = "",
+    file_type: str = "",
+    camera: str = "",
+    lens: str = "",
+) -> list[dict]:
+    if date_taken:
+        if date_taken == "undated":
+            images = [img for img in images if not img.get("date_taken")]
+        elif date_taken.isdigit() and len(date_taken) == 4:
+            prefix = f"{date_taken}-"
+            images = [img for img in images if str(img.get("date_taken") or "").startswith(prefix)]
+
+    if file_type:
+        normalized_type = file_type.lower()
+        if not normalized_type.startswith("."):
+            normalized_type = f".{normalized_type}"
+        images = [img for img in images if (img.get("file_ext") or "").lower() == normalized_type]
+
+    if camera:
+        images = [img for img in images if _camera_label(img) == camera]
+
+    if lens:
+        images = [img for img in images if (img.get("lens") or "") == lens]
+
+    return images
+
 
 async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
     """Select images that maximize visual diversity using embedding distance."""
@@ -1224,7 +1382,8 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
 @app.get("/api/mosaic/next")
 async def mosaic_next(
     n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0,
-    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "", flag: str = "",
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+    flag: str = "", date_taken: str = "", file_type: str = "", camera: str = "", lens: str = "",
 ):
     """Get active images for mosaic ranking with configurable sampling strategy."""
     exclude_ids = set()
@@ -1259,10 +1418,12 @@ async def mosaic_next(
         candidates = [c for c in candidates if f"/{folder}/" in c.get("filepath", "")]
     if flag in ("picked", "unflagged", "rejected"):
         candidates = [c for c in candidates if (c.get("flag") or "unflagged") == flag]
+    candidates = _filter_by_metadata(candidates, date_taken, file_type, camera, lens)
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
         img["effective_elo"] = img["elo"]
-    count = min(n, len(candidates))
+    filtered_count = len(candidates)
+    count = min(n, filtered_count)
 
     if strategy == "diverse":
         # Maximize visual diversity: pick images that are most dissimilar from each other
@@ -1309,8 +1470,9 @@ async def mosaic_next(
             limit=min(len(sample), config["mosaic_prefetch_limit"]),
         )
 
-    stats = await db.get_stats()
-    return {"images": result, "total_images": len(images), "total_kept": len(images), "stats": stats}
+    stats = dict(await db.get_stats())
+    stats["filtered_pool"] = filtered_count
+    return {"images": result, "total_images": filtered_count, "total_kept": filtered_count, "stats": stats}
 
 
 @app.post("/api/mosaic/pick")
@@ -1410,7 +1572,8 @@ async def propagation_predict(request: Request):
 @app.get("/api/compare/next")
 async def compare_next(
     n: int = 5, mode: str = "swiss",
-    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "", flag: str = "",
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+    flag: str = "", date_taken: str = "", file_type: str = "", camera: str = "", lens: str = "",
 ):
     if mode == "topn":
         images = await db.get_top_images(limit=50)
@@ -1439,6 +1602,7 @@ async def compare_next(
         image_dicts = [c for c in image_dicts if f"/{folder}/" in c.get("filepath", "")]
     if flag in ("picked", "unflagged", "rejected"):
         image_dicts = [c for c in image_dicts if (c.get("flag") or "unflagged") == flag]
+    image_dicts = _filter_by_metadata(image_dicts, date_taken, file_type, camera, lens)
 
     if len(image_dicts) < 2:
         return {"pairs": [], "total_images": len(image_dicts), "total_kept": len(image_dicts)}
@@ -1463,7 +1627,8 @@ async def compare_next(
             limit=min(len(prefetch_rows), config["compare_prefetch_limit"]),
         )
 
-    stats = await db.get_stats()
+    stats = dict(await db.get_stats())
+    stats["filtered_pool"] = len(image_dicts)
     return {"pairs": result, "total_images": len(image_dicts), "total_kept": len(image_dicts), "stats": stats}
 
 
@@ -1516,12 +1681,14 @@ async def compare_undo():
 async def api_rankings(
     limit: int = 100, offset: int = 0, sort: str = "elo",
     orientation: str = "", compared: str = "", min_stars: int = 0,
-    folder: str = "", flag: str = "", q: str = "",
+    folder: str = "", flag: str = "", date_taken: str = "", file_type: str = "",
+    camera: str = "", lens: str = "", q: str = "",
 ):
     # When a search query is present, pre-filter to images above similarity threshold
     search_ids = None
     search_scores = {}
-    if q.strip():
+    search_active = bool(q.strip())
+    if search_active:
         try:
             import embedding_worker
             import embed_cache
@@ -1540,13 +1707,17 @@ async def api_rankings(
                             search_scores[image_ids[i]] = float(similarities[i])
         except Exception:
             pass
+        if search_ids is None:
+            search_ids = set()
 
     # Similarity sort: fetch all matches, sort in Python, then paginate
     if sort == "similarity" and search_scores:
         images = await db.get_rankings(
             limit=len(search_ids), offset=0, sort="elo",
             orientation=orientation, compared=compared, min_stars=min_stars,
-            folder=folder, flag=flag, id_filter=search_ids,
+            folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+            camera=camera, lens=lens,
+            id_filter=search_ids,
         )
         all_results = []
         for img in images:
@@ -1556,6 +1727,7 @@ async def api_rankings(
                 "elo": round(d["elo"], 1), "comparisons": d["comparisons"],
                 "status": d["status"], "flag": d.get("flag") or "unflagged",
                 "aspect_ratio": d.get("aspect_ratio") or 1.5,
+                **_metadata_payload(d),
                 "thumb_url": f"/api/thumb/sm/{d['id']}",
                 "similarity": round(search_scores.get(d["id"], 0), 4),
             })
@@ -1566,12 +1738,26 @@ async def api_rankings(
                 [{"id": r["id"], "filepath": ""} for r in page], "sm",
                 limit=min(len(page), 48),
             )
-        return {"images": page}
+        return {
+            "images": page,
+            "total_images": len(all_results),
+            "total_kept": len(all_results),
+        }
 
-    images = await db.get_rankings(
-        limit=limit, offset=offset, sort=sort,
-        orientation=orientation, compared=compared, min_stars=min_stars,
-        folder=folder, flag=flag, id_filter=search_ids,
+    images, total_images = await asyncio.gather(
+        db.get_rankings(
+            limit=limit, offset=offset, sort=sort,
+            orientation=orientation, compared=compared, min_stars=min_stars,
+            folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+            camera=camera, lens=lens,
+            id_filter=search_ids,
+        ),
+        db.count_rankings(
+            orientation=orientation, compared=compared, min_stars=min_stars,
+            folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+            camera=camera, lens=lens,
+            id_filter=search_ids,
+        ),
     )
     if images:
         await thumbnails.prefetch_images(
@@ -1590,12 +1776,49 @@ async def api_rankings(
             "status": d["status"],
             "flag": d.get("flag") or "unflagged",
             "aspect_ratio": d.get("aspect_ratio") or 1.5,
+            **_metadata_payload(d),
             "thumb_url": f"/api/thumb/sm/{d['id']}",
         }
         if search_scores:
             entry["similarity"] = round(search_scores.get(d["id"], 0), 4)
+        if sort in ("date_taken", "date_taken_asc"):
+            dt = d.get("date_taken") or ""
+            entry["date_group"] = dt[:7] if len(dt) >= 7 else ""
         result.append(entry)
-    return {"images": result}
+    return {
+        "images": result,
+        "total_images": total_images,
+        "total_kept": total_images,
+    }
+
+
+@app.get("/api/date-groups")
+async def api_date_groups(
+    orientation: str = "", compared: str = "", min_stars: int = 0,
+    folder: str = "", flag: str = "", date_taken: str = "", file_type: str = "",
+    camera: str = "", lens: str = "",
+):
+    """Return date groups with counts for the scrubber, respecting active filters."""
+    groups = await db.get_date_groups(
+        orientation=orientation, compared=compared, min_stars=min_stars,
+        folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+        camera=camera, lens=lens,
+    )
+    return {"groups": groups}
+
+
+@app.get("/api/map/markers")
+async def api_map_markers(
+    orientation: str = "", compared: str = "", min_stars: int = 0,
+    folder: str = "", flag: str = "", date_taken: str = "", file_type: str = "",
+    camera: str = "", lens: str = "",
+):
+    """Return images with GPS data for map display."""
+    return await db.get_map_markers(
+        orientation=orientation, compared=compared, min_stars=min_stars,
+        folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+        camera=camera, lens=lens,
+    )
 
 
 @app.get("/api/export")
@@ -1615,6 +1838,17 @@ async def export_rankings(format: str = "json", ids: str = ""):
             "comparisons": img["comparisons"],
             "status": img["status"],
             "flag": img.get("flag") or "unflagged",
+            "date_taken": img.get("date_taken"),
+            "camera_make": img.get("camera_make"),
+            "camera_model": img.get("camera_model"),
+            "lens": img.get("lens"),
+            "file_ext": img.get("file_ext"),
+            "file_size": img.get("file_size"),
+            "file_modified_at": img.get("file_modified_at"),
+            "width": img.get("width"),
+            "height": img.get("height"),
+            "latitude": img.get("latitude"),
+            "longitude": img.get("longitude"),
         }
         for i, img in enumerate(images)
     ]
@@ -1674,6 +1908,7 @@ async def api_search(q: str = "", limit: int = 50):
             "flag": img.get("flag") or "unflagged",
             "similarity": round(score, 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
+            **_metadata_payload(img),
             "thumb_url": f"/api/thumb/sm/{img_id}",
         })
 
@@ -1716,6 +1951,7 @@ async def api_similar(image_id: int, limit: int = 50):
             "flag": img.get("flag") or "unflagged",
             "similarity": round(float(similarities[idx]), 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
+            **_metadata_payload(img),
             "thumb_url": f"/api/thumb/sm/{img_id}",
         })
 
@@ -1790,110 +2026,26 @@ async def api_exif(image_id: int):
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
 
-    from PIL import Image as PILImage
-    from PIL.ExifTags import TAGS, IFD
     try:
-        img = PILImage.open(image["filepath"])
-        exif_raw = img.getexif()
-        # Also read EXIF IFD (where most camera data lives)
-        exif_ifd = {}
-        try:
-            exif_ifd = exif_raw.get_ifd(IFD.Exif)
-        except Exception:
-            pass
-        img.close()
+        exif = photo_metadata.extract_image_metadata(image["filepath"])
     except Exception:
-        return {"exif": {}}
+        exif = {}
 
-    # Merge base and IFD tags
-    all_tags = {}
-    for tag_id, value in exif_raw.items():
-        tag_name = TAGS.get(tag_id, "")
-        if tag_name:
-            all_tags[tag_name] = value
-    for tag_id, value in exif_ifd.items():
-        tag_name = TAGS.get(tag_id, "")
-        if tag_name:
-            all_tags[tag_name] = value
+    row = dict(image)
+    for key in (
+        "date_taken", "camera_make", "camera_model", "lens", "file_ext",
+        "file_size", "file_modified_at", "latitude", "longitude",
+    ):
+        if not exif.get(key) and row.get(key) is not None:
+            exif[key] = row.get(key)
+    if not exif.get("dimensions") and row.get("width") and row.get("height"):
+        exif["dimensions"] = f"{row['width']} x {row['height']}"
+    if not exif.get("filepath"):
+        exif["filepath"] = image["filepath"]
 
-    def fmt_rational(val):
-        if hasattr(val, 'numerator'):
-            return float(val)
-        return val
-
-    exif = {}
-    # Camera
-    make = str(all_tags.get("Make", "")).strip()
-    model = str(all_tags.get("Model", "")).strip()
-    # Remove make from model if duplicated (e.g., "Canon Canon EOS R5")
-    if make and model.startswith(make):
-        model = model[len(make):].strip()
-    if make:
-        exif["camera_make"] = make
-    if model:
-        exif["camera_model"] = model
-
-    # Lens
-    lens = str(all_tags.get("LensModel", "")).strip()
-    if lens:
-        exif["lens"] = lens
-
-    # Focal length
-    fl = all_tags.get("FocalLength")
-    if fl is not None:
-        exif["focal_length"] = f"{fmt_rational(fl):.0f}mm"
-    fl35 = all_tags.get("FocalLengthIn35mmFilm")
-    if fl35 is not None:
-        exif["focal_length_35mm"] = f"{int(fl35)}mm"
-
-    # Aperture
-    fnum = all_tags.get("FNumber")
-    if fnum is not None:
-        exif["aperture"] = f"f/{fmt_rational(fnum):.1f}"
-
-    # Shutter speed
-    exp = all_tags.get("ExposureTime")
-    if exp is not None:
-        ev = fmt_rational(exp)
-        if ev > 0:
-            exif["shutter_speed"] = f"1/{int(1/ev)}" if ev < 1 else f"{ev:.1f}"
-
-    # ISO
-    iso = all_tags.get("ISOSpeedRatings") or all_tags.get("PhotographicSensitivity")
-    if iso is not None:
-        exif["iso"] = str(int(iso) if isinstance(iso, (int, float)) else iso)
-
-    # Exposure program
-    exp_prog_map = {1: "Manual", 2: "Program", 3: "Aperture Priority", 4: "Shutter Priority"}
-    exp_prog = all_tags.get("ExposureProgram")
-    if exp_prog in exp_prog_map:
-        exif["exposure_program"] = exp_prog_map[exp_prog]
-
-    # White balance
-    wb = all_tags.get("WhiteBalance")
-    if wb is not None:
-        exif["white_balance"] = "Auto" if wb == 0 else "Manual"
-
-    # Flash
-    flash = all_tags.get("Flash")
-    if flash is not None:
-        exif["flash"] = "Fired" if (flash & 1) else "No flash"
-
-    # Dimensions
-    w = all_tags.get("ExifImageWidth") or all_tags.get("ImageWidth")
-    h = all_tags.get("ExifImageHeight") or all_tags.get("ImageLength")
-    if w and h:
-        exif["dimensions"] = f"{w} x {h}"
-
-    # Date
-    date = all_tags.get("DateTimeOriginal") or all_tags.get("DateTime")
-    if date:
-        exif["date"] = str(date)
-
-    # File info
-    exif["filepath"] = image["filepath"]
     try:
-        exif["filesize"] = f"{os.path.getsize(image['filepath']) / (1024*1024):.1f} MB"
+        await db.batch_update_metadata([_metadata_update_tuple(image_id, exif)])
+        _invalidate_pairing_cache()
     except Exception:
         pass
 
@@ -2031,8 +2183,13 @@ async def api_folders():
     return result
 
 
+@app.get("/api/filter-options")
+async def api_filter_options():
+    """Return metadata-backed filter choices for the bottom bar."""
+    return await db.get_filter_options()
+
+
 @app.get("/api/stats")
-            "manual_pause": False,
 async def api_stats():
     return await db.get_stats()
 
@@ -2053,6 +2210,7 @@ async def build_ai_status():
             "state": "unavailable",
             "message": "AI worker unavailable",
             "ready": False,
+            "manual_pause": False,
             "model_id": "",
             "model_dir": "",
             "last_error": "",
@@ -2084,7 +2242,6 @@ async def build_ai_status():
 
     recent_rate = float(worker_status.get("recent_images_per_min") or 0.0)
     overall_rate = float(worker_status.get("overall_images_per_min") or 0.0)
-        "embedding_manual_pause": bool(worker_status.get("manual_pause")),
     effective_rate = recent_rate if recent_rate > 0 else overall_rate
     eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
     progress_pct = round((embedded / total_images) * 100, 1) if total_images > 0 else 0.0
@@ -2105,6 +2262,7 @@ async def build_ai_status():
         "worker_state": worker_status["state"],
         "worker_message": worker_status["message"],
         "worker_ready": worker_status["ready"],
+        "embedding_manual_pause": bool(worker_status.get("manual_pause")),
         "worker_error": worker_status["last_error"],
         "last_batch_size": worker_status.get("last_batch_size", 0),
         "last_batch_seconds": worker_status.get("last_batch_seconds", 0.0),

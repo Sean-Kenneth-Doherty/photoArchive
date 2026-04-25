@@ -5,6 +5,7 @@
 <div class="library-container">
     <div class="rankings-grid" id="rankings-grid">
     </div>
+    <div class="map-container hidden" id="map-container"></div>
 
     <!-- Loupe view (full screen + filmstrip) -->
     <div class="loupe hidden" id="loupe">
@@ -32,7 +33,12 @@
         <select id="sort-field" class="bar-select" onchange="PhotoArchive.setSortField(this.value)">
             <option value="elo">Rating</option>
             <option value="comparisons">Comparisons</option>
+            <option value="date_taken">Date Taken</option>
             <option value="newest">Date Added</option>
+            <option value="date_modified">Date Modified</option>
+            <option value="file_size">File Size</option>
+            <option value="resolution">Resolution</option>
+            <option value="camera">Camera</option>
             <option value="filename">Filename</option>
         </select>
         <button class="filter-icon sort-dir-btn" id="sort-dir-btn" onclick="PhotoArchive.toggleSortDir()" title="Toggle sort direction">
@@ -70,6 +76,10 @@
     </div>
     <div class="bar-section bar-hints">
         ↑↓←→ navigate · Enter view · Tab compare · Esc clear
+    </div>
+    <div class="bar-section bar-view-toggle">
+        <button class="bar-btn view-btn active" id="view-grid-btn" onclick="PhotoArchive.setLibraryView('grid')">Grid</button>
+        <button class="bar-btn view-btn" id="view-map-btn" onclick="PhotoArchive.setLibraryView('map')">Map</button>
     </div>
     <div class="bar-section bar-nav">
         <a href="/compare" class="bar-link">Compare</a>

@@ -37,6 +37,38 @@
     <select id="filter-folder" class="bar-select" onchange="PhotoArchive.setFilter('folder', this.value)">
         <option value="">All Folders</option>
     </select>
+    <div class="metadata-filter-wrap">
+        <button id="metadata-filter-btn" class="bar-btn metadata-filter-btn"
+                onclick="PhotoArchive.toggleMetadataFilters()" aria-expanded="false">
+            Metadata
+        </button>
+        <div id="metadata-filter-panel" class="metadata-filter-panel hidden">
+            <label>
+                <span>Date</span>
+                <select id="filter-taken" class="bar-select" onchange="PhotoArchive.setFilter('taken', this.value)">
+                    <option value="">All Dates</option>
+                </select>
+            </label>
+            <label>
+                <span>Type</span>
+                <select id="filter-type" class="bar-select" onchange="PhotoArchive.setFilter('fileType', this.value)">
+                    <option value="">All Types</option>
+                </select>
+            </label>
+            <label>
+                <span>Camera</span>
+                <select id="filter-camera" class="bar-select metadata-select" onchange="PhotoArchive.setFilter('camera', this.value)">
+                    <option value="">All Cameras</option>
+                </select>
+            </label>
+            <label>
+                <span>Lens</span>
+                <select id="filter-lens" class="bar-select metadata-select metadata-select-wide" onchange="PhotoArchive.setFilter('lens', this.value)">
+                    <option value="">All Lenses</option>
+                </select>
+            </label>
+        </div>
+    </div>
 </div>
 <div class="bar-divider"></div>
 <div class="bar-section bar-size">

@@ -475,6 +475,7 @@ const PhotoArchive = (() => {
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
         loadFolderList();
+        loadFilterOptions();
         initStarHover();
     }
 
@@ -677,7 +678,7 @@ const PhotoArchive = (() => {
 
     function updateCompareProgress() {
         const total = compareStats.total_comparisons || 0;
-        const poolCount = compareStats['ke' + 'pt'] || 0;
+        const poolCount = compareStats.filtered_pool ?? compareStats['ke' + 'pt'] ?? 0;
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
         if (poolEl) poolEl.textContent = poolCount.toLocaleString();
@@ -941,6 +942,8 @@ const PhotoArchive = (() => {
     let rankingsSort = 'elo';
     let sortField = 'elo';
     let sortDesc = true;
+    let lastDateGroup = null;
+    let dateGroupsData = [];
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
@@ -948,7 +951,17 @@ const PhotoArchive = (() => {
     let thumbHeight = 220;
     let libraryImages = [];
     let lightboxIndex = -1;
-    let filters = { orientation: '', compared: '', rating: '', folder: '', flag: '' };
+    let filters = {
+        orientation: '',
+        compared: '',
+        rating: '',
+        folder: '',
+        flag: '',
+        taken: '',
+        fileType: '',
+        camera: '',
+        lens: '',
+    };
 
     function saveFilters() {
         try { sessionStorage.setItem('pa_filters', JSON.stringify(filters)); } catch {}
@@ -982,12 +995,49 @@ const PhotoArchive = (() => {
                 const sel = document.getElementById('filter-folder');
                 if (sel) sel.value = filters.folder;
             }
+            if (filters.taken) {
+                const sel = document.getElementById('filter-taken');
+                if (sel) sel.value = filters.taken;
+            }
+            if (filters.fileType) {
+                const sel = document.getElementById('filter-type');
+                if (sel) sel.value = filters.fileType;
+            }
+            if (filters.camera) {
+                const sel = document.getElementById('filter-camera');
+                if (sel) sel.value = filters.camera;
+            }
+            if (filters.lens) {
+                const sel = document.getElementById('filter-lens');
+                if (sel) sel.value = filters.lens;
+            }
             if (filters.flag) {
                 document.querySelectorAll('.filter-flag').forEach(btn => {
                     btn.classList.toggle('active', btn.dataset.flag === filters.flag);
                 });
             }
+            updateMetadataFilterButton();
         } catch {}
+    }
+
+    function activeMetadataFilterCount() {
+        return ['taken', 'fileType', 'camera', 'lens'].filter(key => Boolean(filters[key])).length;
+    }
+
+    function updateMetadataFilterButton() {
+        const btn = document.getElementById('metadata-filter-btn');
+        if (!btn) return;
+        const count = activeMetadataFilterCount();
+        btn.textContent = count ? `Metadata (${count})` : 'Metadata';
+        btn.classList.toggle('active', count > 0);
+    }
+
+    function toggleMetadataFilters() {
+        const panel = document.getElementById('metadata-filter-panel');
+        const btn = document.getElementById('metadata-filter-btn');
+        if (!panel) return;
+        panel.classList.toggle('hidden');
+        if (btn) btn.setAttribute('aria-expanded', panel.classList.contains('hidden') ? 'false' : 'true');
     }
 
     function filterParams(state = filters) {
@@ -997,6 +1047,10 @@ const PhotoArchive = (() => {
         if (state.rating) p += `&min_stars=${state.rating}`;
         if (state.folder) p += `&folder=${encodeURIComponent(state.folder)}`;
         if (state.flag) p += `&flag=${state.flag}`;
+        if (state.taken) p += `&date_taken=${encodeURIComponent(state.taken)}`;
+        if (state.fileType) p += `&file_type=${encodeURIComponent(state.fileType)}`;
+        if (state.camera) p += `&camera=${encodeURIComponent(state.camera)}`;
+        if (state.lens) p += `&lens=${encodeURIComponent(state.lens)}`;
         return p;
     }
 
@@ -1007,6 +1061,10 @@ const PhotoArchive = (() => {
             rating: filters.rating || '',
             folder: filters.folder || '',
             flag: filters.flag || '',
+            taken: filters.taken || '',
+            fileType: filters.fileType || '',
+            camera: filters.camera || '',
+            lens: filters.lens || '',
         };
     }
 
@@ -1039,6 +1097,22 @@ const PhotoArchive = (() => {
 
         if (baseState.folder) {
             pushState({ folder: '' });
+        }
+
+        if (baseState.taken) {
+            pushState({ taken: '' });
+        }
+
+        if (baseState.fileType) {
+            pushState({ fileType: '' });
+        }
+
+        if (baseState.camera) {
+            pushState({ camera: '' });
+        }
+
+        if (baseState.lens) {
+            pushState({ lens: '' });
         }
 
         if (!baseState.flag) {
@@ -1085,7 +1159,7 @@ const PhotoArchive = (() => {
         if (fromView === 'compare') {
             const libraryUrl = buildRankingsUrl({
                 sort: 'elo',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '' },
+                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 limit: INITIAL_RANKINGS_PAGE_SIZE,
                 offset: 0,
             });
@@ -1102,7 +1176,7 @@ const PhotoArchive = (() => {
         } else if (fromView === 'library') {
             const compareUrl = buildMosaicUrl({
                 strategy: 'explore',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '' },
+                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 gridElo: 0,
                 n: mosaicSize,
             });
@@ -1173,11 +1247,16 @@ const PhotoArchive = (() => {
     }
 
     const SORT_KEYS = {
-        'elo':         { desc: 'elo',           asc: 'elo_asc' },
-        'comparisons': { desc: 'comparisons',   asc: 'least_compared' },
-        'newest':      { desc: 'newest',        asc: 'oldest' },
-        'filename':    { desc: 'filename_desc', asc: 'filename' },
-        'similarity':  { desc: 'similarity',    asc: 'similarity' },
+        'elo':         { desc: 'elo',           asc: 'elo_asc', defaultDesc: true },
+        'comparisons': { desc: 'comparisons',   asc: 'least_compared', defaultDesc: true },
+        'date_taken':  { desc: 'date_taken',    asc: 'date_taken_asc', defaultDesc: true },
+        'newest':      { desc: 'newest',        asc: 'oldest', defaultDesc: true },
+        'date_modified': { desc: 'date_modified', asc: 'date_modified_asc', defaultDesc: true },
+        'file_size':   { desc: 'file_size',     asc: 'file_size_asc', defaultDesc: true },
+        'resolution':  { desc: 'resolution',    asc: 'resolution_asc', defaultDesc: true },
+        'camera':      { desc: 'camera_desc',   asc: 'camera', defaultDesc: false },
+        'filename':    { desc: 'filename_desc', asc: 'filename', defaultDesc: false },
+        'similarity':  { desc: 'similarity',    asc: 'similarity', defaultDesc: true },
     };
 
     async function initLibrary() {
@@ -1193,6 +1272,7 @@ const PhotoArchive = (() => {
         }).catch(() => {});
 
         loadFolderList();
+        loadFilterOptions();
         initStarHover();
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
@@ -1252,16 +1332,20 @@ const PhotoArchive = (() => {
                 openLightbox(libraryImages[selectedLibraryIndex]);
             } else if (e.key.toLowerCase() === 'p') {
                 e.preventDefault();
-                setCurrentLibraryFlag('picked');
+                if (batchSelected.size > 0) batchFlag('picked');
+                else setCurrentLibraryFlag('picked');
             } else if (e.key.toLowerCase() === 'x') {
                 e.preventDefault();
-                setCurrentLibraryFlag('rejected');
+                if (batchSelected.size > 0) batchFlag('rejected');
+                else setCurrentLibraryFlag('rejected');
             } else if (e.key.toLowerCase() === 'u') {
                 e.preventDefault();
-                setCurrentLibraryFlag('unflagged');
-            } else if (e.key === 'Escape' && selectedLibraryIndex >= 0) {
+                if (batchSelected.size > 0) batchFlag('unflagged');
+                else setCurrentLibraryFlag('unflagged');
+            } else if (e.key === 'Escape') {
                 e.preventDefault();
-                deselectLibraryCard(cards);
+                if (batchSelected.size > 0) clearBatchSelection();
+                else if (selectedLibraryIndex >= 0) deselectLibraryCard(cards);
             } else if (e.key === 'Tab') {
                 e.preventDefault();
                 window.location.href = '/compare';
@@ -1350,6 +1434,7 @@ const PhotoArchive = (() => {
             card.style.height = thumbHeight + 'px';
             card.style.flexGrow = ar;
             card.style.flexBasis = (thumbHeight * ar) + 'px';
+            card.title = imageMetadataTitle(img);
             card.onclick = () => openLightbox(img);
 
             const simPct = (img.similarity * 100).toFixed(0);
@@ -1375,17 +1460,20 @@ const PhotoArchive = (() => {
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
+        lastDateGroup = null;
+        dateGroupsData = [];
         // Clear grid only after new data arrives to avoid blank flash
         rankingsLoading = false; // allow loadRankings to proceed
         loadRankings(true);  // true = clear grid before appending
+        updateDateScrubber();
     }
 
     function setSortField(field) {
         sortField = field;
-        sortDesc = true; // reset to desc when changing field
-        updateSortDirIcon();
         const key = SORT_KEYS[field];
-        setRankingsSort(key ? key.desc : field);
+        sortDesc = key?.defaultDesc !== false;
+        updateSortDirIcon();
+        setRankingsSort(key ? (sortDesc ? key.desc : key.asc) : field);
     }
 
     function toggleSortDir() {
@@ -1401,6 +1489,61 @@ const PhotoArchive = (() => {
     function updateSortDirIcon() {
         const btn = document.getElementById('sort-dir-btn');
         if (btn) btn.classList.toggle('active', !sortDesc);
+    }
+
+    function parseMetadataDate(value) {
+        if (!value) return null;
+        if (typeof value === 'number') {
+            const millis = value > 100000000000 ? value : value * 1000;
+            const parsed = new Date(millis);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+        const normalized = String(value).trim().replace(' ', 'T');
+        const parsed = new Date(normalized);
+        return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    function formatShortDate(value) {
+        const date = parseMetadataDate(value);
+        if (!date) return value || '';
+        return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+
+    function formatDateTime(value) {
+        const date = parseMetadataDate(value);
+        if (!date) return value || '';
+        return date.toLocaleString(undefined, {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+        });
+    }
+
+    function cameraLabel(img) {
+        return [img.camera_make, img.camera_model].filter(Boolean).join(' ').trim();
+    }
+
+    function resolutionLabel(img) {
+        const width = Number(img.width || 0);
+        const height = Number(img.height || 0);
+        if (!width || !height) return '';
+        const megapixels = (width * height) / 1000000;
+        return `${width} x ${height} (${megapixels.toFixed(megapixels >= 10 ? 0 : 1)} MP)`;
+    }
+
+    function imageMetadataTitle(img) {
+        const parts = [img.filename];
+        const camera = cameraLabel(img);
+        if (camera) parts.push(camera);
+        if (img.lens) parts.push(img.lens);
+        if (img.date_taken) parts.push(`Taken ${formatDateTime(img.date_taken)}`);
+        const resolution = resolutionLabel(img);
+        if (resolution) parts.push(resolution);
+        if (img.file_size) parts.push(formatBytes(img.file_size));
+        if (img.file_ext) parts.push(img.file_ext.toUpperCase());
+        return parts.filter(Boolean).join('\n');
     }
 
     function flagClass(flag) {
@@ -1443,6 +1586,8 @@ const PhotoArchive = (() => {
 
     async function setImageFlag(imageId, flag) {
         if (!imageId || !['picked', 'unflagged', 'rejected'].includes(flag)) return;
+        const img = libraryImages.find(item => item.id === imageId);
+        const previousFlag = img?.flag || 'unflagged';
         updateImageFlagLocal(imageId, flag);
         try {
             const res = await fetch(`/api/image/${imageId}/flag`, {
@@ -1452,6 +1597,7 @@ const PhotoArchive = (() => {
             });
             if (!res.ok) throw new Error('flag update failed');
         } catch {
+            updateImageFlagLocal(imageId, previousFlag);
             showToast('Flag update failed');
         }
     }
@@ -1478,9 +1624,14 @@ const PhotoArchive = (() => {
             rankingsLoading = false;
             return;
         }
+        if (requestOffset === 0 && typeof data.total_images === 'number') {
+            compareStats = { ...compareStats, filtered_pool: data.total_images };
+            updateCompareProgress();
+        }
         const grid = document.getElementById('rankings-grid');
-        if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; }
+        if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; lastDateGroup = null; }
         const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
+        const isDateSort = (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc');
         const rowH = thumbHeight;
 
         // Batch DOM writes with DocumentFragment to avoid per-card reflows
@@ -1492,22 +1643,33 @@ const PhotoArchive = (() => {
             const tier = getTierClass(img.elo, img.comparisons);
             const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
 
+            // Insert date group header when group changes
+            if (isDateSort) {
+                const group = img.date_group || '';
+                if (group !== lastDateGroup) {
+                    lastDateGroup = group;
+                    const header = document.createElement('div');
+                    header.className = 'date-group-header';
+                    header.dataset.dateGroup = group;
+                    header.textContent = group ? formatDateGroup(group) : 'No Date';
+                    frag.appendChild(header);
+                }
+            }
+
             const card = document.createElement('div');
             card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
+            if (batchMode) card.classList.add('selectable');
+            if (batchSelected.has(img.id)) card.classList.add('selected');
             card.dataset.imageId = img.id;
             card.dataset.ar = ar;
             card.style.height = rowH + 'px';
             card.style.flexGrow = ar;
             card.style.flexBasis = (rowH * ar) + 'px';
-            card.onclick = () => {
-                if (batchMode) { toggleBatchSelect(img.id, card); }
-                else { openLightbox(img); }
-            };
+            card.title = imageMetadataTitle(img);
+            card.onclick = (e) => handleCardClick(e, img, card, libraryImages.length + i);
 
             const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
-            const infoLine = showRank
-                ? `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo}</span>`
-                : `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+            const infoLine = libraryCardInfoLine(img, rank, showRank);
 
             card.innerHTML = `
                 <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
@@ -1530,7 +1692,143 @@ const PhotoArchive = (() => {
             // Always warm neighbors — not just on first load
             scheduleLibraryNeighborWarmup();
             if (requestOffset === 0) scheduleCrossViewWarmup('library');
+            if (isDateSortActive()) setupScrubberScrollObserver();
         }
+    }
+
+    function libraryCardInfoLine(img, rank, showRank) {
+        if (showRank) {
+            return `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo}</span>`;
+        }
+        if (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc') {
+            const label = formatShortDate(img.date_taken) || 'No date';
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+        }
+        if (rankingsSort === 'file_size' || rankingsSort === 'file_size_asc') {
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${formatBytes(img.file_size)}</span>`;
+        }
+        if (rankingsSort === 'date_modified' || rankingsSort === 'date_modified_asc') {
+            const label = formatShortDate(img.file_modified_at) || 'No modified date';
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+        }
+        if (rankingsSort === 'resolution' || rankingsSort === 'resolution_asc') {
+            const label = resolutionLabel(img) || 'No size';
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+        }
+        if (rankingsSort === 'camera' || rankingsSort === 'camera_desc') {
+            const label = cameraLabel(img) || 'No camera';
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+        }
+        if (rankingsSort === 'newest' || rankingsSort === 'oldest') {
+            const label = formatShortDate(img.created_at) || 'Added';
+            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+        }
+        return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+    }
+
+    function formatDateGroup(dateStr) {
+        // dateStr is "YYYY-MM" format
+        try {
+            const [year, month] = dateStr.split('-');
+            const date = new Date(parseInt(year), parseInt(month) - 1);
+            return date.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
+        } catch {
+            return dateStr;
+        }
+    }
+
+    function isDateSortActive() {
+        return rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc';
+    }
+
+    async function updateDateScrubber() {
+        const existing = document.getElementById('date-scrubber');
+        if (!isDateSortActive()) {
+            if (existing) existing.remove();
+            return;
+        }
+        // Fetch date groups for the scrubber
+        const url = `/api/date-groups?${filterParams().replace(/^&/, '')}`;
+        try {
+            const data = await fetch(url).then(r => r.json());
+            dateGroupsData = data.groups || [];
+            if (rankingsSort === 'date_taken_asc') dateGroupsData.reverse();
+            renderDateScrubber();
+        } catch {
+            // silently fail
+        }
+    }
+
+    function renderDateScrubber() {
+        let scrubber = document.getElementById('date-scrubber');
+        if (!dateGroupsData.length) {
+            if (scrubber) scrubber.remove();
+            return;
+        }
+        if (!scrubber) {
+            scrubber = document.createElement('div');
+            scrubber.id = 'date-scrubber';
+            scrubber.className = 'date-scrubber';
+            document.body.appendChild(scrubber);
+        }
+        // Build scrubber labels — show years prominently, months smaller
+        let currentYear = '';
+        let html = '';
+        for (const group of dateGroupsData) {
+            if (!group.date) {
+                html += `<div class="scrubber-label" data-date-group="">No Date</div>`;
+                continue;
+            }
+            const year = group.date.substring(0, 4);
+            const month = group.date.substring(5, 7);
+            const monthName = new Date(parseInt(year), parseInt(month) - 1).toLocaleDateString(undefined, { month: 'short' });
+            if (year !== currentYear) {
+                currentYear = year;
+                html += `<div class="scrubber-year" data-date-group="${group.date}">${year}</div>`;
+            }
+            html += `<div class="scrubber-label" data-date-group="${group.date}" title="${group.label} (${group.count})">${monthName}</div>`;
+        }
+        scrubber.innerHTML = html;
+
+        // Click to jump
+        scrubber.querySelectorAll('[data-date-group]').forEach(label => {
+            label.onclick = () => {
+                const group = label.dataset.dateGroup;
+                const header = document.querySelector(`.date-group-header[data-date-group="${group}"]`);
+                if (header) {
+                    header.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            };
+        });
+
+        // Scroll observer to highlight current group
+        setupScrubberScrollObserver();
+    }
+
+    function setupScrubberScrollObserver() {
+        const headers = document.querySelectorAll('.date-group-header');
+        if (!headers.length) return;
+
+        if (window._scrubberObserver) window._scrubberObserver.disconnect();
+        window._scrubberObserver = new IntersectionObserver((entries) => {
+            // Find the topmost visible header
+            let topHeader = null;
+            let topY = Infinity;
+            entries.forEach(entry => {
+                if (entry.isIntersecting && entry.boundingClientRect.top < topY) {
+                    topY = entry.boundingClientRect.top;
+                    topHeader = entry.target;
+                }
+            });
+            if (topHeader) {
+                const group = topHeader.dataset.dateGroup;
+                document.querySelectorAll('.scrubber-label, .scrubber-year').forEach(el => {
+                    el.classList.toggle('active', el.dataset.dateGroup === group);
+                });
+            }
+        }, { rootMargin: '0px 0px -80% 0px' });
+
+        headers.forEach(h => window._scrubberObserver.observe(h));
     }
 
     function selectLibraryCard(index, cards) {
@@ -1582,7 +1880,10 @@ const PhotoArchive = (() => {
 
     function openLightbox(img) {
         lightboxIndex = libraryImages.findIndex(i => i.id === img.id);
-        if (lightboxIndex < 0) lightboxIndex = 0;
+        if (lightboxIndex < 0) {
+            libraryImages.push(img);
+            lightboxIndex = libraryImages.length - 1;
+        }
         buildFilmstrip();
         showLoupeImage(libraryImages[lightboxIndex], 0);
     }
@@ -1738,17 +2039,26 @@ const PhotoArchive = (() => {
             const parts = [];
             const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
             if (camera) parts.push(camera);
+            if (e.date_taken || e.date) parts.push('Taken ' + formatDateTime(e.date_taken || e.date));
             const settings = [];
             if (e.focal_length) settings.push(e.focal_length);
+            if (e.focal_length_35mm) settings.push(`${e.focal_length_35mm} equiv`);
             if (e.aperture) settings.push(e.aperture);
             if (e.shutter_speed) settings.push(e.shutter_speed + 's');
             if (e.iso) settings.push('ISO ' + e.iso);
             if (settings.length) parts.push(settings.join('  '));
             if (e.lens) parts.push(e.lens);
+            const exposure = [e.exposure_program, e.exposure_bias, e.metering_mode, e.white_balance, e.flash].filter(Boolean);
+            if (exposure.length) parts.push(exposure.join('  '));
+            const fileBits = [];
+            if (e.dimensions) fileBits.push(e.dimensions);
+            if (e.filesize) fileBits.push(e.filesize);
+            else if (e.file_size) fileBits.push(formatBytes(e.file_size));
+            if (e.file_ext) fileBits.push(e.file_ext.replace('.', '').toUpperCase());
+            if (fileBits.length) parts.push(fileBits.join('  '));
+            if (e.file_modified) parts.push('Modified ' + formatDateTime(e.file_modified));
+            if (e.filepath) parts.push(e.filepath);
             if (exifEl) exifEl.textContent = parts.join('\n');
-            if (e.dimensions && statsEl) {
-                statsEl.textContent += ' · ' + e.dimensions;
-            }
         }).catch(() => {});
     }
 
@@ -2226,8 +2536,11 @@ const PhotoArchive = (() => {
             rankingsOffset = 0;
             rankingsExhausted = false;
             libraryImages = [];
+            lastDateGroup = null;
             rankingsLoading = false;
             loadRankings(true);
+            if (isDateSortActive()) updateDateScrubber();
+            if (libraryView === 'map') loadMap();
         } else {
             // Compare page — reload mosaic
             loadMosaicBatch();
@@ -2236,6 +2549,7 @@ const PhotoArchive = (() => {
 
     function setFilter(key, value) {
         filters[key] = value;
+        updateMetadataFilterButton();
         saveFilters();
         reloadForFilters();
     }
@@ -2278,6 +2592,72 @@ const PhotoArchive = (() => {
                 opt.textContent = `${indent}${f.path} (${f.count})`;
                 sel.appendChild(opt);
             }
+            if (filters.folder) sel.value = filters.folder;
+        }).catch(() => {});
+    }
+
+    function loadFilterOptions() {
+        fetch('/api/filter-options').then(r => r.json()).then(data => {
+            function populateSelect(selectId, allLabel, items, valueKey, labelFn, currentValue) {
+                const sel = document.getElementById(selectId);
+                if (!sel) return;
+                sel.innerHTML = `<option value="">${allLabel}</option>`;
+                for (const item of items || []) {
+                    const value = item[valueKey] || '';
+                    if (!value) continue;
+                    const opt = document.createElement('option');
+                    opt.value = value;
+                    opt.textContent = labelFn(item);
+                    opt.title = value;
+                    sel.appendChild(opt);
+                }
+                sel.value = currentValue || '';
+            }
+
+            const takenSel = document.getElementById('filter-taken');
+            if (takenSel) {
+                const current = filters.taken || '';
+                takenSel.innerHTML = '<option value="">All Dates</option>';
+                for (const item of data.years || []) {
+                    const opt = document.createElement('option');
+                    opt.value = item.year;
+                    opt.textContent = `${item.year} (${item.count})`;
+                    takenSel.appendChild(opt);
+                }
+                if (Number(data.undated || 0) > 0) {
+                    const opt = document.createElement('option');
+                    opt.value = 'undated';
+                    opt.textContent = `Undated (${data.undated})`;
+                    takenSel.appendChild(opt);
+                }
+                takenSel.value = current;
+            }
+
+            populateSelect(
+                'filter-type',
+                'All Types',
+                data.file_types || [],
+                'ext',
+                item => `${String(item.ext || '').replace('.', '').toUpperCase()} (${item.count})`,
+                filters.fileType,
+            );
+            populateSelect(
+                'filter-camera',
+                'All Cameras',
+                data.cameras || [],
+                'camera',
+                item => `${item.camera} (${item.count})`,
+                filters.camera,
+            );
+            populateSelect(
+                'filter-lens',
+                'All Lenses',
+                data.lenses || [],
+                'lens',
+                item => `${item.lens} (${item.count})`,
+                filters.lens,
+            );
+            updateMetadataFilterButton();
         }).catch(() => {});
     }
 
@@ -2376,31 +2756,89 @@ const PhotoArchive = (() => {
 
     let batchMode = false;
     let batchSelected = new Set();
+    let lastClickedIndex = -1;
 
     function toggleBatchMode() {
-        batchMode = !batchMode;
+        if (batchMode) {
+            clearBatchSelection();
+        } else {
+            batchMode = true;
+            document.querySelectorAll('.rank-card').forEach(c => c.classList.add('selectable'));
+            updateBatchBar();
+        }
+    }
+
+    function clearBatchSelection() {
+        batchMode = false;
         batchSelected.clear();
+        lastClickedIndex = -1;
         document.querySelectorAll('.rank-card').forEach(c => {
-            c.classList.toggle('selectable', batchMode);
-            c.classList.remove('selected');
+            c.classList.remove('selectable', 'selected');
         });
         updateBatchBar();
     }
 
-    function toggleBatchSelect(imgId, card) {
-        if (batchSelected.has(imgId)) {
-            batchSelected.delete(imgId);
-            card.classList.remove('selected');
+    function handleCardClick(e, img, card, index) {
+        if (e.ctrlKey || e.metaKey) {
+            // Ctrl/Cmd-click: toggle individual selection
+            e.preventDefault();
+            if (batchSelected.has(img.id)) {
+                batchSelected.delete(img.id);
+                card.classList.remove('selected');
+            } else {
+                batchSelected.add(img.id);
+                card.classList.add('selected');
+            }
+            lastClickedIndex = index;
+            if (batchSelected.size === 0) {
+                clearBatchSelection();
+            } else {
+                batchMode = true;
+                document.querySelectorAll('.rank-card').forEach(c => c.classList.add('selectable'));
+                updateBatchBar();
+            }
+        } else if (e.shiftKey && lastClickedIndex >= 0) {
+            // Shift-click: range selection
+            e.preventDefault();
+            const cards = document.querySelectorAll('.rank-card');
+            const start = Math.min(lastClickedIndex, index);
+            const end = Math.max(lastClickedIndex, index);
+            for (let i = start; i <= end; i++) {
+                if (i < libraryImages.length && i < cards.length) {
+                    batchSelected.add(libraryImages[i].id);
+                    cards[i].classList.add('selected');
+                }
+            }
+            batchMode = true;
+            document.querySelectorAll('.rank-card').forEach(c => c.classList.add('selectable'));
+            updateBatchBar();
+        } else if (batchMode) {
+            // In batch mode, plain click toggles selection
+            if (batchSelected.has(img.id)) {
+                batchSelected.delete(img.id);
+                card.classList.remove('selected');
+            } else {
+                batchSelected.add(img.id);
+                card.classList.add('selected');
+            }
+            lastClickedIndex = index;
+            if (batchSelected.size === 0) {
+                clearBatchSelection();
+            } else {
+                batchMode = true;
+                document.querySelectorAll('.rank-card').forEach(c => c.classList.add('selectable'));
+                updateBatchBar();
+            }
         } else {
-            batchSelected.add(imgId);
-            card.classList.add('selected');
+            // Normal click: open lightbox
+            lastClickedIndex = index;
+            openLightbox(img);
         }
-        updateBatchBar();
     }
 
     function updateBatchBar() {
         let bar = document.getElementById('batch-bar');
-        if (batchMode) {
+        if (batchSelected.size > 0) {
             if (!bar) {
                 bar = document.createElement('div');
                 bar.id = 'batch-bar';
@@ -2409,12 +2847,41 @@ const PhotoArchive = (() => {
             }
             bar.innerHTML = `
                 <span>${batchSelected.size} selected</span>
+                <button class="batch-flag-btn flag-picked" onclick="PhotoArchive.batchFlag('picked')">P</button>
+                <button class="batch-flag-btn flag-unflagged" onclick="PhotoArchive.batchFlag('unflagged')">U</button>
+                <button class="batch-flag-btn flag-rejected" onclick="PhotoArchive.batchFlag('rejected')">X</button>
+                <span class="batch-divider"></span>
                 <button onclick="PhotoArchive.batchExport('json')">Export JSON</button>
                 <button onclick="PhotoArchive.batchExport('csv')">Export CSV</button>
-                <button class="batch-cancel" onclick="PhotoArchive.toggleBatchMode()">Cancel</button>
+                <button class="batch-cancel" onclick="PhotoArchive.clearBatchSelection()">✕</button>
             `;
         } else if (bar) {
             bar.remove();
+        }
+    }
+
+    async function batchFlag(flag) {
+        if (!batchSelected.size) return;
+        const ids = Array.from(batchSelected);
+        const previousFlags = ids.map(id => {
+            const img = libraryImages.find(item => item.id === id);
+            return { id, flag: img?.flag || 'unflagged' };
+        });
+        // Update UI immediately
+        ids.forEach(id => updateImageFlagLocal(id, flag));
+        try {
+            const res = await fetch('/api/images/flag', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image_ids: ids, flag }),
+            });
+            if (!res.ok) throw new Error('batch flag failed');
+            showToast(`${ids.length} image${ids.length > 1 ? 's' : ''} → ${flag}`);
+            clearBatchSelection();
+        } catch {
+            previousFlags.forEach(item => updateImageFlagLocal(item.id, item.flag));
+            showToast('Batch flag update failed');
+            return;
         }
     }
 
@@ -2425,6 +2892,158 @@ const PhotoArchive = (() => {
 
     function exportRankings(format) {
         window.open(`/api/export?format=${format}`, '_blank');
+    }
+
+    // ==================== MAP VIEW ====================
+
+    let mapInstance = null;
+    let mapMarkerLayer = null;
+    let mapCenter = [20, 0];
+    let mapZoom = 2;
+    let libraryView = 'grid';
+    let leafletLoaded = false;
+
+    function setLibraryView(mode) {
+        libraryView = mode;
+        const grid = document.getElementById('rankings-grid');
+        const mapEl = document.getElementById('map-container');
+        const gridBtn = document.getElementById('view-grid-btn');
+        const mapBtn = document.getElementById('view-map-btn');
+
+        if (mode === 'map') {
+            grid.classList.add('hidden');
+            mapEl.classList.remove('hidden');
+            gridBtn.classList.remove('active');
+            mapBtn.classList.add('active');
+            loadMap();
+        } else {
+            if (mapInstance) {
+                mapCenter = [mapInstance.getCenter().lat, mapInstance.getCenter().lng];
+                mapZoom = mapInstance.getZoom();
+            }
+            grid.classList.remove('hidden');
+            mapEl.classList.add('hidden');
+            gridBtn.classList.add('active');
+            mapBtn.classList.remove('active');
+        }
+    }
+
+    async function loadLeaflet() {
+        if (leafletLoaded) return;
+        // Load Leaflet CSS
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(link);
+
+        // Load MarkerCluster CSS
+        const mcLink = document.createElement('link');
+        mcLink.rel = 'stylesheet';
+        mcLink.href = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css';
+        document.head.appendChild(mcLink);
+        const mcDefaultLink = document.createElement('link');
+        mcDefaultLink.rel = 'stylesheet';
+        mcDefaultLink.href = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css';
+        document.head.appendChild(mcDefaultLink);
+
+        // Load Leaflet JS
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+        });
+
+        // Load MarkerCluster JS
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+        });
+
+        leafletLoaded = true;
+    }
+
+    async function loadMap() {
+        await loadLeaflet();
+
+        const container = document.getElementById('map-container');
+        if (!mapInstance) {
+            mapInstance = L.map(container).setView(mapCenter, mapZoom);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors',
+                maxZoom: 19,
+            }).addTo(mapInstance);
+        } else {
+            // Resize map to fit container
+            setTimeout(() => mapInstance.invalidateSize(), 100);
+        }
+
+        // Fetch markers
+        const url = `/api/map/markers?${filterParams().replace(/^&/, '')}`;
+        try {
+            const data = await fetch(url).then(r => r.json());
+            if (mapMarkerLayer) {
+                mapInstance.removeLayer(mapMarkerLayer);
+            }
+            mapMarkerLayer = L.markerClusterGroup();
+
+            for (const m of data.markers) {
+                const marker = L.marker([m.lat, m.lng]);
+                marker.bindPopup(
+                    `<div class="map-popup">` +
+                    `<img src="${m.thumb_url}" alt="${m.filename}" class="map-popup-thumb" ` +
+                    `onclick="PhotoArchive.openLightboxById(${m.id})">` +
+                    `<div class="map-popup-name">${m.filename}</div></div>`,
+                    { maxWidth: 200 }
+                );
+                mapMarkerLayer.addLayer(marker);
+            }
+            mapInstance.addLayer(mapMarkerLayer);
+
+            // Update stats
+            const mapInfo = document.getElementById('map-info');
+            if (!mapInfo) {
+                const info = document.createElement('div');
+                info.id = 'map-info';
+                info.className = 'map-info';
+                container.appendChild(info);
+            }
+            const infoEl = document.getElementById('map-info');
+            infoEl.textContent = `${data.gps_count.toLocaleString()} of ${data.total_count.toLocaleString()} photos have location data`;
+
+            // Fit bounds if markers exist and map hasn't been manually positioned
+            if (data.markers.length > 0 && mapZoom === 2) {
+                mapInstance.fitBounds(mapMarkerLayer.getBounds(), { padding: [30, 30] });
+            }
+        } catch (e) {
+            console.error('Map load error:', e);
+        }
+    }
+
+    function openLightboxById(id) {
+        const img = libraryImages.find(i => i.id === id);
+        if (img) {
+            openLightbox(img);
+        } else {
+            // Image not in library list — fetch minimal info
+            fetch(`/api/image/${id}/exif`).then(r => r.json()).then(data => {
+                const exif = data.exif || {};
+                openLightbox({
+                    id,
+                    filename: exif.filename || `Image ${id}`,
+                    thumb_url: `/api/thumb/sm/${id}`,
+                    aspect_ratio: 1.5,
+                    elo: 0,
+                    comparisons: 0,
+                    flag: 'unflagged',
+                    ...exif,
+                });
+            }).catch(() => {});
+        }
     }
 
     // ==================== SETTINGS ====================
@@ -3501,8 +4120,6 @@ const PhotoArchive = (() => {
     return {
         initCompare,
         initLibrary,
-        pauseEmbeddings,
-        resumeEmbeddings,
         initRankings,
         initSettings,
         clearSearch,
@@ -3516,11 +4133,14 @@ const PhotoArchive = (() => {
         lightboxPrev,
         setThumbSize,
         setFilter,
+        toggleMetadataFilters,
         toggleFilter,
         toggleStar,
         findSimilar,
         toggleBatchMode,
+        clearBatchSelection,
         batchExport,
+        batchFlag,
         mosaicShuffle,
         setMosaicStrategy,
         toggleAIPanel,
@@ -3543,5 +4163,9 @@ const PhotoArchive = (() => {
         browseDirectoryParent,
         selectBrowsedDirectory,
         useBrowsedDirectory,
+        pauseEmbeddings,
+        resumeEmbeddings,
+        setLibraryView,
+        openLightboxById,
     };
 })();
