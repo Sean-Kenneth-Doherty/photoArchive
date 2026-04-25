@@ -9,6 +9,7 @@ const PhotoArchive = (() => {
     let compareModeTransitionToken = 0;
     let compareBusy = false;
     let compareActionSeq = 0;
+    let undoCount = 0;
     let compareStats = {};
     let compareImageToken = 0;
     const compareDisplayedTier = { left: -1, right: -1 };
@@ -502,6 +503,7 @@ const PhotoArchive = (() => {
         const idx = mosaicImages.findIndex(img => img.id === id);
         if (idx === -1) return;
         mosaicBusy = true;
+        undoCount = 0;
         const actionSeq = ++mosaicActionSeq;
 
         const otherIds = mosaicImages.filter(img => img.id !== id).map(img => img.id);
@@ -1003,6 +1005,7 @@ const PhotoArchive = (() => {
     function submitComparison(side) {
         if (compareBusy || compareIndex >= comparePairs.length) return;
         compareBusy = true;
+        undoCount = 0;
         const actionSeq = ++compareActionSeq;
 
         const pair = comparePairs[compareIndex];
@@ -1046,6 +1049,11 @@ const PhotoArchive = (() => {
 
     async function undoComparison() {
         if (compareBusy) return;
+        undoCount++;
+        if (undoCount > 3) {
+            showToast('Maximum undo reached');
+            return;
+        }
         compareBusy = true;
         try {
             const res = await fetch('/api/compare/undo', { method: 'POST' });
