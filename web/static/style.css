@@ -761,6 +761,12 @@ button:disabled {
     margin: 2px;
     object-fit: contain;
     display: block;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.mosaic-cell img.loaded {
+    opacity: 1;
 }
 
 .mosaic-cell:hover {

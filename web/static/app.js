@@ -259,7 +259,7 @@ const PhotoArchive = (() => {
             cell.style.flexGrow = ar;
             cell.style.flexBasis = (rowH * ar) + 'px';
             cell.onclick = () => mosaicClick(img.id);
-            cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" data-tier-rank="0">`;
+            cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
             preloadImage(img.thumb_url);
             grid.appendChild(cell);
             scheduleMosaicImageUpgrade(cell, img, rowH, token, index);
@@ -412,6 +412,7 @@ const PhotoArchive = (() => {
                 const imgEl = targetCell.querySelector('img');
                 if (imgEl) {
                     imgEl.dataset.tierRank = '0';
+                    imgEl.classList.remove('loaded');
                     imgEl.src = newImg.thumb_url;
                     imgEl.alt = newImg.filename;
                 }
