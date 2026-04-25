@@ -215,6 +215,7 @@ const PhotoArchive = (() => {
 
     function renderMosaic() {
         const grid = document.getElementById('mosaic-grid');
+        if (!grid) return;
         grid.innerHTML = '';
         selectedMosaicIndex = -1;
         const token = ++mosaicRenderToken;
