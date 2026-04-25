@@ -7,14 +7,15 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="{% block body_class %}{% endblock %}">
+    {% set current_nav %}{% block active_nav %}{% endblock %}{% endset %}
     {% block navbar %}
     <nav class="navbar">
         <a href="/" class="nav-brand">photoArchive</a>
         {% block navbar_center %}{% endblock %}
         <div class="nav-links">
-            <a href="/compare" class="nav-link">Compare</a>
-            <a href="/library" class="nav-link">Library</a>
-            <a href="/catalog" class="nav-link">Catalog</a>
+            <a href="/compare" class="nav-link{% if current_nav|trim == 'compare' %} active{% endif %}">Compare</a>
+            <a href="/library" class="nav-link{% if current_nav|trim == 'library' %} active{% endif %}">Library</a>
+            <a href="/catalog" class="nav-link{% if current_nav|trim == 'catalog' %} active{% endif %}">Catalog</a>
         </div>
     </nav>
     {% endblock %}
