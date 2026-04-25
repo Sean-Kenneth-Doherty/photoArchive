@@ -2466,6 +2466,7 @@ def clear_cache() -> dict:
                 conn.close()
 
     _replace_stale_thumbnails = False
+    db.invalidate_cached_image_ids_cache(cache_root=SSD_CACHE_DIR)
 
     return {
         "memory_entries_cleared": memory["entries_cleared"],
@@ -2534,6 +2535,7 @@ def configure(config: dict):
         _clear_disk_index()
         _tier_byte_totals.clear()
         _reset_pregen_bulk_cursor()
+        db.invalidate_cached_image_ids_cache()
     _ensure_disk_cache_dirs()
 
     _sync_thumb_config_metadata(
@@ -2567,6 +2569,7 @@ def configure(config: dict):
 
     _enforce_all_disk_budgets()
     _build_disk_path_index()
+    db.invalidate_cached_image_ids_cache()
 
 
 def start_pregeneration() -> dict:

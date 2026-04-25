@@ -214,6 +214,8 @@ CREATE TABLE IF NOT EXISTS cache_metadata (
 
 _stats_cache = {"data": None, "expires": 0}
 _filter_options_cache = {"data": None, "expires": 0}
+_cached_image_ids_cache: dict[tuple[str, str], dict] = {}
+CACHED_IMAGE_IDS_TTL_SECONDS = 5.0
 
 
 def normalize_source_path(path: str) -> str:
@@ -254,6 +256,19 @@ def _invalidate_stats_cache():
 def _invalidate_filter_options_cache():
     _filter_options_cache["data"] = None
     _filter_options_cache["expires"] = 0
+
+
+def invalidate_cached_image_ids_cache(cache_root: str | None = None, size: str | None = None):
+    if cache_root is None and size is None:
+        _cached_image_ids_cache.clear()
+        return
+    for key in list(_cached_image_ids_cache.keys()):
+        key_root, key_size = key
+        if cache_root is not None and key_root != cache_root:
+            continue
+        if size is not None and key_size != size:
+            continue
+        _cached_image_ids_cache.pop(key, None)
 
 
 def invalidate_stats_cache():
@@ -836,6 +851,7 @@ async def mark_source_scan_finished(source_id: int, seen_filepaths: list[str] | 
         await db.commit()
         _invalidate_stats_cache()
         _invalidate_filter_options_cache()
+        invalidate_cached_image_ids_cache()
     finally:
         await db.close()
 
@@ -1338,20 +1354,61 @@ async def get_cached_image_ids(
     if not image_ids or not size or not cache_root:
         return set()
     unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+    cached_all = await get_cached_image_id_set(size, cache_root)
+    if cached_all:
+        return {image_id for image_id in unique_ids if image_id in cached_all}
+    return set()
+
+
+async def get_cached_image_id_set(size: str, cache_root: str) -> frozenset[int]:
+    """Return cached image IDs for one cache root/tier with a short TTL."""
+    if not size or not cache_root:
+        return frozenset()
+    key = (cache_root, size)
+    now = _time.time()
+    cached_entry = _cached_image_ids_cache.get(key)
+    if cached_entry and now < cached_entry["expires"]:
+        return cached_entry["ids"]
+
     cached: set[int] = set()
     db = await get_db()
     try:
-        for chunk in _chunked(unique_ids, chunk_size):
-            placeholders = ",".join("?" for _ in chunk)
-            cursor = await db.execute(
-                "SELECT image_id FROM cache_entries "
-                f"WHERE cache_root = ? AND size = ? AND image_id IN ({placeholders})",
-                [cache_root, size] + chunk,
-            )
-            cached.update(int(row["image_id"]) for row in await cursor.fetchall())
-        return cached
+        cursor = await db.execute(
+            "SELECT image_id FROM cache_entries WHERE cache_root = ? AND size = ?",
+            (cache_root, size),
+        )
+        cached.update(int(row["image_id"]) for row in await cursor.fetchall())
     finally:
         await db.close()
+    frozen = frozenset(cached)
+    _cached_image_ids_cache[key] = {
+        "ids": frozen,
+        "expires": now + CACHED_IMAGE_IDS_TTL_SECONDS,
+    }
+    return frozen
+
+
+async def _count_rankings_with_id_filter(
+    conn,
+    conditions: list[str],
+    params: list,
+    id_values,
+) -> int:
+    ids = list(dict.fromkeys(int(image_id) for image_id in id_values))
+    if not ids:
+        return 0
+    total = 0
+    for chunk in _chunked(ids, 900):
+        placeholders = ",".join("?" for _ in chunk)
+        cursor = await conn.execute(
+            f"SELECT COUNT(*) AS count FROM images i "
+            f"JOIN catalog_sources s ON s.id = i.source_id "
+            f"WHERE {' AND '.join(conditions + [f'i.id IN ({placeholders})'])}",
+            list(params) + chunk,
+        )
+        row = await cursor.fetchone()
+        total += int(row["count"] or 0)
+    return total
 
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
@@ -1406,6 +1463,12 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
                          text_query: str = "") -> int:
     db = await get_db()
     try:
+        cached_id_filter = None
+        if visible_thumb_size and cache_root:
+            cached_id_filter = set(await get_cached_image_id_set(visible_thumb_size, cache_root))
+            visible_thumb_size = ""
+            cache_root = ""
+
         conditions, params = _ranking_filter_parts(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
@@ -1413,12 +1476,16 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
             visible_thumb_size=visible_thumb_size, cache_root=cache_root,
             text_query=text_query,
         )
+
+        if cached_id_filter is not None:
+            if id_filter is not None:
+                cached_id_filter.intersection_update(int(image_id) for image_id in id_filter)
+            return await _count_rankings_with_id_filter(db, conditions, params, cached_id_filter)
+
         if id_filter is not None:
             if not id_filter:
                 return 0
-            placeholders = ",".join("?" * len(id_filter))
-            conditions.append(f"i.id IN ({placeholders})")
-            params.extend(id_filter)
+            return await _count_rankings_with_id_filter(db, conditions, params, id_filter)
         cursor = await db.execute(
             f"SELECT COUNT(*) AS count FROM images i "
             f"JOIN catalog_sources s ON s.id = i.source_id "

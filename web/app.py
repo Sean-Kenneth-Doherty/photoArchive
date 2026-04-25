@@ -865,6 +865,16 @@ async def warm_images(request: Request):
         return {"scheduled": {tier: 0 for tier in requested}, "images": len(all_ids)}
 
     scheduled = {}
+    for tier in list(requested.keys()):
+        if tier not in thumbnails.THUMB_TIERS:
+            continue
+        cached_ids = await _cached_image_ids(requested[tier], tier)
+        if not cached_ids:
+            continue
+        requested[tier] = [image_id for image_id in requested[tier] if image_id not in cached_ids]
+        if not requested[tier]:
+            scheduled[tier] = 0
+
     for tier, ids in requested.items():
         rows = [rows_by_id[image_id] for image_id in ids if image_id in rows_by_id]
         if not rows:

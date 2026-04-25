@@ -47,6 +47,7 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         app_module.settings.SETTINGS_PATH = os.path.join(self.tempdir.name, "settings.local.json")
         app_module.settings._settings = None
         db.invalidate_stats_cache()
+        db.invalidate_cached_image_ids_cache()
         await db.init_db()
         app_module._pairing_cache.update({"data": None, "by_id": None, "valid": False})
         app_module._matchups_cache.update({"data": None, "valid": False})
@@ -74,6 +75,7 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         app_module.settings._settings = self.old_settings_state
         db.DB_PATH = self.old_db_path
         db.invalidate_stats_cache()
+        db.invalidate_cached_image_ids_cache()
         self.tempdir.cleanup()
 
     async def _source(self, name="catalog", *, online=True):
@@ -431,6 +433,32 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["hidden_pending_thumbnails"], 1)
         self.assertNotIn(hidden, [img["id"] for img in result["images"]])
 
+    async def test_visible_ranking_count_uses_short_ttl_cache_and_invalidation(self):
+        source = await self._source()
+        first = await self._image(source["id"], "first.jpg")
+        second = await self._image(source["id"], "second.jpg")
+        await self._cache_entry(first, "sm")
+
+        count = await db.count_rankings(
+            visible_thumb_size="sm",
+            cache_root=app_module.thumbnails.SSD_CACHE_DIR,
+        )
+        self.assertEqual(count, 1)
+
+        await self._cache_entry(second, "sm")
+        stale_count = await db.count_rankings(
+            visible_thumb_size="sm",
+            cache_root=app_module.thumbnails.SSD_CACHE_DIR,
+        )
+        self.assertEqual(stale_count, 1)
+
+        db.invalidate_cached_image_ids_cache()
+        refreshed_count = await db.count_rankings(
+            visible_thumb_size="sm",
+            cache_root=app_module.thumbnails.SSD_CACHE_DIR,
+        )
+        self.assertEqual(refreshed_count, 2)
+
     async def test_rescan_marks_missing_files_and_restores_seen_files(self):
         source = await self._source("scan-source")
         first_path = os.path.join(source["path"], "first.jpg")
@@ -705,6 +733,34 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         }])
         self.assertEqual([call["id"] for call in full_calls], [first, second])
         self.assertTrue(all(call["hot"] for call in full_calls))
+
+    async def test_warm_images_skips_already_cached_thumbnail_ids(self):
+        source = await self._source()
+        cached = await self._image(source["id"], "cached.jpg")
+        uncached = await self._image(source["id"], "uncached.jpg")
+        await self._cache_entry(cached, "md")
+        prefetch_calls = []
+
+        async def fake_prefetch(rows, tier, limit=None, hot=False):
+            prefetch_calls.append({
+                "tier": tier,
+                "ids": [row["id"] for row in rows],
+                "limit": limit,
+                "hot": hot,
+            })
+            return len(rows)
+
+        app_module.thumbnails.prefetch_images = fake_prefetch
+
+        result = await app_module.warm_images(JsonRequest({"tiers": {"md": [cached, uncached]}}))
+
+        self.assertEqual(result["scheduled"], {"md": 1})
+        self.assertEqual(prefetch_calls, [{
+            "tier": "md",
+            "ids": [uncached],
+            "limit": 1,
+            "hot": True,
+        }])
 
     async def test_warm_images_is_best_effort_when_thumbnail_cache_is_locked(self):
         source = await self._source()
