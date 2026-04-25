@@ -942,7 +942,7 @@ const PhotoArchive = (() => {
     function rollUpCounter(el, from, to) {
         if (_rollupAnim) cancelAnimationFrame(_rollupAnim);
         const diff = to - from;
-        const duration = Math.min(2000, Math.max(600, Math.abs(diff) * 10));
+        const duration = Math.min(800, Math.max(300, Math.abs(diff) * 10));
         const start = performance.now();
 
         function tick(now) {
