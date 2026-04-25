@@ -2813,6 +2813,8 @@ const PhotoArchive = (() => {
         const lgEl = document.getElementById('cache-tier-lg');
         const fullEl = document.getElementById('cache-tier-full');
         const pregenEl = document.getElementById('cache-pregen-summary');
+        const thumbPauseBtn = document.getElementById('thumb-pause-btn');
+        const thumbResumeBtn = document.getElementById('thumb-resume-btn');
 
         if (cacheEl) {
             cacheEl.textContent = `${formatBytes(memory.used_bytes)} / ${formatBytes(memory.limit_bytes)}`;
@@ -2842,6 +2844,9 @@ const PhotoArchive = (() => {
             const speed = rate > 0 ? ` · ${formatRatePerMinute(rate)}` : '';
             pregenEl.textContent = `${state}${phase}${message}${speed}${eta}`;
         }
+        const thumbnailsPaused = Boolean(pregen.manual_pause);
+        if (thumbPauseBtn) thumbPauseBtn.disabled = thumbnailsPaused;
+        if (thumbResumeBtn) thumbResumeBtn.disabled = !thumbnailsPaused && pregen.state === 'running';
     }
 
     function renderAutoTuningStatus(settings) {
@@ -3113,6 +3118,8 @@ const PhotoArchive = (() => {
         const etaEl = document.getElementById('ai-settings-embed-eta');
         const predictionsEl = document.getElementById('ai-settings-predictions');
         const workerEl = document.getElementById('ai-settings-worker-message');
+        const pauseBtn = document.getElementById('embedding-pause-btn');
+        const resumeBtn = document.getElementById('embedding-resume-btn');
         if (!progressEl || !remainingEl || !speedEl || !etaEl || !predictionsEl || !workerEl || !aiStatus) return;
 
         const embedded = Number(aiStatus.embedded || 0);
@@ -3149,6 +3156,11 @@ const PhotoArchive = (() => {
 
         predictionsEl.textContent = `${Number(aiStatus.predicted || 0).toLocaleString()} predicted · ${Number(aiStatus.compared || 0).toLocaleString()} compared`;
         workerEl.textContent = aiStatus.worker_message || 'Waiting for worker activity';
+
+        const paused = Boolean(aiStatus.embedding_manual_pause);
+        const available = aiStatus.worker_state !== 'unavailable';
+        if (pauseBtn) pauseBtn.disabled = !available || paused;
+        if (resumeBtn) resumeBtn.disabled = !available || !paused;
     }
 
     function populateSettingsForm(settings) {
@@ -3379,6 +3391,36 @@ const PhotoArchive = (() => {
         }
     }
 
+    async function pauseEmbeddings() {
+        setSettingsStatus('Pausing background embeddings...', 'muted');
+        try {
+            const res = await fetch('/api/ai/embeddings/pause', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Could not pause embeddings');
+            }
+            renderAISettingsStatus(data.ai_status);
+            setSettingsStatus('Embeddings paused. Current in-flight batch may finish first.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Could not pause embeddings: ${err.message}`, 'error');
+        }
+    }
+
+    async function resumeEmbeddings() {
+        setSettingsStatus('Resuming background embeddings...', 'muted');
+        try {
+            const res = await fetch('/api/ai/embeddings/resume', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || 'Could not resume embeddings');
+            }
+            renderAISettingsStatus(data.ai_status);
+            setSettingsStatus('Embeddings resumed.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Could not resume embeddings: ${err.message}`, 'error');
+        }
+    }
+
     async function installAIModel() {
         setSettingsStatus('Saving settings and starting model install…', 'muted');
         try {
@@ -3459,6 +3501,8 @@ const PhotoArchive = (() => {
     return {
         initCompare,
         initLibrary,
+        pauseEmbeddings,
+        resumeEmbeddings,
         initRankings,
         initSettings,
         clearSearch,

@@ -873,6 +873,26 @@ async def cache_pregen_status():
     return thumbnails.get_pregen_status(stats["kept"] + stats["maybe"])
 
 
+@app.post("/api/ai/embeddings/pause")
+async def api_pause_embeddings():
+    try:
+        import embedding_worker
+    except ImportError:
+        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
+    embedding_worker.pause_embedding_worker()
+    return {"ok": True, "ai_status": await build_ai_status()}
+
+
+@app.post("/api/ai/embeddings/resume")
+async def api_resume_embeddings():
+    try:
+        import embedding_worker
+    except ImportError:
+        return JSONResponse({"error": "Embeddings not available"}, status_code=503)
+    embedding_worker.resume_embedding_worker()
+    return {"ok": True, "ai_status": await build_ai_status()}
+
+
 # --- Settings API ---
 
 @app.get("/api/settings")
@@ -2012,6 +2032,7 @@ async def api_folders():
 
 
 @app.get("/api/stats")
+            "manual_pause": False,
 async def api_stats():
     return await db.get_stats()
 
@@ -2063,6 +2084,7 @@ async def build_ai_status():
 
     recent_rate = float(worker_status.get("recent_images_per_min") or 0.0)
     overall_rate = float(worker_status.get("overall_images_per_min") or 0.0)
+        "embedding_manual_pause": bool(worker_status.get("manual_pause")),
     effective_rate = recent_rate if recent_rate > 0 else overall_rate
     eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
     progress_pct = round((embedded / total_images) * 100, 1) if total_images > 0 else 0.0

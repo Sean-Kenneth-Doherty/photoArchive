@@ -68,6 +68,8 @@
             </div>
             <div class="settings-actions">
                 <button class="bar-btn" type="button" id="install-model-btn" onclick="PhotoArchive.installAIModel()">Save + Install Model</button>
+                <button class="bar-btn" type="button" id="embedding-pause-btn" onclick="PhotoArchive.pauseEmbeddings()">Pause Embeddings</button>
+                <button class="bar-btn" type="button" id="embedding-resume-btn" onclick="PhotoArchive.resumeEmbeddings()">Resume Embeddings</button>
             </div>
         </section>
 
@@ -143,6 +145,10 @@
                 <input id="pregenerate_on_idle" type="checkbox">
                 <span>Warm image cache while the computer is idle</span>
             </label>
+            <div class="settings-actions">
+                <button class="bar-btn" type="button" id="thumb-pause-btn" onclick="PhotoArchive.stopCachePregeneration()">Pause Thumbnail Generation</button>
+                <button class="bar-btn" type="button" id="thumb-resume-btn" onclick="PhotoArchive.startCachePregeneration()">Resume Thumbnail Generation</button>
+            </div>
             <details class="settings-advanced" id="cache-advanced">
                 <summary>Technical details</summary>
                 <label class="settings-field">

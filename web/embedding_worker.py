@@ -46,6 +46,7 @@ _worker_status = {
     "state": "idle",
     "message": "",
     "ready": False,
+    "manual_pause": False,
     "model_id": "",
     "model_dir": "",
     "last_error": "",
@@ -60,6 +61,7 @@ _worker_status = {
 }
 _embedding_history = deque()
 _embed_retry_after: dict[int, float] = {}
+_embedding_manual_pause = False
 
 
 def _set_worker_status(state: str, message: str = "", ready: bool = False, last_error: str = ""):
@@ -68,6 +70,7 @@ def _set_worker_status(state: str, message: str = "", ready: bool = False, last_
         "state": state,
         "message": message,
         "ready": ready,
+        "manual_pause": _embedding_manual_pause,
         "model_id": config["embed_model_id"],
         "model_dir": config["embed_model_dir"],
         "last_error": last_error,
@@ -148,7 +151,22 @@ def _select_ready_candidates(rows):
 
 def get_worker_status() -> dict:
     _recompute_speed_metrics()
+    _worker_status["manual_pause"] = _embedding_manual_pause
     return dict(_worker_status)
+
+
+def pause_embedding_worker() -> dict:
+    global _embedding_manual_pause
+    _embedding_manual_pause = True
+    _set_worker_status("paused", "Embedding paused by user.", ready=_model is not None)
+    return get_worker_status()
+
+
+def resume_embedding_worker() -> dict:
+    global _embedding_manual_pause
+    _embedding_manual_pause = False
+    _set_worker_status("idle", "Embedding will resume automatically.", ready=_model is not None)
+    return get_worker_status()
 
 
 def _load_model(model_dir: str, model_id: str):
@@ -290,6 +308,11 @@ async def run_embedding_worker():
                 ),
             )
             model_installed = ai_models.model_files_present(model_dir)
+
+            if _embedding_manual_pause:
+                _set_worker_status("paused", "Embedding paused by user.", ready=_model is not None)
+                await asyncio.sleep(1)
+                continue
 
             if decision.pause:
                 _set_worker_status(
