@@ -56,6 +56,7 @@ _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/dev/status",
     "/api/scan/status",
     "/api/settings",
+    "/api/ui/settings",
 }
 _STARTED_AT = time.time()
 
@@ -1051,6 +1052,16 @@ async def api_settings():
         "ai_status": ai_status,
         "catalog": await db.get_catalog_summary(),
         **settings.settings_metadata(),
+    }
+
+
+@app.get("/api/ui/settings")
+async def api_ui_settings():
+    config = settings.get_settings()
+    return {
+        "settings": {
+            "show_loupe_cache_status": bool(config.get("show_loupe_cache_status", True)),
+        }
     }
 
 

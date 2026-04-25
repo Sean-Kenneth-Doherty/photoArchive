@@ -21,12 +21,15 @@ const PhotoArchive = (() => {
     const COMPARE_NEIGHBOR_PAIRS = 4;
     const FILMSTRIP_WINDOW_RADIUS = 55;
     const LOUPE_TIER_LABELS = ['Thumbnail (sm)', 'Medium (md)', 'Large (lg)', 'Original'];
+    const LOUPE_TIER_NAMES = ['sm', 'md', 'lg', 'full'];
     const LOUPE_TIER_TIMEOUTS = { md: 1800, lg: 2600, full: 5000 };
     const LOUPE_TIER_RANKS = { sm: 0, md: 1, lg: 2, full: 3 };
     const LOUPE_BLANK_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
     const MEDIA_STATUS_MAX_AGE_MS = 15000;
     const mediaStatusCache = new Map();
     const mediaStatusInflight = new Map();
+    let uiSettings = { show_loupe_cache_status: true };
+    let uiSettingsPromise = null;
     let selectedLibraryIndex = -1;
     let selectedMosaicIndex = -1;
     const backgroundWarmTimers = new Map();
@@ -169,7 +172,32 @@ const PhotoArchive = (() => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tiers: payload }),
             keepalive: true,
+        }).then(() => {
+            const currentId = Number(loupeCurrentImage?.id || 0);
+            if (!currentId) return;
+            const includesCurrent = Object.values(payload).some((ids) => (ids || []).includes(currentId));
+            if (includesCurrent) refreshLoupeMediaStatus(loupeCurrentImage, loupeImageToken);
         }).catch(() => {});
+    }
+
+    async function loadUiSettings() {
+        if (uiSettingsPromise) return uiSettingsPromise;
+        uiSettingsPromise = fetch('/api/ui/settings')
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) => {
+                const values = data?.settings || data || {};
+                uiSettings = {
+                    ...uiSettings,
+                    show_loupe_cache_status: values.show_loupe_cache_status !== false,
+                };
+                renderLoupeStatusLine();
+                return uiSettings;
+            })
+            .catch(() => uiSettings)
+            .finally(() => {
+                uiSettingsPromise = null;
+            });
+        return uiSettingsPromise;
     }
 
     async function warmRequests(key, token, requests) {
@@ -1495,6 +1523,7 @@ const PhotoArchive = (() => {
         initBottomBarMeasurement();
         resetLibraryResults();
         restoreFilters();
+        loadUiSettings();
 
         // Fire all init requests in parallel — don't block on rankings
         const rankingsPromise = loadRankings();
@@ -2325,6 +2354,7 @@ const PhotoArchive = (() => {
     let loupeFullLoadTimer = null;
     let loupeFullLoadToken = 0;
     let loupeHideTimer = null;
+    let loupeCurrentMediaStatus = null;
     const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
@@ -2337,8 +2367,8 @@ const PhotoArchive = (() => {
             probe.img.onerror = null;
             probe.img.src = '';
             loupeTierProbes.delete(probe);
-            probe.settled = true;
-            probe.resolve(false);
+            probe.done = true;
+            probe.resolveOnce(false);
         }
     }
 
@@ -2362,6 +2392,7 @@ const PhotoArchive = (() => {
             loupeFullLoadTimer = null;
         }
         loupeDisplayedTierRank = -1;
+        loupeCurrentMediaStatus = null;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
         loupeImg.onload = null;
@@ -2400,7 +2431,7 @@ const PhotoArchive = (() => {
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
         if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} ranking signals`;
-        updateLoupeFlagDisplay(img.flag || 'unflagged');
+        renderLoupeStatusLine(img.flag || 'unflagged');
 
         updateFilmstripActive();
 
@@ -2488,11 +2519,54 @@ const PhotoArchive = (() => {
     }
 
     function updateLoupeFlagDisplay(flag) {
+        renderLoupeStatusLine(flag);
+    }
+
+    function loupeCacheMark(status, tier) {
+        const tierStatus = status?.tiers?.[tier];
+        if (!tierStatus) return 'x';
+        return tierStatus.cached ? '✓' : 'x';
+    }
+
+    function loupeViewingTierName() {
+        return LOUPE_TIER_NAMES[loupeDisplayedTierRank] || 'none';
+    }
+
+    function loupeCacheStatusText(status = loupeCurrentMediaStatus) {
+        return [
+            'cache:',
+            `sm ${loupeCacheMark(status, 'sm')}`,
+            `md ${loupeCacheMark(status, 'md')}`,
+            `lg ${loupeCacheMark(status, 'lg')}`,
+            `og ssd ${loupeCacheMark(status, 'full')}`,
+            `· viewing ${loupeViewingTierName()}`,
+        ].join(' ');
+    }
+
+    function renderLoupeStatusLine(flag = loupeCurrentImage?.flag || 'unflagged') {
         const tierEl = document.getElementById('loupe-overlay-tier');
         if (!tierEl) return;
         const tier = LOUPE_TIER_LABELS[loupeDisplayedTierRank] || 'Image';
         const label = flag === 'picked' ? 'Picked' : flag === 'rejected' ? 'Rejected' : 'Unflagged';
-        tierEl.textContent = `${tier} · ${label}`;
+        if (uiSettings.show_loupe_cache_status) {
+            tierEl.textContent = `${loupeCacheStatusText()} · ${label}`;
+        } else {
+            tierEl.textContent = `${tier} · ${label}`;
+        }
+    }
+
+    function applyLoupeMediaStatus(status, img = loupeCurrentImage, token = loupeImageToken) {
+        if (!status || !img || !isCurrentLoupeImage(img, token)) return false;
+        loupeCurrentMediaStatus = status;
+        renderLoupeStatusLine(img.flag || 'unflagged');
+        return true;
+    }
+
+    async function refreshLoupeMediaStatus(img = loupeCurrentImage, token = loupeImageToken, { force = true } = {}) {
+        if (!img || !isCurrentLoupeImage(img, token)) return null;
+        const status = await getMediaStatus(img.id, { force });
+        applyLoupeMediaStatus(status, img, token);
+        return status;
     }
 
     function loupeApplyImageSize() {
@@ -2508,8 +2582,11 @@ const PhotoArchive = (() => {
             timeoutMs: LOUPE_TIER_TIMEOUTS.md,
         });
 
-        const status = await withTimeout(getMediaStatus(img.id, { force: true }), 500, null);
+        const statusRequest = getMediaStatus(img.id, { force: true });
+        statusRequest.then((latest) => applyLoupeMediaStatus(latest, img, token)).catch(() => {});
+        const status = await withTimeout(statusRequest, 500, null);
         if (!isCurrentLoupeImage(img, token)) return;
+        applyLoupeMediaStatus(status, img, token);
 
         const cachedBest = status?.best_cached;
         if (cachedBest && cachedBest !== 'sm') {
@@ -2548,18 +2625,27 @@ const PhotoArchive = (() => {
             const probe = {
                 img: probeImg,
                 timer: null,
-                resolve,
-                settled: false,
+                resolved: false,
+                resolveOnce(value) {
+                    if (probe.resolved) return;
+                    probe.resolved = true;
+                    resolve(value);
+                },
+                done: false,
                 cancelled: false,
             };
             loupeTierProbes.add(probe);
 
-            const finish = (loaded) => {
-                if (probe.settled) return;
-                probe.settled = true;
+            const cleanup = () => {
+                if (probe.done) return;
+                probe.done = true;
                 if (probe.timer) clearTimeout(probe.timer);
                 loupeTierProbes.delete(probe);
-                resolve(loaded);
+            };
+
+            const finish = (loaded) => {
+                cleanup();
+                probe.resolveOnce(loaded);
             };
 
             probeImg.decoding = 'async';
@@ -2573,7 +2659,8 @@ const PhotoArchive = (() => {
                     finish(false);
                     return;
                 }
-                if (isCurrentLoupeImage(img, token) && rank > loupeDisplayedTierRank) {
+                const isCurrent = isCurrentLoupeImage(img, token);
+                if (isCurrent && rank > loupeDisplayedTierRank) {
                     if (adoptDimensions && probeImg.naturalWidth > 0 && probeImg.naturalHeight > 0) {
                         loupeAdoptSourceDimensions(probeImg.naturalWidth, probeImg.naturalHeight);
                     }
@@ -2581,18 +2668,23 @@ const PhotoArchive = (() => {
                     const loupeImg = document.getElementById('loupe-img');
                     if (loupeImg) {
                         loupeDisplayedTierRank = rank;
+                        if (rank === LOUPE_TIER_RANKS.full) loupeFullLoadToken = token;
                         loupeImg.src = probeImg.src;
                         loupeImg.style.opacity = '1';
-                        updateLoupeFlagDisplay(img.flag || 'unflagged');
+                        renderLoupeStatusLine(img.flag || 'unflagged');
                     }
                 }
+                if (isCurrent) refreshLoupeMediaStatus(img, token);
                 finish(true);
             };
             probeImg.onerror = () => {
                 finish(false);
             };
             if (timeoutMs > 0) {
-                probe.timer = setTimeout(() => finish(false), timeoutMs);
+                probe.timer = setTimeout(() => {
+                    probe.timer = null;
+                    probe.resolveOnce(false);
+                }, timeoutMs);
             }
             probeImg.src = url;
         });
@@ -2947,6 +3039,7 @@ const PhotoArchive = (() => {
         }
         loupeCurrentImage = null;
         loupeFullLoadToken = 0;
+        loupeCurrentMediaStatus = null;
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
@@ -3594,6 +3687,7 @@ const PhotoArchive = (() => {
         'pregenerate_on_idle',
         'embed_batch_size',
         'search_similarity_threshold',
+        'show_loupe_cache_status',
     ];
     const THUMB_OUTPUT_FIELDS = ['thumb_size_sm', 'thumb_size_md', 'thumb_size_lg', 'thumb_quality'];
     let settingsPoller = null;

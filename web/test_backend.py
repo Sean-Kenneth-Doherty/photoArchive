@@ -39,8 +39,12 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.old_schedule_full_image_cache = app_module.thumbnails.schedule_full_image_cache
         self.old_has_cached_fast = app_module.thumbnails.has_cached_fast
         self.old_fast_disk_path_entry = app_module.thumbnails.fast_disk_path_entry
+        self.old_settings_path = app_module.settings.SETTINGS_PATH
+        self.old_settings_state = app_module.settings._settings
 
         db.DB_PATH = os.path.join(self.tempdir.name, "photoarchive-test.db")
+        app_module.settings.SETTINGS_PATH = os.path.join(self.tempdir.name, "settings.local.json")
+        app_module.settings._settings = None
         db.invalidate_stats_cache()
         await db.init_db()
         app_module._pairing_cache.update({"data": None, "by_id": None, "valid": False})
@@ -65,6 +69,8 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         app_module.thumbnails.schedule_full_image_cache = self.old_schedule_full_image_cache
         app_module.thumbnails.has_cached_fast = self.old_has_cached_fast
         app_module.thumbnails.fast_disk_path_entry = self.old_fast_disk_path_entry
+        app_module.settings.SETTINGS_PATH = self.old_settings_path
+        app_module.settings._settings = self.old_settings_state
         db.DB_PATH = self.old_db_path
         db.invalidate_stats_cache()
         self.tempdir.cleanup()
@@ -615,10 +621,26 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
 
         result = await app_module.image_media_status(42)
 
+        self.assertEqual(set(result["tiers"].keys()), {"sm", "md", "lg", "full"})
         self.assertTrue(result["tiers"]["md"]["cached"])
         self.assertTrue(result["tiers"]["full"]["cached"])
         self.assertEqual(result["best_cached"], "full")
         self.assertEqual(result["tiers"]["md"]["cached_url"], "/api/thumb/md/42?cached=1")
+
+    async def test_ui_settings_returns_default_loupe_cache_status(self):
+        result = await app_module.api_ui_settings()
+
+        self.assertEqual(result, {"settings": {"show_loupe_cache_status": True}})
+
+    async def test_loupe_cache_status_setting_persists(self):
+        saved = app_module.settings.save_settings({"show_loupe_cache_status": False})
+        self.assertFalse(saved["show_loupe_cache_status"])
+
+        reloaded = app_module.settings.load_settings(force=True)
+        result = await app_module.api_ui_settings()
+
+        self.assertFalse(reloaded["show_loupe_cache_status"])
+        self.assertEqual(result, {"settings": {"show_loupe_cache_status": False}})
 
 
 if __name__ == "__main__":
