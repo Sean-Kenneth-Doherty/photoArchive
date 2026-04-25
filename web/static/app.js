@@ -1953,50 +1953,6 @@ const PhotoArchive = (() => {
         reloadForFilters();
     }
 
-    async function loadSearchResults() {
-        libraryImages = [];
-        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&limit=100`);
-        const data = await res.json();
-        const grid = document.getElementById('rankings-grid');
-        compareStats = {
-            ...compareStats,
-            filtered_pool: Number(data.visible_images ?? data.images?.length ?? 0),
-            filtered_pool_visible: Number(data.visible_images ?? data.images?.length ?? 0),
-            filtered_pool_total: Number(data.total_images ?? data.images?.length ?? 0),
-        };
-        updateCompareProgress();
-
-        for (let i = 0; i < data.images.length; i++) {
-            const img = data.images[i];
-            const ar = img.aspect_ratio || 1.5;
-            const card = document.createElement('div');
-            card.className = 'rank-card' + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
-            card.dataset.imageId = img.id;
-            card.dataset.ar = ar;
-            card.style.height = thumbHeight + 'px';
-            card.style.flexGrow = ar;
-            card.style.flexBasis = (thumbHeight * ar) + 'px';
-            card.title = imageMetadataTitle(img);
-            card.onclick = () => openLightbox(img);
-
-            const simLabel = similarityLabel(img);
-
-            card.innerHTML = `
-                <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
-                ${flagBadge(img.flag)}
-                <div class="rank-card-info">
-                    <span class="rank-elo">${escapeHtml(img.elo)} Elo</span>
-                    <span class="rank-similarity">${escapeHtml(simLabel)}</span>
-                </div>
-            `;
-            grid.appendChild(card);
-            libraryImages.push(img);
-        }
-
-        const loadMoreWrap = document.getElementById('load-more-wrap');
-        if (loadMoreWrap) loadMoreWrap.classList.add('hidden');
-    }
-
     function setRankingsSort(sort, { persist = true } = {}) {
         rankingsSort = sort;
         const state = sortStateFromValue(sort);
