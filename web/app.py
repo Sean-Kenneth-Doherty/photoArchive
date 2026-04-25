@@ -1411,6 +1411,86 @@ def _filter_by_metadata(
     return images
 
 
+async def _resolve_text_search(q: str) -> dict:
+    """Resolve a text query into either embedding IDs or metadata fallback text."""
+    normalized_query = (q or "").strip()
+    result = {
+        "active": bool(normalized_query),
+        "id_filter": None,
+        "scores": {},
+        "text_query": "",
+        "search_mode": "",
+        "ai_unavailable": False,
+    }
+    if not normalized_query:
+        return result
+
+    try:
+        import embedding_worker
+        import embed_cache
+
+        text_vec = await asyncio.get_event_loop().run_in_executor(
+            None,
+            embedding_worker.encode_text,
+            normalized_query,
+        )
+        if text_vec is not None:
+            image_ids, matrix = await embed_cache.get_matrix()
+            if image_ids is not None:
+                config = settings.get_settings()
+                threshold = config.get("search_similarity_threshold", 0.35)
+                similarities = matrix @ text_vec
+                search_ids: set[int] = set()
+                scores = {}
+                for i in range(len(image_ids)):
+                    if similarities[i] >= threshold:
+                        image_id = int(image_ids[i])
+                        search_ids.add(image_id)
+                        scores[image_id] = float(similarities[i])
+                result.update({
+                    "id_filter": search_ids,
+                    "scores": scores,
+                    "search_mode": "embedding",
+                })
+                return result
+    except Exception:
+        pass
+
+    result.update({
+        "text_query": normalized_query,
+        "search_mode": "metadata",
+        "ai_unavailable": True,
+    })
+    return result
+
+
+def _metadata_text_match(image: dict, query: str) -> bool:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return True
+    fields = (
+        "filename",
+        "filepath",
+        "date_taken",
+        "camera_make",
+        "camera_model",
+        "lens",
+        "file_ext",
+    )
+    return any(needle in str(image.get(field) or "").lower() for field in fields)
+
+
+def _apply_text_search_constraint(candidates: list[dict], search: dict) -> list[dict]:
+    if not search.get("active"):
+        return candidates
+    id_filter = search.get("id_filter")
+    if id_filter is not None:
+        search_ids = {int(image_id) for image_id in id_filter}
+        return [c for c in candidates if int(c.get("id") or 0) in search_ids]
+    text_query = search.get("text_query") or ""
+    return [c for c in candidates if _metadata_text_match(c, text_query)]
+
+
 async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
     """Select images that maximize visual diversity using embedding distance."""
     import random
@@ -1574,25 +1654,18 @@ async def mosaic_next(
     n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0,
     orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
     flag: str = "", date_taken: str = "", file_type: str = "", camera: str = "", lens: str = "",
+    q: str = "",
 ):
     """Get active images for mosaic ranking with configurable sampling strategy."""
     exclude_ids = set()
     if exclude:
         exclude_ids = {int(x) for x in exclude.split(",") if x.strip().isdigit()}
+    search = await _resolve_text_search(q)
 
     if strategy == "top":
         images = await db.get_top_images(limit=50)
     else:
         images = await _get_pairing_images()
-
-    if len(images) < 2:
-        visible = await _filter_visible_candidates([dict(img) for img in images], "sm")
-        counts = _visibility_counts(len(images), len(visible))
-        stats = dict(await db.get_stats())
-        stats["filtered_pool"] = len(visible)
-        stats["filtered_pool_visible"] = len(visible)
-        stats["filtered_pool_total"] = len(images)
-        return {"images": [], **counts, "total_kept": len(images), "stats": stats}
 
     import random
     candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
@@ -1615,9 +1688,24 @@ async def mosaic_next(
     if flag in ("picked", "unflagged", "rejected"):
         candidates = [c for c in candidates if (c.get("flag") or "unflagged") == flag]
     candidates = _filter_by_metadata(candidates, date_taken, file_type, camera, lens)
+    candidates = _apply_text_search_constraint(candidates, search)
     filtered_total = len(candidates)
     candidates = await _filter_visible_candidates(candidates, "sm")
     visible_count = len(candidates)
+
+    if visible_count < 2:
+        stats = dict(await db.get_stats())
+        stats["filtered_pool"] = visible_count
+        stats["filtered_pool_visible"] = visible_count
+        stats["filtered_pool_total"] = filtered_total
+        return {
+            "images": [],
+            **_visibility_counts(filtered_total, visible_count),
+            "total_kept": filtered_total,
+            "stats": stats,
+            "search_mode": search["search_mode"],
+            "ai_unavailable": search["ai_unavailable"],
+        }
 
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
@@ -1680,6 +1768,8 @@ async def mosaic_next(
         **_visibility_counts(filtered_total, visible_count),
         "total_kept": filtered_total,
         "stats": stats,
+        "search_mode": search["search_mode"],
+        "ai_unavailable": search["ai_unavailable"],
     }
 
 
@@ -1807,24 +1897,13 @@ async def compare_next(
     n: int = 5, mode: str = "swiss",
     orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
     flag: str = "", date_taken: str = "", file_type: str = "", camera: str = "", lens: str = "",
+    q: str = "",
 ):
+    search = await _resolve_text_search(q)
     if mode == "topn":
         images = await db.get_top_images(limit=50)
     else:
         images = await _get_pairing_images()
-
-    if len(images) < 2:
-        visible = await _filter_visible_candidates([dict(img) for img in images], "md")
-        stats = dict(await db.get_stats())
-        stats["filtered_pool"] = len(visible)
-        stats["filtered_pool_visible"] = len(visible)
-        stats["filtered_pool_total"] = len(images)
-        return {
-            "pairs": [],
-            **_visibility_counts(len(images), len(visible)),
-            "total_kept": len(images),
-            "stats": stats,
-        }
 
     image_dicts = [dict(img) for img in images]
 
@@ -1846,6 +1925,7 @@ async def compare_next(
     if flag in ("picked", "unflagged", "rejected"):
         image_dicts = [c for c in image_dicts if (c.get("flag") or "unflagged") == flag]
     image_dicts = _filter_by_metadata(image_dicts, date_taken, file_type, camera, lens)
+    image_dicts = _apply_text_search_constraint(image_dicts, search)
     filtered_total = len(image_dicts)
     image_dicts = await _filter_visible_candidates(image_dicts, "md")
     visible_count = len(image_dicts)
@@ -1860,6 +1940,8 @@ async def compare_next(
             **_visibility_counts(filtered_total, visible_count),
             "total_kept": filtered_total,
             "stats": stats,
+            "search_mode": search["search_mode"],
+            "ai_unavailable": search["ai_unavailable"],
         }
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
@@ -1907,6 +1989,8 @@ async def compare_next(
         **_visibility_counts(filtered_total, visible_count),
         "total_kept": filtered_total,
         "stats": stats,
+        "search_mode": search["search_mode"],
+        "ai_unavailable": search["ai_unavailable"],
     }
 
 
@@ -1979,41 +2063,11 @@ async def api_rankings(
 ):
     limit = _clamp_int(limit, 100, 1, 500)
     offset = _clamp_int(offset, 0, 0, 1_000_000)
-    # When a search query is present, pre-filter to images above similarity threshold
-    search_ids = None
-    search_scores = {}
-    search_mode = ""
-    text_query = ""
-    search_active = bool(q.strip())
-    if search_active:
-        normalized_query = q.strip()
-        try:
-            import embedding_worker
-            import embed_cache
-            text_vec = await asyncio.get_event_loop().run_in_executor(
-                None,
-                embedding_worker.encode_text,
-                normalized_query,
-            )
-            if text_vec is not None:
-                image_ids, matrix = await embed_cache.get_matrix()
-                if image_ids is not None:
-                    config = settings.get_settings()
-                    threshold = config.get("search_similarity_threshold", 0.35)
-                    similarities = matrix @ text_vec
-                    mask = similarities >= threshold
-                    search_ids = set()
-                    for i in range(len(image_ids)):
-                        if mask[i]:
-                            search_ids.add(image_ids[i])
-                            search_scores[image_ids[i]] = float(similarities[i])
-        except Exception:
-            pass
-        if search_ids is None:
-            text_query = normalized_query
-            search_mode = "metadata"
-        else:
-            search_mode = "embedding"
+    search = await _resolve_text_search(q)
+    search_ids = search["id_filter"]
+    search_scores = search["scores"]
+    search_mode = search["search_mode"]
+    text_query = search["text_query"]
 
     db_sort = "elo" if sort == "similarity" and not search_scores else sort
 
@@ -2070,7 +2124,7 @@ async def api_rankings(
             **_visibility_counts(total_images, visible_images),
             "total_kept": total_images,
             "search_mode": search_mode,
-            "ai_unavailable": False,
+            "ai_unavailable": search["ai_unavailable"],
         }
 
     images, visible_images, total_images = await asyncio.gather(
@@ -2131,7 +2185,7 @@ async def api_rankings(
         **_visibility_counts(total_images, visible_images),
         "total_kept": total_images,
         "search_mode": search_mode,
-        "ai_unavailable": bool(search_active and text_query),
+        "ai_unavailable": search["ai_unavailable"],
     }
 
 

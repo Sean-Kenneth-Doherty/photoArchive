@@ -63,6 +63,12 @@
         <span id="compare-stat-pool" class="bar-stat-num">0</span> images
     </div>
     <div class="bar-divider"></div>
+    <div class="bar-section compare-search-active hidden" id="compare-search-active">
+        <span class="compare-search-label">Search</span>
+        <span class="compare-search-query" id="compare-search-query"></span>
+        <button type="button" class="compare-search-clear" onclick="PhotoArchive.clearSearch()" title="Clear search">&times;</button>
+    </div>
+    <div class="bar-divider"></div>
     <div class="bar-section bar-ai" id="bar-ai" onclick="PhotoArchive.toggleAIPanel()" style="cursor:pointer">
         <span class="bar-ai-label">AI</span>
         <span id="ai-embed-count">—</span>/<span id="ai-embed-total">—</span>

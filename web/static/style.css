@@ -1828,6 +1828,48 @@ body.library-shell .library-container::-webkit-scrollbar-thumb:hover {
     color: #aaa;
 }
 
+.compare-search-active {
+    max-width: 220px;
+    min-width: 0;
+    gap: 6px;
+    color: var(--text-primary);
+}
+
+.compare-search-active.hidden + .bar-divider {
+    display: none;
+}
+
+.compare-search-label {
+    color: var(--text-subtle);
+    font-size: 11px;
+}
+
+.compare-search-query {
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--accent);
+    font-size: 12px;
+}
+
+.compare-search-clear {
+    width: 18px;
+    height: 18px;
+    border: 1px solid #3a3a3a;
+    border-radius: 50%;
+    background: var(--bg-input);
+    color: var(--text-subtle);
+    cursor: pointer;
+    line-height: 14px;
+    padding: 0;
+}
+
+.compare-search-clear:hover {
+    color: var(--text-primary);
+    border-color: var(--accent);
+}
+
 .library-search {
     position: relative;
     margin: 0 0 8px;

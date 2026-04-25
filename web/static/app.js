@@ -667,6 +667,7 @@ const PhotoArchive = (() => {
             slider.value = Math.round(120 + t * 280);
         }
         restoreFilters();
+        restoreSearchState();
         setCompareMode('mosaic');
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
@@ -1246,6 +1247,8 @@ const PhotoArchive = (() => {
     let loupeStandaloneImage = null;
     const FILTER_STORAGE_KEY = 'pa_filters';
     const SORT_STORAGE_KEY = 'pa_sort';
+    const SEARCH_STORAGE_KEY = 'pa_search_query';
+    const SEARCH_SORT_STORAGE_KEY = 'pa_search_sort';
     const EMPTY_FILTERS = {
         orientation: '',
         compared: '',
@@ -1475,6 +1478,7 @@ const PhotoArchive = (() => {
         params.set('strategy', strategy);
         params.set('grid_elo', String(gridElo));
         appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) params.set('q', state.searchQuery);
         if (exclude) params.set('exclude', exclude);
         return `/api/mosaic/next?${params.toString()}`;
     }
@@ -1485,6 +1489,7 @@ const PhotoArchive = (() => {
         params.set('n', String(n));
         params.set('mode', mode);
         appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) params.set('q', state.searchQuery);
         return `/api/compare/next?${params.toString()}`;
     }
 
@@ -1620,6 +1625,10 @@ const PhotoArchive = (() => {
         return null;
     }
 
+    function hasActiveTextSearch(value = searchQuery) {
+        return Boolean(value && value !== '__similar__');
+    }
+
     function currentSearchMode() {
         if (searchQuery === '__similar__') return 'similar';
         return searchQuery ? 'search' : 'library';
@@ -1640,9 +1649,46 @@ const PhotoArchive = (() => {
         };
     }
 
+    function applySortState(field, desc, { persist = true, persistSearch = true } = {}) {
+        if (!SORT_KEYS[field]) return;
+        sortField = field;
+        sortDesc = Boolean(desc);
+        rankingsSort = sortValueForState(sortField, sortDesc);
+        syncSortControls();
+        if (persist && sortField !== 'similarity') saveSortState();
+        if (persistSearch && hasActiveTextSearch()) saveSearchSortState();
+    }
+
     function saveSortState() {
         try {
             sessionStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
+        } catch {}
+    }
+
+    function saveSearchState() {
+        try {
+            if (hasActiveTextSearch()) {
+                sessionStorage.setItem(SEARCH_STORAGE_KEY, searchQuery);
+            } else {
+                sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+            }
+        } catch {}
+    }
+
+    function saveSearchSortState() {
+        try {
+            if (hasActiveTextSearch()) {
+                sessionStorage.setItem(SEARCH_SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
+            } else {
+                sessionStorage.removeItem(SEARCH_SORT_STORAGE_KEY);
+            }
+        } catch {}
+    }
+
+    function clearPersistedSearchState() {
+        try {
+            sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+            sessionStorage.removeItem(SEARCH_SORT_STORAGE_KEY);
         } catch {}
     }
 
@@ -1652,11 +1698,58 @@ const PhotoArchive = (() => {
             if (!saved) return;
             const parsed = JSON.parse(saved);
             const field = SORT_KEYS[parsed?.field] && parsed.field !== 'similarity' ? parsed.field : 'elo';
-            sortField = field;
-            sortDesc = parsed?.desc !== false;
-            rankingsSort = sortValueForState(sortField, sortDesc);
-            syncSortControls();
+            applySortState(field, parsed?.desc !== false, { persist: false, persistSearch: false });
         } catch {}
+    }
+
+    function restoreSearchSortState() {
+        try {
+            const saved = sessionStorage.getItem(SEARCH_SORT_STORAGE_KEY);
+            if (!saved) return null;
+            const parsed = JSON.parse(saved);
+            const field = SORT_KEYS[parsed?.field] ? parsed.field : '';
+            if (!field) return null;
+            return { field, desc: parsed?.desc !== false };
+        } catch {
+            return null;
+        }
+        return null;
+    }
+
+    function restoreSearchState() {
+        try {
+            const saved = (sessionStorage.getItem(SEARCH_STORAGE_KEY) || '').trim();
+            searchQuery = saved;
+        } catch {
+            searchQuery = '';
+        }
+        updateSimilaritySortOption();
+        if (hasActiveTextSearch()) {
+            const restoredSort = restoreSearchSortState() || { field: 'similarity', desc: true };
+            applySortState(restoredSort.field, restoredSort.desc, { persist: false });
+        }
+        updateSearchControls();
+    }
+
+    function updateSearchControls() {
+        const input = document.getElementById('search-input');
+        const clearBtn = document.getElementById('search-clear');
+        if (input && searchQuery !== '__similar__') input.value = searchQuery;
+        if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
+        updateSimilaritySortOption();
+        syncSortControls();
+        updateCompareSearchIndicator();
+        updateSortDirIcon();
+    }
+
+    function updateCompareSearchIndicator() {
+        const chip = document.getElementById('compare-search-active');
+        if (!chip) return;
+        const queryEl = document.getElementById('compare-search-query');
+        const active = hasActiveTextSearch();
+        chip.classList.toggle('hidden', !active);
+        if (queryEl) queryEl.textContent = active ? searchQuery : '';
+        updateBottomBarHeightVar();
     }
 
     function syncSortControls() {
@@ -1690,6 +1783,7 @@ const PhotoArchive = (() => {
         resetLibraryResults();
         restoreFilters();
         restoreSortState();
+        restoreSearchState();
         loadUiSettings();
 
         // Fire all init requests in parallel — don't block on rankings
@@ -1789,10 +1883,26 @@ const PhotoArchive = (() => {
             input.addEventListener('input', (e) => {
                 clearTimeout(searchDebounce);
                 searchDebounce = setTimeout(() => {
+                    const wasSearching = hasActiveTextSearch();
                     searchQuery = e.target.value.trim();
-                    const clearBtn = document.getElementById('search-clear');
-                    if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
-                    updateSimilaritySortOption();
+                    if (hasActiveTextSearch()) {
+                        saveSearchState();
+                        updateSimilaritySortOption();
+                        if (!wasSearching) {
+                            applySortState('similarity', true, { persist: false });
+                        } else {
+                            saveSearchSortState();
+                        }
+                    } else {
+                        clearPersistedSearchState();
+                        if (sortField === 'similarity') {
+                            restoreSortState();
+                            if (sortField === 'similarity') {
+                                applySortState('elo', true, { persist: false, persistSearch: false });
+                            }
+                        }
+                    }
+                    updateSearchControls();
                     // Search is a filter — reload rankings with the query
                     resetLibraryResults({ clearBatch: true });
                     loadRankings(true);
@@ -1811,7 +1921,7 @@ const PhotoArchive = (() => {
         const select = document.getElementById('sort-field');
         if (!select) return;
         let opt = select.querySelector('option[value="similarity"]');
-        if (searchQuery) {
+        if (hasActiveTextSearch()) {
             if (!opt) {
                 opt = document.createElement('option');
                 opt.value = 'similarity';
@@ -1820,28 +1930,27 @@ const PhotoArchive = (() => {
             }
         } else {
             if (opt) {
-                // If similarity was selected, switch back to elo
-                if (select.value === 'similarity') {
-                    select.value = 'elo';
-                    setSortField('elo');
-                }
                 opt.remove();
             }
         }
     }
 
     function clearSearch() {
+        const wasSimilaritySort = sortField === 'similarity';
         searchQuery = '';
+        clearPersistedSearchState();
+        if (wasSimilaritySort) {
+            restoreSortState();
+            if (sortField === 'similarity') {
+                applySortState('elo', true, { persist: false, persistSearch: false });
+            }
+        }
         const input = document.getElementById('search-input');
-        const clearBtn = document.getElementById('search-clear');
         if (input) input.value = '';
-        if (clearBtn) clearBtn.classList.add('hidden');
         const sortToggles = document.getElementById('sort-toggles');
         if (sortToggles) sortToggles.style.opacity = '';
-        updateSimilaritySortOption();
-        resetLibraryResults({ clearBatch: true });
-        loadRankings(true);
-        updateDateScrubber();
+        updateSearchControls();
+        reloadForFilters();
     }
 
     async function loadSearchResults() {
@@ -1892,10 +2001,7 @@ const PhotoArchive = (() => {
         rankingsSort = sort;
         const state = sortStateFromValue(sort);
         if (state) {
-            sortField = state.field;
-            sortDesc = state.desc;
-            syncSortControls();
-            if (persist && sortField !== 'similarity') saveSortState();
+            applySortState(state.field, state.desc, { persist });
         }
         resetLibraryResults({ clearBatch: true });
         dateGroupsData = [];
@@ -1905,22 +2011,21 @@ const PhotoArchive = (() => {
 
     function setSortField(field) {
         if (!SORT_KEYS[field]) return;
-        sortField = field;
         const key = SORT_KEYS[field];
-        sortDesc = key?.defaultDesc !== false;
-        rankingsSort = sortValueForState(sortField, sortDesc);
-        syncSortControls();
-        if (field !== 'similarity') saveSortState();
-        setRankingsSort(rankingsSort, { persist: false });
+        applySortState(field, key?.defaultDesc !== false, { persist: field !== 'similarity' });
+        resetLibraryResults({ clearBatch: true });
+        dateGroupsData = [];
+        loadRankings(true);
+        updateDateScrubber();
     }
 
     function toggleSortDir() {
-        if (searchQuery) return;
-        sortDesc = !sortDesc;
-        rankingsSort = sortValueForState(sortField, sortDesc);
-        syncSortControls();
-        if (sortField !== 'similarity') saveSortState();
-        setRankingsSort(rankingsSort, { persist: false });
+        if (sortField === 'similarity') return;
+        applySortState(sortField, !sortDesc);
+        resetLibraryResults({ clearBatch: true });
+        dateGroupsData = [];
+        loadRankings(true);
+        updateDateScrubber();
     }
 
     function updateSortDirIcon() {
@@ -3494,6 +3599,7 @@ const PhotoArchive = (() => {
 
         // Clear grid and show similar images
         searchQuery = '__similar__';
+        clearPersistedSearchState();
         const input = document.getElementById('search-input');
         if (input) input.value = `Similar to: ${img.filename}`;
         const clearBtn = document.getElementById('search-clear');

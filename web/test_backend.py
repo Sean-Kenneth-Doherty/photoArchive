@@ -149,6 +149,18 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await conn.close()
 
+    def _stub_text_search(self, image_ids, scores):
+        matrix = np.array([[score, 0.0] for score in scores], dtype=np.float32)
+
+        async def fake_get_matrix():
+            return image_ids, matrix
+
+        def fake_encode_text(_query):
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+        elo_propagation.embed_cache.get_matrix = fake_get_matrix
+        embedding_worker.encode_text = fake_encode_text
+
     async def test_compare_payload_validation_rejects_invalid_and_inactive_images(self):
         source = await self._source()
         a = await self._image(source["id"], "a.jpg")
@@ -631,6 +643,104 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total_images"], 2)
         self.assertEqual(result["hidden_pending_thumbnails"], 1)
         self.assertNotIn(hidden_match, [img["id"] for img in result["images"]])
+
+    async def test_rankings_search_similarity_defaults_but_other_sorts_keep_pool(self):
+        source = await self._source()
+        best_match = await self._image(source["id"], "landscape-best.jpg", elo=1200)
+        rated_match = await self._image(source["id"], "landscape-rated.jpg", elo=1600)
+        miss = await self._image(source["id"], "portrait-miss.jpg", elo=1800)
+        for image_id in (best_match, rated_match, miss):
+            await self._cache_entry(image_id, "sm")
+
+        self._stub_text_search(
+            [best_match, rated_match, miss],
+            [0.92, 0.70, 0.10],
+        )
+
+        similarity = await app_module.api_rankings(q="landscapes", sort="similarity", limit=10)
+        elo_sorted = await app_module.api_rankings(q="landscapes", sort="elo", limit=10)
+
+        self.assertEqual([img["id"] for img in similarity["images"]], [best_match, rated_match])
+        self.assertEqual([img["id"] for img in elo_sorted["images"]], [rated_match, best_match])
+        self.assertEqual(similarity["total_images"], 2)
+        self.assertEqual(elo_sorted["total_images"], 2)
+        self.assertNotIn(miss, [img["id"] for img in elo_sorted["images"]])
+
+    async def test_mosaic_next_search_filters_candidates_and_counts_visibility(self):
+        source = await self._source()
+        visible_a = await self._image(source["id"], "landscape-a.jpg")
+        hidden_match = await self._image(source["id"], "landscape-hidden.jpg")
+        visible_b = await self._image(source["id"], "landscape-b.jpg")
+        miss = await self._image(source["id"], "portrait-miss.jpg")
+        for image_id in (visible_a, visible_b, miss):
+            await self._cache_entry(image_id, "sm")
+
+        self._stub_text_search(
+            [visible_a, hidden_match, visible_b, miss],
+            [0.95, 0.90, 0.80, 0.10],
+        )
+
+        result = await app_module.mosaic_next(n=5, strategy="random", q="landscapes")
+        ids = {img["id"] for img in result["images"]}
+
+        self.assertEqual(ids, {visible_a, visible_b})
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 3)
+        self.assertEqual(result["hidden_pending_thumbnails"], 1)
+        self.assertEqual(result["stats"]["filtered_pool_visible"], 2)
+        self.assertEqual(result["stats"]["filtered_pool_total"], 3)
+
+    async def test_compare_next_search_only_pairs_matching_candidates(self):
+        source = await self._source()
+        match_a = await self._image(source["id"], "landscape-a.jpg", elo=1500)
+        match_b = await self._image(source["id"], "landscape-b.jpg", elo=1400)
+        miss = await self._image(source["id"], "portrait-miss.jpg", elo=1300)
+        for image_id in (match_a, match_b, miss):
+            await self._cache_entry(image_id, "md")
+
+        self._stub_text_search(
+            [match_a, match_b, miss],
+            [0.95, 0.80, 0.10],
+        )
+
+        result = await app_module.compare_next(n=2, mode="swiss", q="landscapes")
+        pair_ids = {
+            image["id"]
+            for pair in result["pairs"]
+            for image in (pair["left"], pair["right"])
+        }
+
+        self.assertEqual(pair_ids, {match_a, match_b})
+        self.assertNotIn(miss, pair_ids)
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 2)
+
+    async def test_metadata_fallback_constrains_compare_and_mosaic_pools(self):
+        source = await self._source()
+        match_a = await self._image(source["id"], "sunset-a.jpg", elo=1500)
+        match_b = await self._image(source["id"], "sunset-b.jpg", elo=1400)
+        miss = await self._image(source["id"], "portrait-miss.jpg", elo=1300)
+        for image_id in (match_a, match_b, miss):
+            await self._cache_entry(image_id, "sm")
+            await self._cache_entry(image_id, "md")
+
+        embedding_worker.encode_text = lambda _query: None
+
+        mosaic = await app_module.mosaic_next(n=5, strategy="random", q="sunset")
+        compare = await app_module.compare_next(n=2, mode="swiss", q="sunset")
+        mosaic_ids = {img["id"] for img in mosaic["images"]}
+        compare_ids = {
+            image["id"]
+            for pair in compare["pairs"]
+            for image in (pair["left"], pair["right"])
+        }
+
+        self.assertEqual(mosaic_ids, {match_a, match_b})
+        self.assertEqual(compare_ids, {match_a, match_b})
+        self.assertEqual(mosaic["search_mode"], "metadata")
+        self.assertEqual(compare["search_mode"], "metadata")
+        self.assertTrue(mosaic["ai_unavailable"])
+        self.assertTrue(compare["ai_unavailable"])
 
     async def test_search_endpoint_uses_metadata_fallback_when_ai_is_cold(self):
         source = await self._source()

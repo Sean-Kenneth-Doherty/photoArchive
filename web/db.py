@@ -1941,7 +1941,7 @@ async def get_top_images(limit: int = 50):
     try:
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
-            "i.propagated_updates, i.flag, i.date_taken, "
+            "i.propagated_updates, i.flag, i.orientation, i.aspect_ratio, i.date_taken, "
             "i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
             "i.width, i.height, i.file_modified_at, i.latitude, i.longitude FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
