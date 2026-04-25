@@ -1819,8 +1819,6 @@ button:disabled {
     display: none;
 }
 
-}
-
 /* Elo tier borders */
 .rank-card.tier-gold { box-shadow: inset 0 0 0 2px rgba(255, 215, 0, 0.5); }
 .rank-card.tier-silver { box-shadow: inset 0 0 0 2px rgba(192, 192, 192, 0.4); }
