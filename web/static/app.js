@@ -2021,6 +2021,7 @@ const PhotoArchive = (() => {
             probe.img.onerror = null;
             probe.img.src = '';
             loupeTierProbes.delete(probe);
+            probe.settled = true;
             probe.resolve(false);
         }
     }
