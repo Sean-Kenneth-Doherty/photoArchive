@@ -1326,6 +1326,7 @@ const PhotoArchive = (() => {
     let rankingsLoadPromise = null;
     let rankingsExhausted = false;
     let libraryRequestGeneration = 0;
+    let pendingScrollRestoreOffset = 0;
     let thumbHeight = 220;
     let libraryImages = [];
     let lightboxIndex = -1;
@@ -1334,6 +1335,8 @@ const PhotoArchive = (() => {
     const SORT_STORAGE_KEY = 'pa_sort';
     const SEARCH_STORAGE_KEY = 'pa_search_query';
     const SEARCH_SORT_STORAGE_KEY = 'pa_search_sort';
+    const SCROLL_POS_STORAGE_KEY = 'pa_scroll_pos';
+    const SCROLL_OFFSET_STORAGE_KEY = 'pa_scroll_offset';
     const EMPTY_FILTERS = {
         orientation: '',
         compared: '',
@@ -1603,6 +1606,9 @@ const PhotoArchive = (() => {
     }
 
     function currentLibraryPageSize() {
+        if (rankingsOffset === 0 && pendingScrollRestoreOffset > 0) {
+            return Math.max(INITIAL_RANKINGS_PAGE_SIZE, pendingScrollRestoreOffset + RANKINGS_PAGE_SIZE);
+        }
         return rankingsOffset === 0 ? INITIAL_RANKINGS_PAGE_SIZE : RANKINGS_PAGE_SIZE;
     }
 
@@ -1656,6 +1662,34 @@ const PhotoArchive = (() => {
 
     function libraryScrollRoot() {
         return document.querySelector('.library-container');
+    }
+
+    function saveScrollPosition() {
+        const root = libraryScrollRoot();
+        if (root) {
+            sessionStorage.setItem(SCROLL_POS_STORAGE_KEY, root.scrollTop);
+            sessionStorage.setItem(SCROLL_OFFSET_STORAGE_KEY, rankingsOffset);
+        }
+    }
+
+    function restoreScrollPosition() {
+        const saved = sessionStorage.getItem(SCROLL_POS_STORAGE_KEY);
+        const savedOffset = sessionStorage.getItem(SCROLL_OFFSET_STORAGE_KEY);
+        if (saved !== null && savedOffset !== null) {
+            const offset = Number(savedOffset);
+            if (Number.isFinite(offset)) rankingsOffset = Math.max(rankingsOffset, offset);
+            const root = libraryScrollRoot();
+            if (root) {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        root.scrollTop = Number(saved);
+                    });
+                });
+            }
+            pendingScrollRestoreOffset = 0;
+            sessionStorage.removeItem(SCROLL_POS_STORAGE_KEY);
+            sessionStorage.removeItem(SCROLL_OFFSET_STORAGE_KEY);
+        }
     }
 
     function updateBackToTopButton() {
@@ -1954,6 +1988,7 @@ const PhotoArchive = (() => {
         restoreFilters();
         restoreSortState();
         restoreSearchState();
+        pendingScrollRestoreOffset = Number(sessionStorage.getItem(SCROLL_OFFSET_STORAGE_KEY) || 0);
         loadUiSettings();
 
         // Fire all init requests in parallel — don't block on rankings
@@ -1970,6 +2005,7 @@ const PhotoArchive = (() => {
         setInterval(pollAIStatus, 5000);
 
         await rankingsPromise;
+        restoreScrollPosition();
         await statsPromise;
 
         // Infinite scroll via IntersectionObserver (avoids continuous scroll events)
@@ -2045,6 +2081,7 @@ const PhotoArchive = (() => {
                 else if (selectedLibraryIndex >= 0) deselectLibraryCard(cards);
             } else if (e.key === 'Tab') {
                 e.preventDefault();
+                saveScrollPosition();
                 window.location.href = '/compare';
             }
         });
@@ -2091,6 +2128,14 @@ const PhotoArchive = (() => {
                 if (e.key === 'Escape') clearSearch();
             });
         }
+
+        document.querySelectorAll('.bottom-bar a[href]').forEach((link) => {
+            link.addEventListener('click', () => {
+                const href = link.getAttribute('href') || '';
+                if (href && href !== window.location.pathname) saveScrollPosition();
+            });
+        });
+        window.addEventListener('beforeunload', saveScrollPosition);
     }
 
     function initRankings() { initLibrary(); }
