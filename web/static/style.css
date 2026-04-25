@@ -2570,6 +2570,11 @@ body.library-shell.date-scrubber-active .rankings-grid {
     font-family: monospace;
 }
 
+.loupe-tier-loading {
+    opacity: 0.6;
+    animation: cache-pulse 1.5s infinite;
+}
+
 /* Filmstrip */
 .filmstrip {
     height: 80px;

@@ -2732,6 +2732,7 @@ const PhotoArchive = (() => {
     let loupeFullLoadToken = 0;
     let loupeHideTimer = null;
     let loupeCurrentMediaStatus = null;
+    let loupeLoadingTierRank = -1;
     const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
@@ -2747,6 +2748,7 @@ const PhotoArchive = (() => {
             probe.done = true;
             probe.resolveOnce(false);
         }
+        clearLoupeTierLoading();
     }
 
     function showLoupeImage(img, direction = 0) {
@@ -2770,6 +2772,7 @@ const PhotoArchive = (() => {
             loupeFullLoadTimer = null;
         }
         loupeDisplayedTierRank = -1;
+        loupeLoadingTierRank = -1;
         loupeCurrentMediaStatus = null;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
@@ -2804,7 +2807,10 @@ const PhotoArchive = (() => {
 
         if (filenameEl) filenameEl.textContent = img.filename;
         renderLoupeMetadata(img, exifEl);
-        if (tierEl) tierEl.textContent = '';
+        if (tierEl) {
+            tierEl.classList.remove('loupe-tier-loading');
+            tierEl.textContent = '';
+        }
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
@@ -2925,6 +2931,8 @@ const PhotoArchive = (() => {
     function renderLoupeStatusLine(flag = loupeCurrentImage?.flag || 'unflagged') {
         const tierEl = document.getElementById('loupe-overlay-tier');
         if (!tierEl) return;
+        if (loupeLoadingTierRank > loupeDisplayedTierRank) return;
+        tierEl.classList.remove('loupe-tier-loading');
         const tier = LOUPE_TIER_LABELS[loupeDisplayedTierRank] || 'Image';
         const label = flag === 'picked' ? 'Picked' : flag === 'rejected' ? 'Rejected' : 'Unflagged';
         if (uiSettings.show_loupe_cache_status) {
@@ -2932,6 +2940,21 @@ const PhotoArchive = (() => {
         } else {
             tierEl.textContent = `${tier} · ${label}`;
         }
+    }
+
+    function setLoupeTierLoading(rank) {
+        const tierEl = document.getElementById('loupe-overlay-tier');
+        if (!tierEl || rank <= loupeDisplayedTierRank) return;
+        loupeLoadingTierRank = rank;
+        tierEl.classList.add('loupe-tier-loading');
+        tierEl.textContent = rank >= LOUPE_TIER_RANKS.full ? 'Loading Original...' : 'Loading HD...';
+    }
+
+    function clearLoupeTierLoading(rank = loupeLoadingTierRank) {
+        if (rank !== loupeLoadingTierRank) return;
+        loupeLoadingTierRank = -1;
+        const tierEl = document.getElementById('loupe-overlay-tier');
+        if (tierEl) tierEl.classList.remove('loupe-tier-loading');
     }
 
     function applyLoupeMediaStatus(status, img = loupeCurrentImage, token = loupeImageToken) {
@@ -3029,6 +3052,9 @@ const PhotoArchive = (() => {
 
             probeImg.decoding = 'async';
             if ('fetchPriority' in probeImg) probeImg.fetchPriority = rank >= 2 ? 'high' : 'auto';
+            if (rank > LOUPE_TIER_RANKS.sm && rank > loupeDisplayedTierRank && isCurrentLoupeImage(img, token)) {
+                setLoupeTierLoading(rank);
+            }
             probeImg.onload = () => {
                 if (probe.cancelled) {
                     finish(false);
@@ -3050,6 +3076,7 @@ const PhotoArchive = (() => {
                         if (rank === LOUPE_TIER_RANKS.full) loupeFullLoadToken = token;
                         loupeImg.src = probeImg.src;
                         loupeImg.style.opacity = '1';
+                        clearLoupeTierLoading(rank);
                         renderLoupeStatusLine(img.flag || 'unflagged');
                     }
                 }
@@ -3057,11 +3084,13 @@ const PhotoArchive = (() => {
                 finish(true);
             };
             probeImg.onerror = () => {
+                if (isCurrentLoupeImage(img, token)) clearLoupeTierLoading(rank);
                 finish(false);
             };
             if (timeoutMs > 0) {
                 probe.timer = setTimeout(() => {
                     probe.timer = null;
+                    if (isCurrentLoupeImage(img, token)) clearLoupeTierLoading(rank);
                     probe.resolveOnce(false);
                 }, timeoutMs);
             }
