@@ -1071,10 +1071,10 @@ async def get_active_images_for_pairing():
     try:
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
-            "i.propagated_updates, i.flag, i.orientation, "
+            "i.propagated_updates, i.status, i.flag, i.orientation, "
             "i.aspect_ratio, i.date_taken, i.camera_make, i.camera_model, i.lens, "
             "i.file_ext, i.file_size, i.width, i.height, i.file_modified_at, "
-            "i.latitude, i.longitude FROM images i "
+            "i.latitude, i.longitude, i.created_at FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
             "ORDER BY i.elo DESC"
@@ -1941,9 +1941,9 @@ async def get_top_images(limit: int = 50):
     try:
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
-            "i.propagated_updates, i.flag, i.orientation, i.aspect_ratio, i.date_taken, "
+            "i.propagated_updates, i.status, i.flag, i.orientation, i.aspect_ratio, i.date_taken, "
             "i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
-            "i.width, i.height, i.file_modified_at, i.latitude, i.longitude FROM images i "
+            "i.width, i.height, i.file_modified_at, i.latitude, i.longitude, i.created_at FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
             "ORDER BY i.elo DESC LIMIT ?",

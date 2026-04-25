@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 import ai_models
 import db
 import elo_propagation
+import helpers as app_helpers
 import pairing
 import photo_metadata
 import resource_governor
@@ -88,14 +89,11 @@ async def _json_object(request: Request):
 
 
 def _ranking_signal_count(image: dict) -> int:
-    return int(image.get("comparisons") or 0) + int(image.get("propagated_updates") or 0)
+    return app_helpers.ranking_signal_count(image)
 
 
 def _has_ranking_signal(image: dict) -> bool:
-    return (
-        _ranking_signal_count(image) > 0
-        or abs(float(image.get("elo") or 1200.0) - 1200.0) > 0.0001
-    )
+    return app_helpers.has_ranking_signal(image)
 
 
 def _git_commit() -> str | None:
@@ -1271,38 +1269,15 @@ def _top_indices_desc(values, limit: int, exclude_index: int | None = None):
 
 
 def _camera_label(image: dict) -> str:
-    return " ".join(
-        str(part).strip()
-        for part in (image.get("camera_make"), image.get("camera_model"))
-        if part
-    ).strip()
+    return app_helpers.camera_label(image)
 
 
 def _metadata_payload(image: dict) -> dict:
-    return {
-        "date_taken": image.get("date_taken"),
-        "camera_make": image.get("camera_make"),
-        "camera_model": image.get("camera_model"),
-        "lens": image.get("lens"),
-        "file_ext": image.get("file_ext"),
-        "file_size": image.get("file_size"),
-        "file_modified_at": image.get("file_modified_at"),
-        "width": image.get("width"),
-        "height": image.get("height"),
-        "latitude": image.get("latitude"),
-        "longitude": image.get("longitude"),
-        "created_at": image.get("created_at"),
-    }
+    return app_helpers.metadata_payload(image)
 
 
 def _visibility_counts(total_images: int, visible_images: int) -> dict:
-    total = max(0, int(total_images or 0))
-    visible = max(0, int(visible_images or 0))
-    return {
-        "visible_images": visible,
-        "total_images": total,
-        "hidden_pending_thumbnails": max(total - visible, 0),
-    }
+    return app_helpers.visibility_counts(total_images, visible_images)
 
 
 def _cache_root() -> str:
@@ -1310,76 +1285,23 @@ def _cache_root() -> str:
 
 
 def _chunks(values: list[int], size: int = 900):
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
+    yield from app_helpers._chunks(values, size)
 
 
 async def _cached_image_ids(image_ids, size: str) -> set[int]:
-    ids = [int(image_id) for image_id in image_ids if image_id is not None]
-    return await db.get_cached_image_ids(ids, size, _cache_root())
+    return await app_helpers.cached_image_ids(image_ids, size, _cache_root())
 
 
 async def _filter_visible_candidates(candidates: list[dict], size: str) -> list[dict]:
-    if not candidates:
-        return []
-    cached_ids = await _cached_image_ids([c.get("id") for c in candidates], size)
-    return [c for c in candidates if int(c.get("id") or 0) in cached_ids]
+    return await app_helpers.filter_visible_candidates(candidates, size, _cache_root())
 
 
 async def _visible_ranked_images(ranked_ids: list[int], limit: int, size: str = "sm") -> list[dict]:
-    """Fetch active images in ranked order, skipping IDs without the displayed tier."""
-    if limit <= 0 or not ranked_ids:
-        return []
-    results: list[dict] = []
-    seen: set[int] = set()
-    unique_ids = []
-    for image_id in ranked_ids:
-        try:
-            normalized = int(image_id)
-        except (TypeError, ValueError):
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        unique_ids.append(normalized)
-
-    for chunk in _chunks(unique_ids):
-        cached_ids = await _cached_image_ids(chunk, size)
-        if not cached_ids:
-            continue
-        active_rows = await db.get_active_images_by_ids([image_id for image_id in chunk if image_id in cached_ids])
-        for image_id in chunk:
-            row = active_rows.get(image_id)
-            if row is None:
-                continue
-            results.append(row)
-            if len(results) >= limit:
-                return results
-    return results
+    return await app_helpers.visible_ranked_images(ranked_ids, limit, size, _cache_root())
 
 
 async def _count_visible_ranked_ids(ranked_ids: list[int], size: str = "sm") -> int:
-    if not ranked_ids:
-        return 0
-    visible = 0
-    seen: set[int] = set()
-    unique_ids = []
-    for image_id in ranked_ids:
-        try:
-            normalized = int(image_id)
-        except (TypeError, ValueError):
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        unique_ids.append(normalized)
-    for chunk in _chunks(unique_ids):
-        cached_ids = await _cached_image_ids(chunk, size)
-        if not cached_ids:
-            continue
-        active_rows = await db.get_active_images_by_ids([image_id for image_id in chunk if image_id in cached_ids])
-        visible += len(active_rows)
-    return visible
+    return await app_helpers.count_visible_ranked_ids(ranked_ids, size, _cache_root())
 
 
 def _filter_by_metadata(
@@ -1389,26 +1311,7 @@ def _filter_by_metadata(
     camera: str = "",
     lens: str = "",
 ) -> list[dict]:
-    if date_taken:
-        if date_taken == "undated":
-            images = [img for img in images if not img.get("date_taken")]
-        elif date_taken.isdigit() and len(date_taken) == 4:
-            prefix = f"{date_taken}-"
-            images = [img for img in images if str(img.get("date_taken") or "").startswith(prefix)]
-
-    if file_type:
-        normalized_type = file_type.lower()
-        if not normalized_type.startswith("."):
-            normalized_type = f".{normalized_type}"
-        images = [img for img in images if (img.get("file_ext") or "").lower() == normalized_type]
-
-    if camera:
-        images = [img for img in images if _camera_label(img) == camera]
-
-    if lens:
-        images = [img for img in images if (img.get("lens") or "") == lens]
-
-    return images
+    return app_helpers.filter_by_metadata(images, date_taken, file_type, camera, lens)
 
 
 async def _resolve_text_search(q: str) -> dict:
@@ -1668,26 +1571,19 @@ async def mosaic_next(
         images = await _get_pairing_images()
 
     import random
-    candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
-
-    # Apply filters
-    if orientation in ("landscape", "portrait"):
-        candidates = [c for c in candidates if c.get("orientation") == orientation]
-    if compared == "compared":
-        candidates = [c for c in candidates if _has_ranking_signal(c)]
-    elif compared == "uncompared":
-        candidates = [c for c in candidates if not _has_ranking_signal(c)]
-    elif compared == "confident":
-        candidates = [c for c in candidates if c["comparisons"] >= 10]
-    if min_stars > 0:
-        from db import STAR_THRESHOLDS
-        threshold = STAR_THRESHOLDS.get(min_stars, 0)
-        candidates = [c for c in candidates if c["elo"] >= threshold]
-    if folder:
-        candidates = [c for c in candidates if f"/{folder}/" in c.get("filepath", "")]
-    if flag in ("picked", "unflagged", "rejected"):
-        candidates = [c for c in candidates if (c.get("flag") or "unflagged") == flag]
-    candidates = _filter_by_metadata(candidates, date_taken, file_type, camera, lens)
+    candidates = app_helpers.filter_compare_mosaic_candidates(
+        images,
+        exclude_ids=exclude_ids,
+        orientation=orientation,
+        compared=compared,
+        min_stars=min_stars,
+        folder=folder,
+        flag=flag,
+        date_taken=date_taken,
+        file_type=file_type,
+        camera=camera,
+        lens=lens,
+    )
     candidates = _apply_text_search_constraint(candidates, search)
     filtered_total = len(candidates)
     candidates = await _filter_visible_candidates(candidates, "sm")
@@ -1738,18 +1634,10 @@ async def mosaic_next(
             sample.append(candidates[chosen])
             indices.remove(chosen)
 
-    result = []
-    for img in sample:
-        result.append({
-            "id": img["id"],
-            "filename": img["filename"],
-            "elo": round(img["effective_elo"], 1),
-            "comparisons": img["comparisons"],
-            "propagated_updates": img.get("propagated_updates") or 0,
-            "flag": img.get("flag") or "unflagged",
-            "aspect_ratio": img.get("aspect_ratio") or 1.5,
-            "thumb_url": f"/api/thumb/sm/{img['id']}",
-        })
+    result = [
+        app_helpers.image_card(img, "sm", elo_value=img["effective_elo"])
+        for img in sample
+    ]
 
     if sample:
         config = settings.get_settings()
@@ -1905,26 +1793,18 @@ async def compare_next(
     else:
         images = await _get_pairing_images()
 
-    image_dicts = [dict(img) for img in images]
-
-    # Apply filters
-    if orientation in ("landscape", "portrait"):
-        image_dicts = [c for c in image_dicts if c.get("orientation") == orientation]
-    if compared == "compared":
-        image_dicts = [c for c in image_dicts if _has_ranking_signal(c)]
-    elif compared == "uncompared":
-        image_dicts = [c for c in image_dicts if not _has_ranking_signal(c)]
-    elif compared == "confident":
-        image_dicts = [c for c in image_dicts if c["comparisons"] >= 10]
-    if min_stars > 0:
-        from db import STAR_THRESHOLDS
-        threshold = STAR_THRESHOLDS.get(min_stars, 0)
-        image_dicts = [c for c in image_dicts if c["elo"] >= threshold]
-    if folder:
-        image_dicts = [c for c in image_dicts if f"/{folder}/" in c.get("filepath", "")]
-    if flag in ("picked", "unflagged", "rejected"):
-        image_dicts = [c for c in image_dicts if (c.get("flag") or "unflagged") == flag]
-    image_dicts = _filter_by_metadata(image_dicts, date_taken, file_type, camera, lens)
+    image_dicts = app_helpers.filter_compare_mosaic_candidates(
+        images,
+        orientation=orientation,
+        compared=compared,
+        min_stars=min_stars,
+        folder=folder,
+        flag=flag,
+        date_taken=date_taken,
+        file_type=file_type,
+        camera=camera,
+        lens=lens,
+    )
     image_dicts = _apply_text_search_constraint(image_dicts, search)
     filtered_total = len(image_dicts)
     image_dicts = await _filter_visible_candidates(image_dicts, "md")
@@ -1952,24 +1832,8 @@ async def compare_next(
         prefetch_rows.append(left)
         prefetch_rows.append(right)
         result.append({
-            "left": {
-                "id": left["id"],
-                "filename": left["filename"],
-                "elo": round(left["elo"], 1),
-                "comparisons": left["comparisons"],
-                "propagated_updates": left.get("propagated_updates") or 0,
-                "flag": left.get("flag") or "unflagged",
-                "thumb_url": f"/api/thumb/md/{left['id']}",
-            },
-            "right": {
-                "id": right["id"],
-                "filename": right["filename"],
-                "elo": round(right["elo"], 1),
-                "comparisons": right["comparisons"],
-                "propagated_updates": right.get("propagated_updates") or 0,
-                "flag": right.get("flag") or "unflagged",
-                "thumb_url": f"/api/thumb/md/{right['id']}",
-            },
+            "left": app_helpers.image_card(left, "md"),
+            "right": app_helpers.image_card(right, "md"),
         })
 
     if prefetch_rows:
@@ -2102,16 +1966,9 @@ async def api_rankings(
         all_results = []
         for img in images:
             d = dict(img)
-            all_results.append({
-                "id": d["id"], "filename": d["filename"],
-                "elo": round(d["elo"], 1), "comparisons": d["comparisons"],
-                "propagated_updates": d.get("propagated_updates") or 0,
-                "status": d["status"], "flag": d.get("flag") or "unflagged",
-                "aspect_ratio": d.get("aspect_ratio") or 1.5,
-                **_metadata_payload(d),
-                "thumb_url": f"/api/thumb/sm/{d['id']}",
-                "similarity": round(search_scores.get(d["id"], 0), 4),
-            })
+            all_results.append(
+                app_helpers.image_card(d, "sm", similarity=search_scores.get(d["id"], 0))
+            )
         all_results.sort(key=lambda x: x["similarity"], reverse=(sort == "similarity"))
         page = all_results[offset:offset + limit]
         if page:
@@ -2162,23 +2019,12 @@ async def api_rankings(
     result = []
     for img in images:
         d = dict(img)
-        entry = {
-            "id": d["id"],
-            "filename": d["filename"],
-            "elo": round(d["elo"], 1),
-            "comparisons": d["comparisons"],
-            "propagated_updates": d.get("propagated_updates") or 0,
-            "status": d["status"],
-            "flag": d.get("flag") or "unflagged",
-            "aspect_ratio": d.get("aspect_ratio") or 1.5,
-            **_metadata_payload(d),
-            "thumb_url": f"/api/thumb/sm/{d['id']}",
-        }
+        kwargs = {}
         if search_scores:
-            entry["similarity"] = round(search_scores.get(d["id"], 0), 4)
+            kwargs["similarity"] = search_scores.get(d["id"], 0)
         if sort in ("date_taken", "date_taken_asc"):
-            dt = d.get("date_taken") or ""
-            entry["date_group"] = dt[:7] if len(dt) >= 7 else ""
+            kwargs["date_group"] = app_helpers.date_group_for_image(d)
+        entry = app_helpers.image_card(d, "sm", **kwargs)
         result.append(entry)
     return {
         "images": result,
@@ -2297,18 +2143,7 @@ async def api_search(q: str = "", limit: int = 50):
         result = []
         for img in rows:
             d = dict(img)
-            result.append({
-                "id": d["id"],
-                "filename": d["filename"],
-                "elo": round(d["elo"], 1),
-                "comparisons": d["comparisons"],
-                "propagated_updates": d.get("propagated_updates") or 0,
-                "flag": d.get("flag") or "unflagged",
-                "similarity": None,
-                "aspect_ratio": d.get("aspect_ratio") or 1.5,
-                **_metadata_payload(d),
-                "thumb_url": f"/api/thumb/sm/{d['id']}",
-            })
+            result.append(app_helpers.image_card(d, "sm", similarity=None))
         if rows:
             await thumbnails.prefetch_images(
                 [dict(img) for img in rows],
@@ -2349,18 +2184,7 @@ async def api_search(q: str = "", limit: int = 50):
     for img in visible_rows:
         img_id = int(img["id"])
         score = score_by_id.get(img_id, 0.0)
-        result.append({
-            "id": img_id,
-            "filename": img["filename"],
-            "elo": round(img["elo"], 1),
-            "comparisons": img["comparisons"],
-            "propagated_updates": img.get("propagated_updates") or 0,
-            "flag": img.get("flag") or "unflagged",
-            "similarity": round(score, 4),
-            "aspect_ratio": img.get("aspect_ratio") or 1.5,
-            **_metadata_payload(img),
-            "thumb_url": f"/api/thumb/sm/{img_id}",
-        })
+        result.append(app_helpers.image_card(img, "sm", similarity=score))
 
     return {
         "images": result,
@@ -2402,18 +2226,7 @@ async def api_similar(image_id: int, limit: int = 50):
     results = []
     for img in visible_rows:
         img_id = int(img["id"])
-        results.append({
-            "id": img_id,
-            "filename": img["filename"],
-            "elo": round(img["elo"], 1),
-            "comparisons": img["comparisons"],
-            "propagated_updates": img.get("propagated_updates") or 0,
-            "flag": img.get("flag") or "unflagged",
-            "similarity": round(score_by_id.get(img_id, 0.0), 4),
-            "aspect_ratio": img.get("aspect_ratio") or 1.5,
-            **_metadata_payload(img),
-            "thumb_url": f"/api/thumb/sm/{img_id}",
-        })
+        results.append(app_helpers.image_card(img, "sm", similarity=score_by_id.get(img_id, 0.0)))
 
     return {
         "images": results,
