@@ -1,5 +1,6 @@
 import aiosqlite
 import os
+import sqlite3
 import time as _time
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoarchive.db")
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS images (
     longitude REAL DEFAULT NULL,
     metadata_scanned_at REAL DEFAULT NULL,
     metadata_version INTEGER DEFAULT NULL,
+    missing_at REAL DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -66,6 +68,20 @@ CREATE INDEX IF NOT EXISTS idx_images_elo ON images(elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_comparisons ON images(comparisons);
 CREATE INDEX IF NOT EXISTS idx_comparisons_pair ON comparisons(winner_id, loser_id);
 CREATE INDEX IF NOT EXISTS idx_comparisons_action_id ON comparisons(action_id);
+
+CREATE TABLE IF NOT EXISTS propagation_updates (
+    id INTEGER PRIMARY KEY,
+    action_id TEXT NOT NULL,
+    image_id INTEGER NOT NULL REFERENCES images(id),
+    elo_before REAL NOT NULL,
+    propagated_updates_before INTEGER NOT NULL,
+    elo_after REAL NOT NULL,
+    delta REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_propagation_updates_action_id
+ON propagation_updates(action_id);
 
 -- Composite indexes for fast sorted queries with status filter
 CREATE INDEX IF NOT EXISTS idx_images_status_elo ON images(status, elo DESC);
@@ -98,6 +114,36 @@ CREATE INDEX IF NOT EXISTS idx_images_active_camera
 ON images(camera_make, camera_model) WHERE status IN ('kept', 'maybe');
 CREATE INDEX IF NOT EXISTS idx_images_active_lens
 ON images(lens) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_date_taken_sort_desc
+ON images((date_taken IS NULL), date_taken DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_date_taken_sort_asc
+ON images((date_taken IS NULL), date_taken ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_file_size_sort_desc
+ON images((file_size IS NULL), file_size DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_file_size_sort_asc
+ON images((file_size IS NULL), file_size ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_modified_sort_desc
+ON images((file_modified_at IS NULL), file_modified_at DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_modified_sort_asc
+ON images((file_modified_at IS NULL), file_modified_at ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_resolution_sort_desc
+ON images(((width * height) IS NULL), (width * height) DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_resolution_sort_asc
+ON images(((width * height) IS NULL), (width * height) ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_camera_sort_asc
+ON images((camera_make IS NULL), camera_make ASC, camera_model ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_camera_sort_desc
+ON images((camera_make IS NULL), camera_make DESC, camera_model DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
 
 -- Source-aware indexes for the active working set. Source state now determines
 -- whether an image is active; status is retained only for old DB compatibility.
@@ -127,6 +173,10 @@ CREATE INDEX IF NOT EXISTS idx_images_source_camera
 ON images(source_id, camera_make, camera_model);
 CREATE INDEX IF NOT EXISTS idx_images_source_lens
 ON images(source_id, lens);
+CREATE INDEX IF NOT EXISTS idx_images_source_missing
+ON images(source_id, missing_at);
+CREATE INDEX IF NOT EXISTS idx_images_source_missing_filepath
+ON images(source_id, missing_at, filepath ASC);
 CREATE TABLE IF NOT EXISTS embeddings (
     image_id INTEGER PRIMARY KEY REFERENCES images(id),
     embedding BLOB NOT NULL,
@@ -165,6 +215,9 @@ CREATE TABLE IF NOT EXISTS cache_metadata (
 
 _stats_cache = {"data": None, "expires": 0}
 _filter_options_cache = {"data": None, "expires": 0}
+_cached_image_ids_cache: dict[tuple[str, str], dict] = {}
+_rankable_image_ids_cache = {"ids": frozenset(), "expires": 0}
+CACHED_IMAGE_IDS_TTL_SECONDS = 5.0
 
 
 def normalize_source_path(path: str) -> str:
@@ -185,6 +238,13 @@ def active_source_condition(source_alias: str = "s") -> str:
     return f"{source_alias}.included = 1 AND {source_alias}.online = 1"
 
 
+def active_image_condition(image_alias: str = "i", source_alias: str = "s") -> str:
+    return (
+        f"{source_alias}.included = 1 AND {source_alias}.online = 1 "
+        f"AND {image_alias}.missing_at IS NULL"
+    )
+
+
 def _chunked(values: list[int], chunk_size: int = 500):
     for start in range(0, len(values), chunk_size):
         yield values[start:start + chunk_size]
@@ -193,11 +253,30 @@ def _chunked(values: list[int], chunk_size: int = 500):
 def _invalidate_stats_cache():
     _stats_cache["data"] = None
     _stats_cache["expires"] = 0
+    _invalidate_rankable_image_ids_cache()
 
 
 def _invalidate_filter_options_cache():
     _filter_options_cache["data"] = None
     _filter_options_cache["expires"] = 0
+
+
+def invalidate_cached_image_ids_cache(cache_root: str | None = None, size: str | None = None):
+    if cache_root is None and size is None:
+        _cached_image_ids_cache.clear()
+        return
+    for key in list(_cached_image_ids_cache.keys()):
+        key_root, key_size = key
+        if cache_root is not None and key_root != cache_root:
+            continue
+        if size is not None and key_size != size:
+            continue
+        _cached_image_ids_cache.pop(key, None)
+
+
+def _invalidate_rankable_image_ids_cache():
+    _rankable_image_ids_cache["ids"] = frozenset()
+    _rankable_image_ids_cache["expires"] = 0
 
 
 def invalidate_stats_cache():
@@ -246,7 +325,10 @@ async def _update_source_counts(conn, source_id: int | None = None):
     )
     await conn.execute(
         "UPDATE catalog_sources SET active_image_count = CASE "
-        "WHEN included = 1 AND online = 1 THEN image_count ELSE 0 END"
+        "WHEN included = 1 AND online = 1 THEN ("
+        "  SELECT COUNT(*) FROM images "
+        "  WHERE images.source_id = catalog_sources.id AND images.missing_at IS NULL"
+        ") ELSE 0 END"
         f"{where}",
         params,
     )
@@ -338,11 +420,23 @@ async def init_db():
                     ("latitude", "REAL DEFAULT NULL"),
                     ("longitude", "REAL DEFAULT NULL"),
                     ("metadata_version", "INTEGER DEFAULT NULL"),
+                    ("missing_at", "REAL DEFAULT NULL"),
                 ]:
                     try:
                         await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
                     except Exception:
                         pass
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'comparisons'"
+            )
+            if await cursor.fetchone():
+                try:
+                    await db.execute(
+                        "ALTER TABLE comparisons "
+                        "ADD COLUMN action_id TEXT DEFAULT NULL"
+                    )
+                except Exception:
+                    pass
         await db.executescript(SCHEMA)
         # Migrations: add columns if missing
         for col, defn in [
@@ -366,6 +460,7 @@ async def init_db():
             ("latitude", "REAL DEFAULT NULL"),
             ("longitude", "REAL DEFAULT NULL"),
             ("metadata_version", "INTEGER DEFAULT NULL"),
+            ("missing_at", "REAL DEFAULT NULL"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
@@ -422,6 +517,8 @@ async def init_db():
             ("idx_images_source_file_ext", "ON images(source_id, file_ext)"),
             ("idx_images_source_camera", "ON images(source_id, camera_make, camera_model)"),
             ("idx_images_source_lens", "ON images(source_id, lens)"),
+            ("idx_images_source_missing", "ON images(source_id, missing_at)"),
+            ("idx_images_source_missing_filepath", "ON images(source_id, missing_at, filepath ASC)"),
         ]:
             await db.execute(f"CREATE INDEX IF NOT EXISTS {name} {sql}")
         await db.execute(
@@ -444,6 +541,59 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_images_active_lens "
             "ON images(lens) WHERE status IN ('kept', 'maybe')"
         )
+        for name, sql in [
+            (
+                "idx_images_active_date_taken_sort_desc",
+                "ON images((date_taken IS NULL), date_taken DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_date_taken_sort_asc",
+                "ON images((date_taken IS NULL), date_taken ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_file_size_sort_desc",
+                "ON images((file_size IS NULL), file_size DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_file_size_sort_asc",
+                "ON images((file_size IS NULL), file_size ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_modified_sort_desc",
+                "ON images((file_modified_at IS NULL), file_modified_at DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_modified_sort_asc",
+                "ON images((file_modified_at IS NULL), file_modified_at ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_resolution_sort_desc",
+                "ON images(((width * height) IS NULL), (width * height) DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_resolution_sort_asc",
+                "ON images(((width * height) IS NULL), (width * height) ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_camera_sort_asc",
+                "ON images((camera_make IS NULL), camera_make ASC, camera_model ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_camera_sort_desc",
+                "ON images((camera_make IS NULL), camera_make DESC, camera_model DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+        ]:
+            await db.execute(f"CREATE INDEX IF NOT EXISTS {name} {sql}")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_images_gps "
             "ON images(latitude, longitude) WHERE latitude IS NOT NULL"
@@ -486,6 +636,7 @@ async def get_unclassified_images(limit: int = 200):
             "SELECT i.id, i.filepath FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE i.orientation IS NULL AND s.included = 1 AND s.online = 1 "
+            "AND i.missing_at IS NULL "
             "LIMIT ?",
             (limit,),
         )
@@ -518,6 +669,7 @@ async def get_images_needing_metadata(limit: int = 100, metadata_version: int = 
             "i.metadata_scanned_at IS NULL "
             "OR i.metadata_version IS NULL "
             "OR i.metadata_version < ?) "
+            "AND i.missing_at IS NULL "
             "LIMIT ?",
             (metadata_version, limit),
         )
@@ -587,12 +739,19 @@ async def insert_images_batch(rows: list[tuple], source_id: int | None = None):
                 "VALUES (?, ?, ?, 'kept', ?, ?, ?)",
                 [(source_id, *row) for row in normalized_rows],
             )
-            await db.execute(
-                "UPDATE images SET source_id = ? "
-                "WHERE source_id IS NULL AND filepath IN ("
-                + ",".join("?" for _ in normalized_rows)
-                + ")",
-                [source_id] + [row[1] for row in normalized_rows],
+            await db.executemany(
+                "UPDATE images SET "
+                "source_id = CASE WHEN source_id IS NULL THEN ? ELSE source_id END, "
+                "filename = ?, "
+                "file_ext = COALESCE(?, file_ext), "
+                "file_size = COALESCE(?, file_size), "
+                "file_modified_at = COALESCE(?, file_modified_at), "
+                "missing_at = NULL "
+                "WHERE filepath = ? AND (source_id = ? OR source_id IS NULL)",
+                [
+                    (source_id, row[0], row[2], row[3], row[4], row[1], source_id)
+                    for row in normalized_rows
+                ],
             )
             await _update_source_counts(db, source_id)
         else:
@@ -607,6 +766,31 @@ async def insert_images_batch(rows: list[tuple], source_id: int | None = None):
         _invalidate_filter_options_cache()
     finally:
         await db.close()
+
+
+async def _mark_source_missing_files(conn, source_id: int, seen_filepaths: list[str], missing_at: float):
+    await conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS source_scan_seen (filepath TEXT PRIMARY KEY)"
+    )
+    await conn.execute("DELETE FROM source_scan_seen")
+    unique_seen = list(dict.fromkeys(seen_filepaths))
+    if unique_seen:
+        await conn.executemany(
+            "INSERT OR IGNORE INTO source_scan_seen(filepath) VALUES (?)",
+            [(filepath,) for filepath in unique_seen],
+        )
+    await conn.execute(
+        "UPDATE images SET missing_at = NULL "
+        "WHERE source_id = ? AND filepath IN (SELECT filepath FROM source_scan_seen)",
+        (source_id,),
+    )
+    await conn.execute(
+        "UPDATE images SET missing_at = ? "
+        "WHERE source_id = ? AND missing_at IS NULL "
+        "AND filepath NOT IN (SELECT filepath FROM source_scan_seen)",
+        (missing_at, source_id),
+    )
+    await conn.execute("DELETE FROM source_scan_seen")
 
 
 async def refresh_source_online_states():
@@ -661,7 +845,7 @@ async def mark_source_scan_started(source_id: int):
         await db.close()
 
 
-async def mark_source_scan_finished(source_id: int):
+async def mark_source_scan_finished(source_id: int, seen_filepaths: list[str] | None = None):
     db = await get_db()
     try:
         now = _time.time()
@@ -669,12 +853,35 @@ async def mark_source_scan_finished(source_id: int):
             "UPDATE catalog_sources SET last_scan_at = ?, last_seen_at = ?, online = ? WHERE id = ?",
             (now, now, 1, source_id),
         )
+        if seen_filepaths is not None:
+            await _mark_source_missing_files(db, source_id, seen_filepaths, now)
         await _update_source_counts(db, source_id)
         await db.commit()
         _invalidate_stats_cache()
         _invalidate_filter_options_cache()
+        invalidate_cached_image_ids_cache()
     finally:
         await db.close()
+
+
+def mark_image_missing_sync(image_id: int, missing_at: float | None = None) -> bool:
+    """Mark one image missing from sync thumbnail/worker code."""
+    when = _time.time() if missing_at is None else float(missing_at)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        cursor = conn.execute(
+            "UPDATE images SET missing_at = COALESCE(missing_at, ?) WHERE id = ?",
+            (when, int(image_id)),
+        )
+        conn.commit()
+        changed = cursor.rowcount > 0
+    finally:
+        conn.close()
+    if changed:
+        _invalidate_stats_cache()
+        _invalidate_filter_options_cache()
+        invalidate_cached_image_ids_cache()
+    return changed
 
 
 async def get_source(source_id: int):
@@ -805,7 +1012,7 @@ async def get_recent_active_images(limit: int = 10):
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1 "
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
             "ORDER BY i.id DESC LIMIT ?",
             (limit,),
         )
@@ -864,12 +1071,13 @@ async def get_active_images_for_pairing():
     try:
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
-            "i.propagated_updates, i.flag, i.orientation, "
+            "i.propagated_updates, i.status, i.flag, i.orientation, "
             "i.aspect_ratio, i.date_taken, i.camera_make, i.camera_model, i.lens, "
             "i.file_ext, i.file_size, i.width, i.height, i.file_modified_at, "
-            "i.latitude, i.longitude FROM images i "
+            "i.latitude, i.longitude, i.created_at FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1 ORDER BY i.elo DESC"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
+            "ORDER BY i.elo DESC"
         )
         return await cursor.fetchall()
     finally:
@@ -947,6 +1155,25 @@ async def undo_last_comparison():
             if not rows:
                 return None
 
+            propagation_rows = []
+            if action_id:
+                cursor = await db.execute(
+                    "SELECT image_id, elo_before, propagated_updates_before "
+                    "FROM propagation_updates WHERE action_id = ? ORDER BY id ASC",
+                    (action_id,),
+                )
+                propagation_rows = await cursor.fetchall()
+
+            for row in propagation_rows:
+                await db.execute(
+                    "UPDATE images SET elo = ?, propagated_updates = ? WHERE id = ?",
+                    (
+                        float(row["elo_before"]),
+                        int(row["propagated_updates_before"]),
+                        int(row["image_id"]),
+                    ),
+                )
+
             restore_elo: dict[int, float] = {}
             comparison_decrements: dict[int, int] = {}
             for row in rows:
@@ -965,6 +1192,7 @@ async def undo_last_comparison():
 
             if action_id:
                 await db.execute("DELETE FROM comparisons WHERE action_id = ?", (action_id,))
+                await db.execute("DELETE FROM propagation_updates WHERE action_id = ?", (action_id,))
             else:
                 await db.execute("DELETE FROM comparisons WHERE id = ?", (latest["id"],))
             await db.commit()
@@ -974,6 +1202,7 @@ async def undo_last_comparison():
                 "winner_id": last_row["winner_id"],
                 "loser_id": last_row["loser_id"],
                 "comparisons_undone": len(rows),
+                "propagations_undone": len(propagation_rows),
                 "action_id": action_id,
             }
         return None
@@ -1010,16 +1239,16 @@ RANKING_INDEXES = {
     "filename_desc": "idx_images_active_filename",
     "newest": "idx_images_active_id",
     "oldest": "idx_images_active_id",
-    "date_taken": None,
-    "date_taken_asc": None,
-    "file_size": None,
-    "file_size_asc": None,
-    "date_modified": None,
-    "date_modified_asc": None,
-    "camera": None,
-    "camera_desc": None,
-    "resolution": None,
-    "resolution_asc": None,
+    "date_taken": "idx_images_active_date_taken_sort_desc",
+    "date_taken_asc": "idx_images_active_date_taken_sort_asc",
+    "file_size": "idx_images_active_file_size_sort_desc",
+    "file_size_asc": "idx_images_active_file_size_sort_asc",
+    "date_modified": "idx_images_active_modified_sort_desc",
+    "date_modified_asc": "idx_images_active_modified_sort_asc",
+    "camera": "idx_images_active_camera_sort_asc",
+    "camera_desc": "idx_images_active_camera_sort_desc",
+    "resolution": "idx_images_active_resolution_sort_desc",
+    "resolution_asc": "idx_images_active_resolution_sort_asc",
 }
 
 STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
@@ -1029,8 +1258,15 @@ def _ranking_filter_parts(
     orientation: str = "", compared: str = "", min_stars: int = 0,
     folder: str = "", flag: str = "", date_taken: str = "",
     file_type: str = "", camera: str = "", lens: str = "",
+    visible_thumb_size: str = "", cache_root: str = "",
+    text_query: str = "",
 ) -> tuple[list[str], list]:
-    conditions = ["s.included = 1", "s.online = 1"]
+    conditions = [
+        "s.included = 1",
+        "s.online = 1",
+        "i.status IN ('kept', 'maybe')",
+        "i.missing_at IS NULL",
+    ]
     params = []
 
     if orientation in ("landscape", "portrait"):
@@ -1086,14 +1322,173 @@ def _ranking_filter_parts(
         conditions.append("i.lens = ?")
         params.append(lens)
 
+    if text_query:
+        escaped = (
+            text_query.strip().lower()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        if escaped:
+            pattern = f"%{escaped}%"
+            fields = (
+                "i.filename",
+                "i.filepath",
+                "i.date_taken",
+                "i.camera_make",
+                "i.camera_model",
+                "i.lens",
+                "i.file_ext",
+            )
+            conditions.append(
+                "("
+                + " OR ".join(f"LOWER(COALESCE({field}, '')) LIKE ? ESCAPE '\\'" for field in fields)
+                + ")"
+            )
+            params.extend([pattern] * len(fields))
+
+    if visible_thumb_size and cache_root:
+        conditions.append(
+            "EXISTS ("
+            "  SELECT 1 FROM cache_entries c "
+            "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+            ")"
+        )
+        params.extend([cache_root, visible_thumb_size])
+
     return conditions, params
+
+
+def _ranking_index_for_query(sort: str, *, id_filter: set | None, text_query: str) -> str | None:
+    if id_filter is not None or text_query:
+        return None
+    return RANKING_INDEXES.get(sort)
+
+
+def _ranking_image_source(sort: str, *, id_filter: set | None, text_query: str) -> str:
+    index_name = _ranking_index_for_query(sort, id_filter=id_filter, text_query=text_query)
+    if not index_name:
+        return "images i"
+    return f"images i INDEXED BY {index_name}"
+
+
+async def get_cached_image_ids(
+    image_ids: list[int],
+    size: str,
+    cache_root: str,
+    chunk_size: int = 900,
+) -> set[int]:
+    """Return IDs with a cache_entries row for the exact cache root/tier."""
+    if not image_ids or not size or not cache_root:
+        return set()
+    unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+    cached_all = await get_cached_image_id_set(size, cache_root)
+    if cached_all:
+        return {image_id for image_id in unique_ids if image_id in cached_all}
+    return set()
+
+
+async def get_cached_image_id_set(size: str, cache_root: str) -> frozenset[int]:
+    """Return cached image IDs for one cache root/tier with a short TTL."""
+    if not size or not cache_root:
+        return frozenset()
+    key = (cache_root, size)
+    now = _time.time()
+    cached_entry = _cached_image_ids_cache.get(key)
+    if cached_entry and now < cached_entry["expires"]:
+        return cached_entry["ids"]
+
+    cached: set[int] = set()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT image_id FROM cache_entries WHERE cache_root = ? AND size = ?",
+            (cache_root, size),
+        )
+        cached.update(int(row["image_id"]) for row in await cursor.fetchall())
+    finally:
+        await db.close()
+    frozen = frozenset(cached)
+    _cached_image_ids_cache[key] = {
+        "ids": frozen,
+        "expires": now + CACHED_IMAGE_IDS_TTL_SECONDS,
+    }
+    return frozen
+
+
+async def get_rankable_image_id_set() -> frozenset[int]:
+    """Return active ranking image IDs with a short TTL for hot count paths."""
+    now = _time.time()
+    if now < _rankable_image_ids_cache["expires"]:
+        return _rankable_image_ids_cache["ids"]
+
+    ids: set[int] = set()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT i.id FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1 "
+            "AND i.status IN ('kept', 'maybe') AND i.missing_at IS NULL"
+        )
+        ids.update(int(row["id"]) for row in await cursor.fetchall())
+    finally:
+        await db.close()
+    frozen = frozenset(ids)
+    _rankable_image_ids_cache["ids"] = frozen
+    _rankable_image_ids_cache["expires"] = now + CACHED_IMAGE_IDS_TTL_SECONDS
+    return frozen
+
+
+def _has_ranking_count_filters(
+    orientation: str,
+    compared: str,
+    min_stars: int,
+    folder: str,
+    flag: str,
+    date_taken: str,
+    file_type: str,
+    camera: str,
+    lens: str,
+    id_filter: set | None,
+    text_query: str,
+) -> bool:
+    return bool(
+        orientation or compared or min_stars > 0 or folder or flag or date_taken
+        or file_type or camera or lens or id_filter is not None or text_query
+    )
+
+
+async def _count_rankings_with_id_filter(
+    conn,
+    conditions: list[str],
+    params: list,
+    id_values,
+) -> int:
+    ids = list(dict.fromkeys(int(image_id) for image_id in id_values))
+    if not ids:
+        return 0
+    total = 0
+    for chunk in _chunked(ids, 900):
+        placeholders = ",".join("?" for _ in chunk)
+        cursor = await conn.execute(
+            f"SELECT COUNT(*) AS count FROM images i "
+            f"JOIN catalog_sources s ON s.id = i.source_id "
+            f"WHERE {' AND '.join(conditions + [f'i.id IN ({placeholders})'])}",
+            list(params) + chunk,
+        )
+        row = await cursor.fetchone()
+        total += int(row["count"] or 0)
+    return total
 
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
                        orientation: str = "", compared: str = "", min_stars: int = 0,
                        folder: str = "", flag: str = "", date_taken: str = "",
                        file_type: str = "", camera: str = "", lens: str = "",
-                       id_filter: set = None):
+                       id_filter: set = None,
+                       visible_thumb_size: str = "", cache_root: str = "",
+                       text_query: str = ""):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -1101,6 +1496,8 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
+            text_query=text_query,
         )
 
         if id_filter is not None:
@@ -1112,6 +1509,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 
         where = " AND ".join(conditions)
         params.extend([limit, offset])
+        image_source = _ranking_image_source(sort, id_filter=id_filter, text_query=text_query)
 
         cursor = await db.execute(
             f"SELECT i.id, i.source_id, i.filename, i.filepath, i.elo, i.comparisons, "
@@ -1119,7 +1517,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             f"i.status, i.flag, i.aspect_ratio, "
             f"i.date_taken, i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
             f"i.file_modified_at, i.width, i.height, i.latitude, i.longitude, i.created_at "
-            f"FROM images i JOIN catalog_sources s ON s.id = i.source_id "
+            f"FROM {image_source} JOIN catalog_sources s ON s.id = i.source_id "
             f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params,
         )
@@ -1131,20 +1529,44 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 async def count_rankings(orientation: str = "", compared: str = "", min_stars: int = 0,
                          folder: str = "", flag: str = "", date_taken: str = "",
                          file_type: str = "", camera: str = "", lens: str = "",
-                         id_filter: set = None) -> int:
+                         id_filter: set = None,
+                         visible_thumb_size: str = "", cache_root: str = "",
+                         text_query: str = "") -> int:
+    if not _has_ranking_count_filters(
+        orientation, compared, min_stars, folder, flag, date_taken,
+        file_type, camera, lens, id_filter, text_query,
+    ):
+        rankable_ids = await get_rankable_image_id_set()
+        if visible_thumb_size and cache_root:
+            cached_ids = await get_cached_image_id_set(visible_thumb_size, cache_root)
+            return len(rankable_ids & cached_ids)
+        return len(rankable_ids)
+
     db = await get_db()
     try:
+        cached_id_filter = None
+        if visible_thumb_size and cache_root:
+            cached_id_filter = set(await get_cached_image_id_set(visible_thumb_size, cache_root))
+            visible_thumb_size = ""
+            cache_root = ""
+
         conditions, params = _ranking_filter_parts(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
+            text_query=text_query,
         )
+
+        if cached_id_filter is not None:
+            if id_filter is not None:
+                cached_id_filter.intersection_update(int(image_id) for image_id in id_filter)
+            return await _count_rankings_with_id_filter(db, conditions, params, cached_id_filter)
+
         if id_filter is not None:
             if not id_filter:
                 return 0
-            placeholders = ",".join("?" * len(id_filter))
-            conditions.append(f"i.id IN ({placeholders})")
-            params.extend(id_filter)
+            return await _count_rankings_with_id_filter(db, conditions, params, id_filter)
         cursor = await db.execute(
             f"SELECT COUNT(*) AS count FROM images i "
             f"JOIN catalog_sources s ON s.id = i.source_id "
@@ -1159,13 +1581,15 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
 
 async def get_date_groups(orientation: str = "", compared: str = "", min_stars: int = 0,
                           folder: str = "", flag: str = "", date_taken: str = "",
-                          file_type: str = "", camera: str = "", lens: str = ""):
+                          file_type: str = "", camera: str = "", lens: str = "",
+                          visible_thumb_size: str = "", cache_root: str = ""):
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
         )
         cursor = await db.execute(
             "SELECT "
@@ -1196,7 +1620,8 @@ async def get_date_groups(orientation: str = "", compared: str = "", min_stars: 
 
 async def get_map_markers(orientation: str = "", compared: str = "", min_stars: int = 0,
                           folder: str = "", flag: str = "", date_taken: str = "",
-                          file_type: str = "", camera: str = "", lens: str = ""):
+                          file_type: str = "", camera: str = "", lens: str = "",
+                          visible_thumb_size: str = "", cache_root: str = ""):
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
@@ -1212,13 +1637,46 @@ async def get_map_markers(orientation: str = "", compared: str = "", min_stars: 
         )
         total_count = int((await total_cursor.fetchone())["count"] or 0)
 
-        marker_conditions = conditions + ["i.latitude IS NOT NULL", "i.longitude IS NOT NULL"]
+        gps_conditions = conditions + ["i.latitude IS NOT NULL", "i.longitude IS NOT NULL"]
+        gps_total_cursor = await db.execute(
+            f"SELECT COUNT(*) AS count FROM images i "
+            f"JOIN catalog_sources s ON s.id = i.source_id "
+            f"WHERE {' AND '.join(gps_conditions)}",
+            params,
+        )
+        gps_total_count = int((await gps_total_cursor.fetchone())["count"] or 0)
+
+        marker_conditions = list(gps_conditions)
+        marker_params = list(params)
+        visible_total_count = total_count
+        if visible_thumb_size and cache_root:
+            marker_conditions.append(
+                "EXISTS ("
+                "  SELECT 1 FROM cache_entries c "
+                "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+                ")"
+            )
+            marker_params.extend([cache_root, visible_thumb_size])
+            visible_conditions = list(conditions) + [
+                "EXISTS ("
+                "  SELECT 1 FROM cache_entries c "
+                "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+                ")"
+            ]
+            visible_cursor = await db.execute(
+                f"SELECT COUNT(*) AS count FROM images i "
+                f"JOIN catalog_sources s ON s.id = i.source_id "
+                f"WHERE {' AND '.join(visible_conditions)}",
+                params + [cache_root, visible_thumb_size],
+            )
+            visible_total_count = int((await visible_cursor.fetchone())["count"] or 0)
+
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.latitude, i.longitude FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             f"WHERE {' AND '.join(marker_conditions)} "
             "ORDER BY i.date_taken DESC, i.id DESC",
-            params,
+            marker_params,
         )
         markers = [
             {
@@ -1233,7 +1691,10 @@ async def get_map_markers(orientation: str = "", compared: str = "", min_stars: 
         return {
             "markers": markers,
             "total_count": total_count,
+            "visible_count": visible_total_count,
             "gps_count": len(markers),
+            "gps_total_count": gps_total_count,
+            "hidden_pending_thumbnails": max(gps_total_count - len(markers), 0),
         }
     finally:
         await db.close()
@@ -1248,6 +1709,7 @@ async def get_filter_options():
             "SELECT substr(date_taken, 1, 4) AS year, COUNT(*) AS count "
             "FROM images i JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 AND i.date_taken IS NOT NULL "
+            "AND i.missing_at IS NULL "
             "GROUP BY year ORDER BY year DESC"
         )
         years = [
@@ -1260,6 +1722,7 @@ async def get_filter_options():
             "SELECT LOWER(i.file_ext) AS ext, COUNT(*) AS count "
             "FROM images i JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 AND i.file_ext IS NOT NULL AND i.file_ext != '' "
+            "AND i.missing_at IS NULL "
             "GROUP BY LOWER(i.file_ext) ORDER BY count DESC, ext ASC"
         )
         file_types = [
@@ -1271,7 +1734,8 @@ async def get_filter_options():
         cursor = await db.execute(
             "SELECT COUNT(*) AS count FROM images "
             "JOIN catalog_sources s ON s.id = images.source_id "
-            "WHERE s.included = 1 AND s.online = 1 AND images.date_taken IS NULL"
+            "WHERE s.included = 1 AND s.online = 1 AND images.missing_at IS NULL "
+            "AND images.date_taken IS NULL"
         )
         undated = (await cursor.fetchone())["count"]
 
@@ -1280,6 +1744,7 @@ async def get_filter_options():
             "COUNT(*) AS count "
             "FROM images i JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 "
+            "AND i.missing_at IS NULL "
             "AND (i.camera_make IS NOT NULL OR i.camera_model IS NOT NULL) "
             "GROUP BY camera ORDER BY count DESC, camera ASC LIMIT 200"
         )
@@ -1293,6 +1758,7 @@ async def get_filter_options():
             "SELECT i.lens, COUNT(*) AS count "
             "FROM images i JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 AND i.lens IS NOT NULL AND i.lens != '' "
+            "AND i.missing_at IS NULL "
             "GROUP BY i.lens ORDER BY count DESC, i.lens ASC LIMIT 200"
         )
         lenses = [
@@ -1323,11 +1789,11 @@ async def get_stats():
         cursor = await db.execute(
             "SELECT "
             "COUNT(*) AS catalog_images, "
-            "SUM(CASE WHEN s.included = 1 AND s.online = 1 THEN 1 ELSE 0 END) AS active_images, "
+            "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND i.missing_at IS NULL THEN 1 ELSE 0 END) AS active_images, "
             "SUM(CASE WHEN s.included = 0 THEN 1 ELSE 0 END) AS removed_images, "
             "SUM(CASE WHEN s.included = 1 AND s.online = 0 THEN 1 ELSE 0 END) AS offline_images, "
-            "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND COALESCE(i.flag, 'unflagged') = 'picked' THEN 1 ELSE 0 END) AS picked, "
-            "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND COALESCE(i.flag, 'unflagged') = 'rejected' THEN 1 ELSE 0 END) AS rejected "
+            "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND i.missing_at IS NULL AND COALESCE(i.flag, 'unflagged') = 'picked' THEN 1 ELSE 0 END) AS picked, "
+            "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND i.missing_at IS NULL AND COALESCE(i.flag, 'unflagged') = 'rejected' THEN 1 ELSE 0 END) AS rejected "
             "FROM images i LEFT JOIN catalog_sources s ON s.id = i.source_id"
         )
         counts = await cursor.fetchone()
@@ -1338,7 +1804,8 @@ async def get_stats():
             "JOIN images li ON li.id = c.loser_id "
             "JOIN catalog_sources ws ON ws.id = wi.source_id "
             "JOIN catalog_sources ls ON ls.id = li.source_id "
-            "WHERE ws.included = 1 AND ws.online = 1 AND ls.included = 1 AND ls.online = 1"
+            "WHERE ws.included = 1 AND ws.online = 1 AND wi.missing_at IS NULL "
+            "AND ls.included = 1 AND ls.online = 1 AND li.missing_at IS NULL"
         )
         direct_comparison_rows = int((await cursor.fetchone())["c"] or 0)
         cursor = await db.execute("SELECT COUNT(*) as c FROM comparisons")
@@ -1353,7 +1820,7 @@ async def get_stats():
             "      OR ABS(COALESCE(i.elo, 1200.0) - 1200.0) > 0.0001 "
             "    THEN 1 ELSE 0 END) AS rated_images "
             "FROM images i LEFT JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         ranking_counts = await cursor.fetchone()
 
@@ -1365,7 +1832,7 @@ async def get_stats():
             ") x "
             "JOIN images i ON i.id = x.image_id "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         direct_image_history_count = int((await cursor.fetchone())["c"] or 0)
 
@@ -1458,7 +1925,8 @@ async def get_active_images_by_ids(image_ids: list[int]) -> dict[int, dict]:
         cursor = await db.execute(
             f"SELECT i.* FROM images i "
             f"JOIN catalog_sources s ON s.id = i.source_id "
-            f"WHERE s.included = 1 AND s.online = 1 AND i.id IN ({placeholders})",
+            f"WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
+            f"AND i.id IN ({placeholders})",
             unique_ids,
         )
         rows = await cursor.fetchall()
@@ -1473,11 +1941,12 @@ async def get_top_images(limit: int = 50):
     try:
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
-            "i.propagated_updates, i.flag, i.date_taken, "
+            "i.propagated_updates, i.status, i.flag, i.orientation, i.aspect_ratio, i.date_taken, "
             "i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
-            "i.width, i.height, i.file_modified_at, i.latitude, i.longitude FROM images i "
+            "i.width, i.height, i.file_modified_at, i.latitude, i.longitude, i.created_at FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1 ORDER BY i.elo DESC LIMIT ?",
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
+            "ORDER BY i.elo DESC LIMIT ?",
             (limit,),
         )
         return await cursor.fetchall()
@@ -1496,7 +1965,9 @@ async def get_scan_folder():
         row = await cursor.fetchone()
         if row:
             return row["path"]
-        cursor = await db.execute("SELECT filepath FROM images ORDER BY RANDOM() LIMIT 50")
+        cursor = await db.execute(
+            "SELECT filepath FROM images WHERE missing_at IS NULL ORDER BY RANDOM() LIMIT 50"
+        )
         rows = await cursor.fetchall()
         if not rows:
             return None
@@ -1517,6 +1988,7 @@ async def get_unembedded_images(limit: int = 64, md_cache_root: str = ""):
                 "SELECT i.id, i.filepath FROM images i "
                 "JOIN catalog_sources s ON s.id = i.source_id "
                 "WHERE s.included = 1 AND s.online = 1 "
+                "AND i.missing_at IS NULL "
                 "AND EXISTS ("
                 "  SELECT 1 FROM cache_entries c "
                 "  WHERE c.cache_root = ? AND c.size = 'md' AND c.image_id = i.id"
@@ -1533,6 +2005,7 @@ async def get_unembedded_images(limit: int = 64, md_cache_root: str = ""):
                 "SELECT i.id, i.filepath FROM images i "
                 "JOIN catalog_sources s ON s.id = i.source_id "
                 "WHERE s.included = 1 AND s.online = 1 "
+                "AND i.missing_at IS NULL "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM embeddings e WHERE e.image_id = i.id"
                 ") "
@@ -1566,7 +2039,7 @@ async def get_all_embeddings():
             "SELECT e.image_id, e.embedding FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         return await cursor.fetchall()
     finally:
@@ -1580,7 +2053,7 @@ async def get_embedding_count() -> int:
             "SELECT COUNT(*) as c FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         return (await cursor.fetchone())["c"]
     finally:

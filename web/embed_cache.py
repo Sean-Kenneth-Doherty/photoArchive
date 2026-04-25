@@ -116,7 +116,7 @@ def _get_embedding_count_sync() -> int:
             "SELECT COUNT(*) FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         ).fetchone()[0]
     finally:
         conn.close()
@@ -133,7 +133,7 @@ def _load_embeddings_sync(expected_count: int):
             "SELECT e.image_id, e.embedding FROM embeddings e "
             "JOIN images i ON e.image_id = i.id "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         ).fetchall()
     finally:
         conn.close()
@@ -168,12 +168,12 @@ async def get_matrix():
         ):
             return _cache["image_ids"], _matrix_view()
 
-        current_count = _get_embedding_count_sync()
+        current_count = await asyncio.to_thread(_get_embedding_count_sync)
         _cache["checked_at"] = now
         if _cache["matrix"] is not None and _cache["count"] == current_count:
             return _cache["image_ids"], _matrix_view()
 
-        image_ids, matrix = _load_embeddings_sync(current_count)
+        image_ids, matrix = await asyncio.to_thread(_load_embeddings_sync, current_count)
         if not image_ids or matrix is None:
             _cache.update({
                 "image_ids": None,
@@ -195,6 +195,13 @@ async def get_matrix():
         _cache.update(new_cache)
 
         return image_ids, _matrix_view()
+
+
+def get_warm_matrix():
+    """Return the current in-memory matrix without triggering a rebuild."""
+    if _cache["matrix"] is None or _cache["image_ids"] is None:
+        return None, None
+    return _cache["image_ids"], _matrix_view()
 
 
 def add_vectors(rows: list[tuple[int, np.ndarray]]):

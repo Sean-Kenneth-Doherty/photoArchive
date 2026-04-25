@@ -6,15 +6,16 @@
     <title>{% block title %}photoArchive{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
+    {% set current_nav %}{% block active_nav %}{% endblock %}{% endset %}
     {% block navbar %}
     <nav class="navbar">
         <a href="/" class="nav-brand">photoArchive</a>
         {% block navbar_center %}{% endblock %}
         <div class="nav-links">
-            <a href="/compare" class="nav-link">Compare</a>
-            <a href="/library" class="nav-link">Library</a>
-            <a href="/catalog" class="nav-link">Catalog</a>
+            <a href="/compare" class="nav-link{% if current_nav|trim == 'compare' %} active{% endif %}">Compare</a>
+            <a href="/library" class="nav-link{% if current_nav|trim == 'library' %} active{% endif %}">Library</a>
+            <a href="/catalog" class="nav-link{% if current_nav|trim == 'catalog' %} active{% endif %}">Catalog</a>
         </div>
     </nav>
     {% endblock %}
@@ -22,6 +23,39 @@
         {% block content %}{% endblock %}
     </main>
     {% block bottom_bar %}{% endblock %}
+    <div class="shortcut-overlay hidden" id="shortcut-overlay">
+        <div class="shortcut-overlay-card">
+            <div class="shortcut-overlay-header">
+                <span>Keyboard Shortcuts</span>
+                <button type="button" class="shortcut-overlay-close" onclick="PhotoArchive.hideShortcuts()" aria-label="Close">&times;</button>
+            </div>
+            <div class="shortcut-overlay-body">
+                <div class="shortcut-group">
+                    <h4>Compare</h4>
+                    <div class="shortcut-row"><kbd>←</kbd><kbd>→</kbd> Navigate grid</div>
+                    <div class="shortcut-row"><kbd>Enter</kbd> Pick image</div>
+                    <div class="shortcut-row"><kbd>↑</kbd> Undo last pick</div>
+                    <div class="shortcut-row"><kbd>Tab</kbd> Switch to Library</div>
+                    <div class="shortcut-row"><kbd>Esc</kbd> Clear selection</div>
+                </div>
+                <div class="shortcut-group">
+                    <h4>Library</h4>
+                    <div class="shortcut-row"><kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> Navigate</div>
+                    <div class="shortcut-row"><kbd>Enter</kbd> Open in loupe</div>
+                    <div class="shortcut-row"><kbd>P</kbd> Flag as picked</div>
+                    <div class="shortcut-row"><kbd>X</kbd> Flag as rejected</div>
+                    <div class="shortcut-row"><kbd>U</kbd> Clear flag</div>
+                    <div class="shortcut-row"><kbd>Tab</kbd> Switch to Compare</div>
+                </div>
+                <div class="shortcut-group">
+                    <h4>Loupe</h4>
+                    <div class="shortcut-row"><kbd>←</kbd><kbd>→</kbd> Previous / Next</div>
+                    <div class="shortcut-row"><kbd>Esc</kbd> Close loupe</div>
+                    <div class="shortcut-row"><kbd>Scroll</kbd> Zoom</div>
+                </div>
+            </div>
+        </div>
+    </div>
     <script src="/static/app.js"></script>
     {% block scripts %}{% endblock %}
 </body>

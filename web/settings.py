@@ -26,10 +26,12 @@ DEFAULT_SETTINGS = {
     "pregen_generate_batch": 16,
     "pregen_batch_pause_ms": 250,
     "embed_batch_pause_ms": 250,
+    "embed_batch_size": 8,
     "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
     "embed_model_revision": "main",
     "embed_model_dir": _default_model_dir("Qwen/Qwen3-VL-Embedding-2B"),
     "search_similarity_threshold": 0.35,
+    "show_loupe_cache_status": True,
 }
 
 INT_RANGES = {
@@ -42,6 +44,7 @@ INT_RANGES = {
     "pregen_generate_batch": (4, 64),
     "pregen_batch_pause_ms": (0, 5000),
     "embed_batch_pause_ms": (0, 5000),
+    "embed_batch_size": (1, 32),
 }
 
 FLOAT_RANGES = {
@@ -189,6 +192,9 @@ def normalize_settings(raw: dict | None) -> dict:
         normalized["thumb_size_lg"] = normalized["thumb_size_md"]
 
     normalized["pregenerate_on_idle"] = bool(raw.get("pregenerate_on_idle", normalized["pregenerate_on_idle"]))
+    normalized["show_loupe_cache_status"] = bool(
+        raw.get("show_loupe_cache_status", normalized["show_loupe_cache_status"])
+    )
     normalized.update(_derive_runtime_tuning(normalized["memory_cache_gb"]))
     normalized["prefetch_workers"] = min(
         normalized["prefetch_workers"],
