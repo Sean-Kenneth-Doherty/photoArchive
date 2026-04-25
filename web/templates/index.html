@@ -63,6 +63,8 @@ async function startScan() {
     btn.textContent = 'Scanning...';
 
     const progress = document.getElementById('scan-progress');
+    const statusText = document.getElementById('scan-status-text');
+    statusText.classList.remove('scan-error');
     progress.classList.remove('hidden');
 
     try {
@@ -73,7 +75,9 @@ async function startScan() {
         });
         if (!res.ok) {
             const err = await res.json();
-            alert(err.error || 'Scan failed');
+            statusText.textContent = err.error || 'Scan failed';
+            statusText.classList.add('scan-error');
+            progress.classList.remove('hidden');
             btn.disabled = false;
             btn.textContent = 'Scan Folder';
             return;
@@ -82,22 +86,24 @@ async function startScan() {
         // Poll scan status
         const poll = setInterval(async () => {
             const status = await (await fetch('/api/scan/status')).json();
-            document.getElementById('scan-status-text').textContent =
-                `Found ${status.total_found} images, inserted ${status.total_inserted}...`;
+            statusText.classList.remove('scan-error');
+            statusText.textContent = `Found ${status.total_found} images, inserted ${status.total_inserted}...`;
             document.getElementById('scan-fill').style.width =
                 status.total_found > 0 ? `${(status.total_inserted / status.total_found * 100)}%` : '0%';
 
             if (status.done) {
                 clearInterval(poll);
-                document.getElementById('scan-status-text').textContent =
-                    `Done! ${status.total_inserted} images ready.`;
+                statusText.classList.remove('scan-error');
+                statusText.textContent = `Done! ${status.total_inserted} images ready.`;
                 btn.disabled = false;
                 btn.textContent = 'Scan Folder';
                 setTimeout(() => location.reload(), 1000);
             }
         }, 500);
     } catch (e) {
-        alert('Scan failed: ' + e.message);
+        statusText.textContent = 'Scan failed: ' + e.message;
+        statusText.classList.add('scan-error');
+        progress.classList.remove('hidden');
         btn.disabled = false;
         btn.textContent = 'Scan Folder';
     }

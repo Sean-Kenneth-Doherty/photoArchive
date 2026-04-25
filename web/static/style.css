@@ -603,6 +603,11 @@ button:disabled {
     margin-top: 8px;
 }
 
+.scan-error,
+.scan-progress p.scan-error {
+    color: var(--status-error);
+}
+
 /* Stats grid */
 .stats-grid {
     display: grid;
