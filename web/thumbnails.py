@@ -1579,18 +1579,18 @@ def _record_pregen_batch(count: int):
         _pregen_session_started_at = now
     _pregen_session_generated += count
     _pregen_history.append({"ended_at": now, "count": int(count)})
-    cutoff = now - 10 * 60
+    cutoff = now - 30 * 60
     while _pregen_history and _pregen_history[0]["ended_at"] < cutoff:
         _pregen_history.popleft()
 
 
 def _pregen_rates() -> tuple[float, float]:
     now = _current_time()
-    cutoff = now - 10 * 60
+    cutoff = now - 30 * 60
     while _pregen_history and _pregen_history[0]["ended_at"] < cutoff:
         _pregen_history.popleft()
     recent_count = sum(item["count"] for item in _pregen_history)
-    recent_window = max(1.0, min(10 * 60.0, now - _pregen_history[0]["ended_at"])) if _pregen_history else 0.0
+    recent_window = max(1.0, min(30 * 60.0, now - _pregen_history[0]["ended_at"])) if _pregen_history else 0.0
     recent_rate = (recent_count / recent_window) * 60.0 if recent_window > 0 else 0.0
     session_window = max(1.0, now - _pregen_session_started_at) if _pregen_session_started_at else 0.0
     overall_rate = (_pregen_session_generated / session_window) * 60.0 if session_window > 0 else 0.0
