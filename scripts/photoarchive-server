@@ -80,7 +80,11 @@ start_server() {
 
     (
         cd "$WEB"
-        "$UVICORN" app:app --host "$HOST" --port "$PORT" >>"$LOGFILE" 2>&1 &
+        if command -v setsid >/dev/null 2>&1; then
+            nohup setsid "$UVICORN" app:app --host "$HOST" --port "$PORT" >>"$LOGFILE" 2>&1 </dev/null &
+        else
+            nohup "$UVICORN" app:app --host "$HOST" --port "$PORT" >>"$LOGFILE" 2>&1 </dev/null &
+        fi
         echo "$!" >"$PIDFILE"
     )
 

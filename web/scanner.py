@@ -46,6 +46,7 @@ async def scan_folder(folder: str, source_id: int | None = None, on_batch=None):
 
     batch = []
     batch_size = 100
+    seen_filepaths = []
 
     try:
         if source_id is not None:
@@ -53,6 +54,7 @@ async def scan_folder(folder: str, source_id: int | None = None, on_batch=None):
 
         for row in walk_images(folder):
             batch.append(row)
+            seen_filepaths.append(row[1])
             scan_state["total_found"] += 1
 
             if len(batch) >= batch_size:
@@ -71,7 +73,7 @@ async def scan_folder(folder: str, source_id: int | None = None, on_batch=None):
                 await on_batch(scan_state["total_inserted"])
 
         if source_id is not None:
-            await db.mark_source_scan_finished(source_id)
+            await db.mark_source_scan_finished(source_id, seen_filepaths=seen_filepaths)
     except Exception as exc:
         scan_state["error"] = str(exc)
     finally:
