@@ -6,6 +6,7 @@ const PhotoArchive = (() => {
     let comparePairs = [];
     let compareIndex = 0;
     let compareMode = 'swiss';
+    let compareModeTransitionToken = 0;
     let compareBusy = false;
     let compareActionSeq = 0;
     let compareStats = {};
@@ -1192,26 +1193,36 @@ const PhotoArchive = (() => {
         const mosaicContainer = document.getElementById('mosaic-container');
         const strategies = document.getElementById('bar-strategies');
         const hints = document.getElementById('bar-hints');
+        const visibleContainer = [abContainer, mosaicContainer].find(el => el && !el.classList.contains('hidden'));
+        const transitionToken = ++compareModeTransitionToken;
 
-        if (mode === 'mosaic') {
-            // Show mosaic, hide A/B
-            compareImageToken++;
-            if (abContainer) abContainer.classList.add('hidden');
-            if (mosaicContainer) mosaicContainer.classList.remove('hidden');
-            if (strategies) strategies.classList.remove('hidden');
-            if (hints) hints.classList.add('hidden');
-            loadMosaicBatch();
-        } else {
-            // Show A/B, hide mosaic
-            if (abContainer) abContainer.classList.remove('hidden');
-            if (mosaicContainer) mosaicContainer.classList.add('hidden');
-            if (strategies) strategies.classList.add('hidden');
-            if (hints) hints.classList.remove('hidden');
-            // Reset and fetch new pairs
-            comparePairs = [];
-            compareIndex = 0;
-            fetchComparePairs().then(() => showComparePair());
-        }
+        if (visibleContainer) visibleContainer.classList.add('fading');
+
+        setTimeout(() => {
+            if (transitionToken !== compareModeTransitionToken) return;
+            if (mode === 'mosaic') {
+                compareImageToken++;
+                if (abContainer) abContainer.classList.add('hidden');
+                if (mosaicContainer) {
+                    mosaicContainer.classList.remove('hidden');
+                    mosaicContainer.classList.remove('fading');
+                }
+                if (strategies) strategies.classList.remove('hidden');
+                if (hints) hints.classList.add('hidden');
+                loadMosaicBatch();
+            } else {
+                if (abContainer) {
+                    abContainer.classList.remove('hidden');
+                    abContainer.classList.remove('fading');
+                }
+                if (mosaicContainer) mosaicContainer.classList.add('hidden');
+                if (strategies) strategies.classList.add('hidden');
+                if (hints) hints.classList.remove('hidden');
+                comparePairs = [];
+                compareIndex = 0;
+                fetchComparePairs().then(() => showComparePair());
+            }
+        }, 150);
     }
 
     function showCompareEmpty() {

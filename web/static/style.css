@@ -818,6 +818,14 @@ button:disabled {
     overflow: hidden;
 }
 
+.compare-images, .mosaic-container {
+    transition: opacity var(--duration-normal) ease-out;
+}
+
+.compare-images.fading, .mosaic-container.fading {
+    opacity: 0;
+}
+
 .compare-side {
     flex: 1;
     min-height: 0;
