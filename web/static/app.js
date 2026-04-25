@@ -2057,7 +2057,10 @@ const PhotoArchive = (() => {
         if (input) {
             input.addEventListener('input', (e) => {
                 clearTimeout(searchDebounce);
+                e.target.classList.add('searching');
                 searchDebounce = setTimeout(() => {
+                    e.target.classList.remove('searching');
+                    searchDebounce = null;
                     const wasSearching = hasActiveTextSearch();
                     searchQuery = e.target.value.trim();
                     if (hasActiveTextSearch()) {
@@ -2113,6 +2116,8 @@ const PhotoArchive = (() => {
     function clearSearch() {
         const wasSimilaritySort = sortField === 'similarity';
         searchQuery = '';
+        clearTimeout(searchDebounce);
+        searchDebounce = null;
         clearPersistedSearchState();
         if (wasSimilaritySort) {
             restoreSortState();
@@ -2121,7 +2126,10 @@ const PhotoArchive = (() => {
             }
         }
         const input = document.getElementById('search-input');
-        if (input) input.value = '';
+        if (input) {
+            input.value = '';
+            input.classList.remove('searching');
+        }
         const sortToggles = document.getElementById('sort-toggles');
         if (sortToggles) sortToggles.style.opacity = '';
         updateSearchControls();
