@@ -1710,7 +1710,7 @@ async def mosaic_pick(request: Request):
     # Fire-and-forget: propagate Elo to similar images via embeddings
     valid_loser_ids = [row[1] for row in comparison_rows]
     _schedule_pairing_propagation(
-        elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0)
+        elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0, action_id=action_id)
     )
 
     return {
@@ -1871,22 +1871,27 @@ async def submit_comparison(request: Request):
 
     k = pairing.get_k_factor(min(winner["comparisons"], loser["comparisons"]), mode)
     new_winner_elo, new_loser_elo = pairing.update_elo(winner["elo"], loser["elo"], k)
+    action_id = uuid.uuid4().hex
 
     await db.record_comparison(
         winner_id, loser_id, mode,
         winner["elo"], loser["elo"],
         new_winner_elo, new_loser_elo,
+        action_id=action_id,
     )
 
     _patch_pairing_cache([(winner_id, new_winner_elo, 1), (loser_id, new_loser_elo, 1)])
     _add_past_matchups([(winner_id, loser_id)])
     # Fire-and-forget: propagate Elo to similar images via embeddings.
-    _schedule_pairing_propagation(elo_propagation.propagate_comparison(winner_id, loser_id, k))
+    _schedule_pairing_propagation(
+        elo_propagation.propagate_comparison(winner_id, loser_id, k, action_id=action_id)
+    )
 
     return {
         "ok": True,
         "winner_elo": round(new_winner_elo, 1),
         "loser_elo": round(new_loser_elo, 1),
+        "action_id": action_id,
     }
 
 

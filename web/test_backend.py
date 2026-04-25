@@ -229,6 +229,73 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["propagated_updates"], 1)
         self.assertGreater(row["elo"], 1200.0)
 
+    async def test_undo_reverts_action_scoped_propagation_updates(self):
+        source = await self._source()
+        winner = await self._image(source["id"], "winner.jpg")
+        loser = await self._image(source["id"], "loser.jpg")
+        neighbor = await self._image(source["id"], "neighbor.jpg")
+        action_id = "undo-propagation-test"
+
+        image_ids = [winner, loser, neighbor]
+        matrix = np.array(
+            [
+                [1.0, 0.0],
+                [-1.0, 0.0],
+                [0.995, 0.1],
+            ],
+            dtype=np.float32,
+        )
+        matrix /= np.linalg.norm(matrix, axis=1, keepdims=True)
+
+        async def fake_get_matrix():
+            return image_ids, matrix
+
+        def fake_get_index():
+            return {image_id: idx for idx, image_id in enumerate(image_ids)}
+
+        elo_propagation.embed_cache.get_matrix = fake_get_matrix
+        elo_propagation.embed_cache.get_index = fake_get_index
+
+        await db.record_comparison(
+            winner,
+            loser,
+            "swiss",
+            1200.0,
+            1200.0,
+            1210.0,
+            1190.0,
+            action_id=action_id,
+        )
+        await elo_propagation.propagate_comparison(winner, loser, k=20.0, action_id=action_id)
+
+        propagated = await self._image_row(neighbor)
+        self.assertEqual(propagated["propagated_updates"], 1)
+        self.assertGreater(propagated["elo"], 1200.0)
+
+        undo = await app_module.compare_undo()
+        self.assertTrue(undo["ok"])
+        self.assertEqual(undo["comparisons_undone"], 1)
+        self.assertEqual(undo["propagations_undone"], 1)
+
+        restored_neighbor = await self._image_row(neighbor)
+        self.assertAlmostEqual(restored_neighbor["elo"], 1200.0)
+        self.assertEqual(restored_neighbor["propagated_updates"], 0)
+
+        restored_winner = await self._image_row(winner)
+        restored_loser = await self._image_row(loser)
+        self.assertAlmostEqual(restored_winner["elo"], 1200.0)
+        self.assertAlmostEqual(restored_loser["elo"], 1200.0)
+        self.assertEqual(restored_winner["comparisons"], 0)
+        self.assertEqual(restored_loser["comparisons"], 0)
+
+        conn = await db.get_db()
+        try:
+            cursor = await conn.execute("SELECT COUNT(*) AS c FROM propagation_updates")
+            remaining = await cursor.fetchone()
+        finally:
+            await conn.close()
+        self.assertEqual(remaining["c"], 0)
+
     async def test_stats_preserve_imported_ranking_without_history(self):
         source = await self._source()
         await self._image(source["id"], "imported-a.jpg", elo=1300.0, comparisons=5)

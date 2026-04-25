@@ -67,6 +67,20 @@ CREATE INDEX IF NOT EXISTS idx_images_comparisons ON images(comparisons);
 CREATE INDEX IF NOT EXISTS idx_comparisons_pair ON comparisons(winner_id, loser_id);
 CREATE INDEX IF NOT EXISTS idx_comparisons_action_id ON comparisons(action_id);
 
+CREATE TABLE IF NOT EXISTS propagation_updates (
+    id INTEGER PRIMARY KEY,
+    action_id TEXT NOT NULL,
+    image_id INTEGER NOT NULL REFERENCES images(id),
+    elo_before REAL NOT NULL,
+    propagated_updates_before INTEGER NOT NULL,
+    elo_after REAL NOT NULL,
+    delta REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_propagation_updates_action_id
+ON propagation_updates(action_id);
+
 -- Composite indexes for fast sorted queries with status filter
 CREATE INDEX IF NOT EXISTS idx_images_status_elo ON images(status, elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_status_elo_asc ON images(status, elo ASC);
@@ -947,6 +961,25 @@ async def undo_last_comparison():
             if not rows:
                 return None
 
+            propagation_rows = []
+            if action_id:
+                cursor = await db.execute(
+                    "SELECT image_id, elo_before, propagated_updates_before "
+                    "FROM propagation_updates WHERE action_id = ? ORDER BY id ASC",
+                    (action_id,),
+                )
+                propagation_rows = await cursor.fetchall()
+
+            for row in propagation_rows:
+                await db.execute(
+                    "UPDATE images SET elo = ?, propagated_updates = ? WHERE id = ?",
+                    (
+                        float(row["elo_before"]),
+                        int(row["propagated_updates_before"]),
+                        int(row["image_id"]),
+                    ),
+                )
+
             restore_elo: dict[int, float] = {}
             comparison_decrements: dict[int, int] = {}
             for row in rows:
@@ -965,6 +998,7 @@ async def undo_last_comparison():
 
             if action_id:
                 await db.execute("DELETE FROM comparisons WHERE action_id = ?", (action_id,))
+                await db.execute("DELETE FROM propagation_updates WHERE action_id = ?", (action_id,))
             else:
                 await db.execute("DELETE FROM comparisons WHERE id = ?", (latest["id"],))
             await db.commit()
@@ -974,6 +1008,7 @@ async def undo_last_comparison():
                 "winner_id": last_row["winner_id"],
                 "loser_id": last_row["loser_id"],
                 "comparisons_undone": len(rows),
+                "propagations_undone": len(propagation_rows),
                 "action_id": action_id,
             }
         return None
