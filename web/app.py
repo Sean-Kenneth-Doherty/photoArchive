@@ -14,6 +14,7 @@ import ai_models
 import db
 import elo_propagation
 import pairing
+import resource_governor
 import scanner
 import settings
 import thumbnails
@@ -42,8 +43,6 @@ app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000)
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
-# Track cull history for undo (in-memory stack of {image_id, previous_status})
-_cull_history: list[dict] = []
 _BROWSER_IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/ai/status",
@@ -158,11 +157,6 @@ async def index(request: Request):
     return RedirectResponse(url="/library", status_code=302)
 
 
-@app.get("/cull", response_class=HTMLResponse)
-async def cull_page(request: Request):
-    return templates.TemplateResponse(request, "cull.html")
-
-
 @app.get("/compare", response_class=HTMLResponse)
 async def compare_page(request: Request):
     return templates.TemplateResponse(request, "compare.html")
@@ -208,9 +202,9 @@ async def start_scan(request: Request):
         return JSONResponse({"error": "Scan already in progress"}, status_code=409)
 
     async def on_batch(count):
-        # Start prefetching thumbnails for early images
+        # Start prefetching thumbnails for early images.
         if count <= 200:
-            images = await db.get_unculled_images(limit=50)
+            images = await db.get_recent_active_images(limit=50)
             config = settings.get_settings()
             await thumbnails.prefetch_images(
                 [dict(r) for r in images],
@@ -236,7 +230,7 @@ async def scan_folder():
 # --- Thumbnail ---
 
 @app.get("/api/thumb/{size}/{image_id}")
-async def serve_thumbnail(request: Request, size: str, image_id: int):
+async def serve_thumbnail(request: Request, size: str, image_id: int, cached: bool = False):
     if size not in thumbnails.SIZES:
         return JSONResponse({"error": "Invalid size"}, status_code=400)
 
@@ -267,6 +261,8 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
         if request.headers.get("if-none-match") == headers["ETag"]:
             return Response(status_code=304, headers=headers)
         return Response(content=data, media_type="image/jpeg", headers=headers)
+    if cached:
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
     # Slow path: need to generate from source — requires DB lookup for filepath
     image = await db.get_image_by_id(image_id)
@@ -282,7 +278,23 @@ async def serve_thumbnail(request: Request, size: str, image_id: int):
 
 
 @app.get("/api/full/{image_id}")
-async def serve_full_image(request: Request, image_id: int, background_tasks: BackgroundTasks):
+async def serve_full_image(request: Request, image_id: int, background_tasks: BackgroundTasks, cached: bool = False):
+    if cached:
+        entry = thumbnails.fast_disk_path_entry(thumbnails.FULL_TIER, image_id)
+        if entry is None:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        signature, path = entry
+        headers = {
+            "Cache-Control": (
+                f"public, max-age={thumbnails.BROWSER_CACHE_MAX_AGE}, "
+                f"stale-while-revalidate={thumbnails.BROWSER_CACHE_STALE_WHILE_REVALIDATE}"
+            ),
+            "ETag": f'"{signature}"',
+        }
+        if request.headers.get("if-none-match") == headers["ETag"]:
+            return Response(status_code=304, headers=headers)
+        return FileResponse(path, headers=headers)
+
     image = await db.get_image_by_id(image_id)
     if not image:
         return JSONResponse({"error": "Image not found"}, status_code=404)
@@ -313,11 +325,115 @@ async def serve_full_image(request: Request, image_id: int, background_tasks: Ba
     return FileResponse(path, headers=headers)
 
 
+@app.get("/api/image/{image_id}/media-status")
+async def image_media_status(image_id: int):
+    tiers = {}
+    for size in thumbnails.THUMB_TIERS:
+        cached = thumbnails.has_cached_fast(size, image_id)
+        tiers[size] = {
+            "cached": cached,
+            "url": f"/api/thumb/{size}/{image_id}",
+            "cached_url": f"/api/thumb/{size}/{image_id}?cached=1",
+        }
+
+    full_cached = thumbnails.fast_disk_path_entry(thumbnails.FULL_TIER, image_id) is not None
+    tiers[thumbnails.FULL_TIER] = {
+        "cached": full_cached,
+        "url": f"/api/full/{image_id}",
+        "cached_url": f"/api/full/{image_id}?cached=1",
+    }
+    best_cached = next(
+        (tier for tier in (thumbnails.FULL_TIER, "lg", "md", "sm") if tiers.get(tier, {}).get("cached")),
+        None,
+    )
+    return {"id": image_id, "tiers": tiers, "best_cached": best_cached}
+
+
+@app.post("/api/images/warm")
+async def warm_images(request: Request):
+    """Mark current/nearby images as hot and schedule SSD cache warming."""
+    body = await request.json()
+    tier_requests = body.get("tiers") or {}
+    requested: dict[str, list[int]] = {}
+    all_ids: set[int] = set()
+
+    for tier, values in tier_requests.items():
+        if tier not in thumbnails.ALL_TIERS:
+            continue
+        ids = []
+        for value in values or []:
+            try:
+                image_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if image_id <= 0:
+                continue
+            ids.append(image_id)
+            all_ids.add(image_id)
+        if ids:
+            requested[tier] = ids[:96]
+
+    if not requested or not all_ids:
+        return {"scheduled": {}, "images": 0}
+
+    rows_by_id = await db.get_images_by_ids(list(all_ids))
+    scheduled = {}
+    for tier, ids in requested.items():
+        rows = [rows_by_id[image_id] for image_id in ids if image_id in rows_by_id]
+        if not rows:
+            scheduled[tier] = 0
+            continue
+        if tier in thumbnails.THUMB_TIERS:
+            scheduled[tier] = await thumbnails.prefetch_images(
+                rows,
+                tier,
+                limit=len(rows),
+                hot=True,
+            )
+        elif tier == thumbnails.FULL_TIER:
+            count = 0
+            for row in rows[:12]:
+                ext = os.path.splitext(row["filepath"])[1].lower()
+                if ext not in _BROWSER_IMAGE_EXTENSIONS:
+                    continue
+                await thumbnails.schedule_full_image_cache(row["filepath"], row["id"], hot=True)
+                count += 1
+            scheduled[tier] = count
+
+    return {"scheduled": scheduled, "images": len(all_ids)}
+
+
 # --- Cache Status ---
+
+def _cache_recommendations(cache: dict, eligible_images: int, total_images: int) -> dict:
+    estimates = thumbnails.cache_archive_estimates()
+    tiers = {}
+    for tier_name in thumbnails.ALL_TIERS:
+        avg_bytes = int(estimates.get("avg_bytes", {}).get(tier_name) or thumbnails.estimated_tier_bytes(tier_name))
+        target_count = total_images if tier_name == thumbnails.FULL_TIER else eligible_images
+        full_archive_bytes = avg_bytes * max(0, int(target_count))
+        budget_bytes = int(cache.get("disk", {}).get("tiers", {}).get(tier_name, {}).get("budget_bytes") or 0)
+        estimated_cached = int(budget_bytes / avg_bytes) if avg_bytes > 0 else 0
+        tiers[tier_name] = {
+            "avg_bytes": avg_bytes,
+            "sample_count": int(estimates.get("sample_count", {}).get(tier_name) or 0),
+            "full_archive_bytes": full_archive_bytes,
+            "budget_bytes": budget_bytes,
+            "estimated_cached": min(target_count, estimated_cached),
+            "coverage_pct": round((budget_bytes / full_archive_bytes) * 100, 1) if full_archive_bytes > 0 else 0.0,
+        }
+
+    return {
+        "eligible_images": eligible_images,
+        "total_images": total_images,
+        "budget": thumbnails.cache_budget_config(),
+        "tiers": tiers,
+    }
+
 
 async def build_cache_status(ahead: int = 100):
     stats = await db.get_stats()
-    target_total = stats["kept"] + stats["maybe"]
+    active_total = stats["kept"] + stats["maybe"]
     cache = thumbnails.cache_stats()
 
     memory = cache["memory"]
@@ -332,7 +448,7 @@ async def build_cache_status(ahead: int = 100):
     ) if disk["limit_bytes"] > 0 else 0.0
 
     for tier_name, tier in disk["tiers"].items():
-        progress_total = target_total if tier_name in thumbnails.THUMB_TIERS else stats["total_images"]
+        progress_total = active_total if tier_name in thumbnails.THUMB_TIERS else stats["total_images"]
         tier["progress_total"] = progress_total
         tier["progress_pct"] = round((tier["count"] / progress_total) * 100, 1) if progress_total > 0 else 0.0
         tier["utilization_pct"] = round(
@@ -342,8 +458,12 @@ async def build_cache_status(ahead: int = 100):
 
     result = {
         **cache,
-        "eligible_images": target_total,
-        "pregen": thumbnails.get_pregen_status(target_total, cache),
+        "eligible_images": active_total,
+        "recommendations": _cache_recommendations(cache, active_total, stats["total_images"]),
+        "pregen": thumbnails.get_pregen_status(active_total, cache),
+        "governor": resource_governor.get_background_decision(
+            thumbnails.get_idle_seconds()
+        ).to_dict(),
     }
 
     if ahead > 0:
@@ -406,10 +526,35 @@ async def api_settings():
     }
 
 
+@app.post("/api/image/{image_id}/flag")
+async def api_set_image_flag(image_id: int, request: Request):
+    body = await request.json()
+    flag = body.get("flag", "unflagged")
+    if flag not in ("picked", "unflagged", "rejected"):
+        return JSONResponse({"error": "Invalid flag"}, status_code=400)
+
+    image = await db.get_image_by_id(image_id)
+    if not image:
+        return JSONResponse({"error": "Image not found"}, status_code=404)
+
+    await db.set_image_flag(image_id, flag)
+    return {"ok": True, "id": image_id, "flag": flag}
+
+
 @app.post("/api/settings")
 async def api_save_settings(request: Request):
-    saved = settings.save_settings(await request.json())
-    thumbnails.configure(saved)
+    body = await request.json()
+    current = settings.get_settings()
+    saved = settings.save_settings(body)
+    thumbnail_changed = any(
+        int(current.get(field, 0)) != int(saved.get(field, 0))
+        for field in ("thumb_size_sm", "thumb_size_md", "thumb_size_lg", "thumb_quality")
+    )
+    replace_thumbnail_cache = (
+        thumbnail_changed
+        and str(body.get("thumbnail_cache_policy", "keep")).strip().lower() == "replace"
+    )
+    thumbnails.configure({**saved, "_replace_thumbnail_cache": replace_thumbnail_cache})
     return {
         "ok": True,
         "settings": saved,
@@ -454,121 +599,9 @@ async def api_install_ai_model():
     }
 
 
-# --- Cull API ---
-
-@app.get("/api/cull/next")
-async def cull_next(n: int = 10, size: str = "lg", orientation: str = ""):
-    if size not in thumbnails.SIZES:
-        size = "lg"
-
-    if orientation in ("landscape", "portrait"):
-        images = await db.get_unculled_by_orientation(orientation, limit=n)
-    else:
-        images = await db.get_unculled_images(limit=n)
-
-    result = []
-    prefetch_rows = []
-
-    for img in images:
-        d = dict(img)
-        prefetch_rows.append(d)
-        result.append({"id": d["id"], "filename": d["filename"], "thumb_url": f"/api/thumb/{size}/{d['id']}"})
-
-    if prefetch_rows:
-        config = settings.get_settings()
-        await thumbnails.prefetch_images(
-            prefetch_rows,
-            size,
-            limit=min(len(prefetch_rows), config["cull_prefetch_limit"]),
-        )
-
-    stats = await db.get_stats()
-    return {"images": result, "stats": stats}
-
-
-@app.post("/api/cull")
-async def submit_cull(request: Request):
-    body = await request.json()
-    image_id = body.get("image_id")
-    status = body.get("status")
-
-    if status not in ("kept", "maybe", "rejected"):
-        return JSONResponse({"error": "Invalid status"}, status_code=400)
-
-    image = await db.get_image_by_id(image_id)
-    if not image:
-        return JSONResponse({"error": "Image not found"}, status_code=404)
-
-    # Elo adjustment: kept = win vs field (1200), rejected = loss vs field
-    old_elo = image["elo"]
-    if status == "kept":
-        new_elo, _ = pairing.update_elo(old_elo, 1200.0, k=16.0)
-    elif status == "rejected":
-        _, new_elo = pairing.update_elo(1200.0, old_elo, k=16.0)
-    else:  # maybe
-        new_elo = old_elo
-
-    _cull_history.append({"image_id": image_id, "previous_status": image["status"], "previous_elo": old_elo})
-    if len(_cull_history) > 500:
-        _cull_history[:] = _cull_history[-200:]
-    await db.set_image_status_and_elo(image_id, status, new_elo)
-    _invalidate_active_caches()
-    return {"ok": True}
-
-
-@app.post("/api/cull/batch")
-async def submit_cull_batch(request: Request):
-    """Grid cull: receive a list of {image_id, status} decisions."""
-    body = await request.json()
-    decisions_in = body.get("decisions", [])
-    if not decisions_in:
-        return JSONResponse({"error": "No decisions"}, status_code=400)
-
-    image_ids = [d["image_id"] for d in decisions_in]
-    images_map = await db.get_images_by_ids(image_ids)
-
-    db_decisions = []
-    history_batch = []
-
-    for d in decisions_in:
-        image = images_map.get(d["image_id"])
-        if not image:
-            continue
-        status = d["status"]
-        old_elo = image["elo"]
-
-        if status == "kept":
-            new_elo, _ = pairing.update_elo(old_elo, 1200.0, k=16.0)
-        elif status == "rejected":
-            _, new_elo = pairing.update_elo(1200.0, old_elo, k=16.0)
-        else:
-            new_elo = old_elo
-
-        db_decisions.append((d["image_id"], status, new_elo))
-        history_batch.append({"image_id": d["image_id"], "previous_status": image["status"], "previous_elo": old_elo})
-
-    await db.batch_cull(db_decisions)
-    _cull_history.extend(history_batch)
-    if len(_cull_history) > 500:
-        _cull_history[:] = _cull_history[-200:]
-    _invalidate_active_caches()
-    return {"ok": True, "count": len(db_decisions)}
-
-
-@app.post("/api/cull/undo")
-async def cull_undo():
-    if not _cull_history:
-        return JSONResponse({"error": "Nothing to undo"}, status_code=400)
-
-    entry = _cull_history.pop()
-    await db.set_image_status_and_elo(entry["image_id"], entry["previous_status"], entry["previous_elo"])
-    _invalidate_active_caches()
-    return {"ok": True, "image_id": entry["image_id"], "restored_status": entry["previous_status"]}
-
-
 # --- Mosaic Ranking API ---
 
-# Cache for get_kept_images_for_pairing — patched on direct comparisons and
+# Cache for active pairing images — patched on direct comparisons and
 # refreshed after background Elo propagation touches wider neighborhoods.
 _pairing_cache = {"data": None, "by_id": None, "valid": False}
 _matchups_cache = {"data": None, "valid": False}
@@ -577,7 +610,7 @@ async def _get_pairing_images():
     """Cached wrapper — invalidated by mosaic_pick and submit_comparison."""
     if _pairing_cache["valid"] and _pairing_cache["data"] is not None:
         return _pairing_cache["data"]
-    rows = await db.get_kept_images_for_pairing()
+    rows = await db.get_active_images_for_pairing()
     images = [dict(row) for row in rows]
     _pairing_cache["data"] = images
     _pairing_cache["by_id"] = {img["id"]: img for img in images}
@@ -628,18 +661,6 @@ def _schedule_pairing_propagation(coro):
             _invalidate_pairing_cache()
 
     asyncio.create_task(_runner())
-
-
-def _invalidate_active_caches():
-    _invalidate_pairing_cache()
-    _folders_cache["expires"] = 0
-    _collections_cache["key"] = None
-    _collections_cache["data"] = None
-    try:
-        import embed_cache
-        embed_cache.invalidate()
-    except Exception:
-        pass
 
 
 def _top_indices_desc(values, limit: int, exclude_index: int | None = None):
@@ -818,9 +839,9 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
 @app.get("/api/mosaic/next")
 async def mosaic_next(
     n: int = 12, exclude: str = "", strategy: str = "explore", grid_elo: float = 0,
-    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "", flag: str = "",
 ):
-    """Get kept images for mosaic ranking with configurable sampling strategy."""
+    """Get active images for mosaic ranking with configurable sampling strategy."""
     exclude_ids = set()
     if exclude:
         exclude_ids = {int(x) for x in exclude.split(",") if x.strip().isdigit()}
@@ -831,10 +852,10 @@ async def mosaic_next(
         images = await _get_pairing_images()
 
     if len(images) < 2:
-        return {"images": [], "total_kept": len(images)}
+        return {"images": [], "total_images": len(images), "total_kept": len(images)}
 
     import random
-    candidates = [img.copy() for img in images if img["id"] not in exclude_ids]
+    candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
 
     # Apply filters
     if orientation in ("landscape", "portrait"):
@@ -851,6 +872,8 @@ async def mosaic_next(
         candidates = [c for c in candidates if c["elo"] >= threshold]
     if folder:
         candidates = [c for c in candidates if f"/{folder}/" in c.get("filepath", "")]
+    if flag in ("picked", "unflagged", "rejected"):
+        candidates = [c for c in candidates if (c.get("flag") or "unflagged") == flag]
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
         img["effective_elo"] = img["elo"]
@@ -888,6 +911,7 @@ async def mosaic_next(
             "id": img["id"],
             "filename": img["filename"],
             "elo": round(img["effective_elo"], 1),
+            "flag": img.get("flag") or "unflagged",
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img['id']}",
         })
@@ -896,12 +920,12 @@ async def mosaic_next(
         config = settings.get_settings()
         await thumbnails.prefetch_images(
             sample,
-            "sm",
+            "md",
             limit=min(len(sample), config["mosaic_prefetch_limit"]),
         )
 
     stats = await db.get_stats()
-    return {"images": result, "total_kept": len(images), "stats": stats}
+    return {"images": result, "total_images": len(images), "total_kept": len(images), "stats": stats}
 
 
 @app.post("/api/mosaic/pick")
@@ -1001,7 +1025,7 @@ async def propagation_predict(request: Request):
 @app.get("/api/compare/next")
 async def compare_next(
     n: int = 5, mode: str = "swiss",
-    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "",
+    orientation: str = "", compared: str = "", min_stars: int = 0, folder: str = "", flag: str = "",
 ):
     if mode == "topn":
         images = await db.get_top_images(limit=50)
@@ -1009,7 +1033,7 @@ async def compare_next(
         images = await _get_pairing_images()
 
     if len(images) < 2:
-        return {"pairs": [], "total_kept": len(images)}
+        return {"pairs": [], "total_images": len(images), "total_kept": len(images)}
 
     image_dicts = [dict(img) for img in images]
 
@@ -1028,9 +1052,11 @@ async def compare_next(
         image_dicts = [c for c in image_dicts if c["elo"] >= threshold]
     if folder:
         image_dicts = [c for c in image_dicts if f"/{folder}/" in c.get("filepath", "")]
+    if flag in ("picked", "unflagged", "rejected"):
+        image_dicts = [c for c in image_dicts if (c.get("flag") or "unflagged") == flag]
 
     if len(image_dicts) < 2:
-        return {"pairs": [], "total_kept": len(image_dicts)}
+        return {"pairs": [], "total_images": len(image_dicts), "total_kept": len(image_dicts)}
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
@@ -1040,8 +1066,8 @@ async def compare_next(
         prefetch_rows.append(left)
         prefetch_rows.append(right)
         result.append({
-            "left": {"id": left["id"], "filename": left["filename"], "elo": round(left["elo"], 1), "thumb_url": f"/api/thumb/md/{left['id']}"},
-            "right": {"id": right["id"], "filename": right["filename"], "elo": round(right["elo"], 1), "thumb_url": f"/api/thumb/md/{right['id']}"},
+            "left": {"id": left["id"], "filename": left["filename"], "elo": round(left["elo"], 1), "flag": left.get("flag") or "unflagged", "thumb_url": f"/api/thumb/md/{left['id']}"},
+            "right": {"id": right["id"], "filename": right["filename"], "elo": round(right["elo"], 1), "flag": right.get("flag") or "unflagged", "thumb_url": f"/api/thumb/md/{right['id']}"},
         })
 
     if prefetch_rows:
@@ -1053,7 +1079,7 @@ async def compare_next(
         )
 
     stats = await db.get_stats()
-    return {"pairs": result, "total_kept": len(image_dicts), "stats": stats}
+    return {"pairs": result, "total_images": len(image_dicts), "total_kept": len(image_dicts), "stats": stats}
 
 
 @app.post("/api/compare")
@@ -1105,7 +1131,7 @@ async def compare_undo():
 async def api_rankings(
     limit: int = 100, offset: int = 0, sort: str = "elo",
     orientation: str = "", compared: str = "", min_stars: int = 0,
-    folder: str = "", q: str = "",
+    folder: str = "", flag: str = "", q: str = "",
 ):
     # When a search query is present, pre-filter to images above similarity threshold
     search_ids = None
@@ -1135,7 +1161,7 @@ async def api_rankings(
         images = await db.get_rankings(
             limit=len(search_ids), offset=0, sort="elo",
             orientation=orientation, compared=compared, min_stars=min_stars,
-            folder=folder, id_filter=search_ids,
+            folder=folder, flag=flag, id_filter=search_ids,
         )
         all_results = []
         for img in images:
@@ -1143,7 +1169,8 @@ async def api_rankings(
             all_results.append({
                 "id": d["id"], "filename": d["filename"],
                 "elo": round(d["elo"], 1), "comparisons": d["comparisons"],
-                "status": d["status"], "aspect_ratio": d.get("aspect_ratio") or 1.5,
+                "status": d["status"], "flag": d.get("flag") or "unflagged",
+                "aspect_ratio": d.get("aspect_ratio") or 1.5,
                 "thumb_url": f"/api/thumb/sm/{d['id']}",
                 "similarity": round(search_scores.get(d["id"], 0), 4),
             })
@@ -1159,7 +1186,7 @@ async def api_rankings(
     images = await db.get_rankings(
         limit=limit, offset=offset, sort=sort,
         orientation=orientation, compared=compared, min_stars=min_stars,
-        folder=folder, id_filter=search_ids,
+        folder=folder, flag=flag, id_filter=search_ids,
     )
     if images:
         await thumbnails.prefetch_images(
@@ -1176,6 +1203,7 @@ async def api_rankings(
             "elo": round(d["elo"], 1),
             "comparisons": d["comparisons"],
             "status": d["status"],
+            "flag": d.get("flag") or "unflagged",
             "aspect_ratio": d.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{d['id']}",
         }
@@ -1201,6 +1229,7 @@ async def export_rankings(format: str = "json", ids: str = ""):
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
             "status": img["status"],
+            "flag": img.get("flag") or "unflagged",
         }
         for i, img in enumerate(images)
     ]
@@ -1257,6 +1286,7 @@ async def api_search(q: str = "", limit: int = 50):
             "filename": img["filename"],
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
+            "flag": img.get("flag") or "unflagged",
             "similarity": round(score, 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img_id}",
@@ -1298,6 +1328,7 @@ async def api_similar(image_id: int, limit: int = 50):
             "filename": img["filename"],
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
+            "flag": img.get("flag") or "unflagged",
             "similarity": round(float(similarities[idx]), 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img_id}",
@@ -1617,8 +1648,8 @@ async def build_ai_status():
     """Embedding worker + model install status for UI surfaces."""
     embedded = await db.get_embedding_count()
     stats = await db.get_stats()
-    total_kept = stats["kept"] + stats["maybe"]
-    remaining = max(total_kept - embedded, 0)
+    total_images = stats["kept"] + stats["maybe"]
+    remaining = max(total_images - embedded, 0)
 
     worker_status = {}
     try:
@@ -1640,6 +1671,9 @@ async def build_ai_status():
             "session_embed_seconds": 0.0,
             "recent_images_per_min": 0.0,
             "overall_images_per_min": 0.0,
+            "governor": resource_governor.get_background_decision(
+                thumbnails.get_idle_seconds()
+            ).to_dict(),
         }
 
     model_status = ai_models.get_model_status()
@@ -1657,11 +1691,12 @@ async def build_ai_status():
     overall_rate = float(worker_status.get("overall_images_per_min") or 0.0)
     effective_rate = recent_rate if recent_rate > 0 else overall_rate
     eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
-    progress_pct = round((embedded / total_kept) * 100, 1) if total_kept > 0 else 0.0
+    progress_pct = round((embedded / total_images) * 100, 1) if total_images > 0 else 0.0
 
     return {
         "embedded": embedded,
-        "total_kept": total_kept,
+        "total_images": total_images,
+        "total_kept": total_images,
         "remaining": remaining,
         "progress_pct": progress_pct,
         "compared": compared,
@@ -1684,6 +1719,9 @@ async def build_ai_status():
         "recent_images_per_min": recent_rate,
         "overall_images_per_min": overall_rate,
         "eta_seconds": eta_seconds,
+        "governor": worker_status.get("governor") or resource_governor.get_background_decision(
+            thumbnails.get_idle_seconds()
+        ).to_dict(),
     }
 
 

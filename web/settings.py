@@ -20,7 +20,12 @@ DEFAULT_SETTINGS = {
     "ssd_cache_dir": os.path.join(WEB_DIR, ".thumbcache"),
     "ssd_cache_gb": 100,
     "memory_cache_gb": 0.5,
+    "cache_profile": "original_heavy",
     "pregenerate_on_idle": True,
+    "background_thumb_workers": 2,
+    "pregen_generate_batch": 16,
+    "pregen_batch_pause_ms": 250,
+    "embed_batch_pause_ms": 250,
     "embed_model_id": "Qwen/Qwen3-VL-Embedding-2B",
     "embed_model_revision": "main",
     "embed_model_dir": _default_model_dir("Qwen/Qwen3-VL-Embedding-2B"),
@@ -33,6 +38,10 @@ INT_RANGES = {
     "thumb_size_lg": (128, 8192),
     "thumb_quality": (40, 100),
     "ssd_cache_gb": (0, 4096),
+    "background_thumb_workers": (1, 4),
+    "pregen_generate_batch": (4, 64),
+    "pregen_batch_pause_ms": (0, 5000),
+    "embed_batch_pause_ms": (0, 5000),
 }
 
 FLOAT_RANGES = {
@@ -42,6 +51,8 @@ FLOAT_RANGES = {
 
 _lock = threading.Lock()
 _settings = None
+
+CACHE_PROFILES = ("browse_fast", "balanced", "original_heavy")
 
 BROWSER_CACHE_MAX_AGE = 86400
 BROWSER_CACHE_STALE_WHILE_REVALIDATE = 604800
@@ -75,7 +86,7 @@ def _derive_runtime_tuning(memory_cache_gb: float) -> dict:
 
     cache_aggression = max(1, min(4, int(memory_cache_gb / 0.5) if memory_cache_gb > 0 else 1))
     prefetch_target = min(user_workers - 2, user_workers // 2 + cache_aggression - 1)
-    prefetch_workers = _clamp(max(2, prefetch_target), 2, 8)
+    prefetch_workers = _clamp(max(1, prefetch_target), 1, 3)
     warm_factor = max(1, prefetch_workers * cache_aggression)
 
     return {
@@ -84,7 +95,7 @@ def _derive_runtime_tuning(memory_cache_gb: float) -> dict:
         "user_workers": user_workers,
         "prefetch_workers": prefetch_workers,
         "scan_prefetch_limit": _clamp(warm_factor * 8, 24, 96),
-        "cull_prefetch_limit": _clamp(warm_factor * 6, 12, 48),
+        "review_prefetch_limit": _clamp(warm_factor * 6, 12, 48),
         "compare_prefetch_limit": _clamp(warm_factor * 4, 8, 32),
         "mosaic_prefetch_limit": _clamp(warm_factor * 6, 12, 48),
         "browser_cache_max_age": BROWSER_CACHE_MAX_AGE,
@@ -153,6 +164,9 @@ def normalize_settings(raw: dict | None) -> dict:
         _default_model_dir(model_id),
     )
 
+    profile = str(raw.get("cache_profile", normalized["cache_profile"])).strip().lower()
+    normalized["cache_profile"] = profile if profile in CACHE_PROFILES else DEFAULT_SETTINGS["cache_profile"]
+
     for key, (min_value, max_value) in INT_RANGES.items():
         value = raw.get(key, normalized[key])
         try:
@@ -176,6 +190,10 @@ def normalize_settings(raw: dict | None) -> dict:
 
     normalized["pregenerate_on_idle"] = bool(raw.get("pregenerate_on_idle", normalized["pregenerate_on_idle"]))
     normalized.update(_derive_runtime_tuning(normalized["memory_cache_gb"]))
+    normalized["prefetch_workers"] = min(
+        normalized["prefetch_workers"],
+        normalized["background_thumb_workers"],
+    )
 
     return normalized
 
@@ -232,4 +250,5 @@ def settings_metadata() -> dict:
     return {
         "settings_path": SETTINGS_PATH,
         "defaults": copy.deepcopy(DEFAULT_SETTINGS),
+        "cache_profiles": list(CACHE_PROFILES),
     }

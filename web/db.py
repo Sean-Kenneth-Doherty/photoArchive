@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS images (
     elo REAL DEFAULT 1200.0,
     comparisons INTEGER DEFAULT 0,
     status TEXT DEFAULT 'kept',
+    flag TEXT DEFAULT 'unflagged',
     orientation TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -87,6 +88,12 @@ CREATE INDEX IF NOT EXISTS idx_images_status_filepath ON images(status, filepath
 -- For LRU eviction ordering (avoids TEMP B-TREE sort during budget enforcement)
 CREATE INDEX IF NOT EXISTS idx_cache_entries_root_size_accessed_id
 ON cache_entries(cache_root, size, last_accessed, image_id);
+
+CREATE TABLE IF NOT EXISTS cache_metadata (
+    cache_root TEXT PRIMARY KEY,
+    thumb_config_signature TEXT NOT NULL,
+    thumb_config_changed_at REAL NOT NULL
+);
 """
 
 _stats_cache = {"data": None, "expires": 0}
@@ -117,6 +124,7 @@ async def init_db():
         # Migrations: add columns if missing
         for col, defn in [
             ("orientation", "TEXT DEFAULT NULL"),
+            ("flag", "TEXT DEFAULT 'unflagged'"),
             ("predicted_elo", "REAL DEFAULT NULL"),
             ("uncertainty", "REAL DEFAULT NULL"),
             ("aspect_ratio", "REAL DEFAULT NULL"),
@@ -125,6 +133,7 @@ async def init_db():
                 await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
             except Exception:
                 pass  # Column already exists
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_images_flag ON images(flag)")
         # Backfill aspect_ratio from orientation for images that don't have it yet
         await db.execute(
             "UPDATE images SET aspect_ratio = 1.5 WHERE orientation = 'landscape' AND aspect_ratio IS NULL"
@@ -206,11 +215,11 @@ async def insert_images_batch(rows: list[tuple[str, str]]):
         await db.close()
 
 
-async def get_unculled_images(limit: int = 10, offset: int = 0):
+async def get_recent_active_images(limit: int = 10):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath FROM images WHERE status = 'unculled' ORDER BY RANDOM() LIMIT ?",
+            "SELECT id, filename, filepath FROM images WHERE status IN ('kept', 'maybe') ORDER BY id DESC LIMIT ?",
             (limit,),
         )
         return await cursor.fetchall()
@@ -238,6 +247,17 @@ async def set_image_status_and_elo(image_id: int, status: str, new_elo: float):
         )
         await db.commit()
         _invalidate_stats_cache()
+    finally:
+        await db.close()
+
+
+async def set_image_flag(image_id: int, flag: str):
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE images SET flag = ? WHERE id = ?", (flag, image_id)
+        )
+        await db.commit()
     finally:
         await db.close()
 
@@ -274,12 +294,12 @@ async def undo_last_cull():
         await db.close()
 
 
-async def get_kept_images_for_pairing():
-    """Get kept images sorted by Elo for Swiss-system pairing."""
+async def get_active_images_for_pairing():
+    """Get active images sorted by Elo for Swiss-system pairing."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons, orientation, aspect_ratio FROM images "
+            "SELECT id, filename, filepath, elo, comparisons, flag, orientation, aspect_ratio FROM images "
             "INDEXED BY idx_images_active_elo "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
         )
@@ -371,7 +391,7 @@ STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
                        orientation: str = "", compared: str = "", min_stars: int = 0,
-                       folder: str = "", id_filter: set = None):
+                       folder: str = "", flag: str = "", id_filter: set = None):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -397,6 +417,10 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             conditions.append("filepath LIKE ?")
             params.append(f"%/{folder}/%")
 
+        if flag in ("picked", "unflagged", "rejected"):
+            conditions.append("COALESCE(flag, 'unflagged') = ?")
+            params.append(flag)
+
         if id_filter is not None:
             if not id_filter:
                 return []
@@ -410,7 +434,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
         # Skip index hint when using id_filter — SQLite picks the right plan
         if id_filter is not None:
             cursor = await db.execute(
-                f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+                f"SELECT id, filename, filepath, elo, comparisons, status, flag, aspect_ratio "
                 f"FROM images WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 params,
             )
@@ -419,7 +443,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             if orientation in ("landscape", "portrait") and sort == "elo":
                 index_name = "idx_images_active_orientation_elo"
             cursor = await db.execute(
-                f"SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+                f"SELECT id, filename, filepath, elo, comparisons, status, flag, aspect_ratio "
                 f"FROM images INDEXED BY {index_name} "
                 f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
                 params,
@@ -489,7 +513,7 @@ async def get_top_images(limit: int = 50):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, filename, filepath, elo, comparisons FROM images "
+            "SELECT id, filename, filepath, elo, comparisons, flag FROM images "
             "INDEXED BY idx_images_active_elo "
             "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC LIMIT ?",
             (limit,),

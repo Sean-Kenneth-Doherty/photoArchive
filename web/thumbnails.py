@@ -6,10 +6,12 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import db
+import resource_governor
 from PIL import Image, ImageOps
 
 Image.MAX_IMAGE_PIXELS = None
@@ -24,6 +26,7 @@ SIZES = {
 }
 THUMB_QUALITY = 92
 CACHE_VERSION = "v3"
+CACHE_PROFILE = "original_heavy"
 SSD_CACHE_DIR = os.getenv(
     "PHOTOARCHIVE_THUMB_CACHE_DIR",
     os.path.join(os.path.dirname(__file__), ".thumbcache"),
@@ -33,9 +36,15 @@ MEMORY_CACHE_BYTES = 512 * 1024 * 1024
 PREGENERATE_ON_IDLE = True
 PREGENERATE_IDLE_SECONDS = 1.0
 PREGENERATE_SCAN_BATCH = 1024
-PREGENERATE_GENERATE_BATCH = 256
+PREGENERATE_GENERATE_BATCH = 16
+PREGENERATE_BATCH_PAUSE_SECONDS = 0.25
+THUMBNAIL_RETRY_SECONDS = 6 * 60 * 60
 BROWSER_CACHE_MAX_AGE = 86400
 BROWSER_CACHE_STALE_WHILE_REVALIDATE = 604800
+HOT_LG_RESERVE_FRACTION = 0.35
+HOT_LG_RESERVE_MIN_BYTES = 2 * 1024 * 1024 * 1024
+HOT_LG_RESERVE_MAX_BYTES = 64 * 1024 * 1024 * 1024
+COLD_CACHE_ACCESS_OFFSET_SECONDS = 45 * 24 * 60 * 60
 _executor_workers = 4
 _prefetch_workers_count = 6
 
@@ -55,9 +64,10 @@ _meta_lock = threading.Lock()
 
 # Shared in-flight work so a burst of requests only performs one source read.
 _inflight: dict[tuple[str, int, str], asyncio.Task[object]] = {}
+_thumbnail_retry_after: dict[tuple[str, int, str], float] = {}
 
 # Write-behind queue for cache DB entries — reduces _meta_lock contention.
-_write_queue: list[tuple[str, int, str, str, int]] = []  # (size, image_id, sig, path, bytes)
+_write_queue: list[tuple[str, int, str, str, int, float]] = []  # (size, image_id, sig, path, bytes, access)
 _write_queue_lock = threading.Lock()
 
 # Orientation detections pending DB write: image_id -> (orientation, aspect_ratio)
@@ -70,6 +80,7 @@ _pregen_manual_mode = False
 _pregen_manual_pause = False
 _pregen_scan_offsets = {tier: 0 for tier in THUMB_TIERS}
 _last_thumb_config_signature = ""
+_thumb_config_changed_at = 0.0
 _pregen_status = {
     "enabled": True,
     "manual_mode": False,
@@ -82,6 +93,9 @@ _pregen_status = {
     "generated_this_session": 0,
     "last_error": "",
 }
+_pregen_history = deque()
+_pregen_session_started_at: float | None = None
+_pregen_session_generated = 0
 
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
 RAW_EXTENSIONS = {
@@ -102,12 +116,26 @@ _persistent_conn: sqlite3.Connection | None = None
 def _db_connect() -> sqlite3.Connection:
     """Return persistent connection (under _meta_lock, so safe to share)."""
     global _persistent_conn
+    if _persistent_conn is not None:
+        try:
+            _persistent_conn.execute("SELECT 1")
+            return _persistent_conn
+        except sqlite3.ProgrammingError:
+            _persistent_conn = None
+
     if _persistent_conn is None:
         conn = sqlite3.connect(db.DB_PATH, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cache_metadata ("
+            "cache_root TEXT PRIMARY KEY, "
+            "thumb_config_signature TEXT NOT NULL, "
+            "thumb_config_changed_at REAL NOT NULL"
+            ")"
+        )
         _persistent_conn = conn
     return _persistent_conn
 
@@ -126,9 +154,18 @@ def _current_time() -> float:
     return time.time()
 
 
+def _cache_access_time(*, hot: bool) -> float:
+    now = _current_time()
+    return now if hot else now - COLD_CACHE_ACCESS_OFFSET_SECONDS
+
+
 def note_user_activity():
     global _last_user_activity
     _last_user_activity = time.monotonic()
+
+
+def get_idle_seconds() -> float:
+    return max(0.0, time.monotonic() - _last_user_activity)
 
 
 def _ensure_disk_cache_dirs():
@@ -140,30 +177,216 @@ def _ensure_disk_cache_dirs():
     os.makedirs(os.path.join(SSD_CACHE_DIR, FULL_TIER), exist_ok=True)
 
 
-def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
-    """Allocate SSD budget using a fill-from-smallest strategy.
+SSD_REMAINDER_PROFILES = {
+    "browse_fast": {"lg": 0.80, FULL_TIER: 0.20},
+    "balanced": {"lg": 0.55, FULL_TIER: 0.45},
+    "original_heavy": {"lg": 0.35, FULL_TIER: 0.65},
+}
 
-    Prioritizes sm (always 100%), then md, then lg with remainder.
-    This ensures grid browsing is always fast before investing in
-    loupe-quality cache. Full-res tier gets 5% reserved.
-    """
-    allocations = {tier: 0 for tier in ALL_TIERS}
+MEMORY_CACHE_PROFILES = {
+    "browse_fast": {"sm": 0.30, "md": 0.50, "lg": 0.20},
+    "balanced": {"sm": 0.20, "md": 0.45, "lg": 0.35},
+    "original_heavy": {"sm": 0.15, "md": 0.45, "lg": 0.40},
+}
+
+
+def _normalize_ratios(values: dict[str, float], tiers: tuple[str, ...]) -> dict[str, float]:
+    cleaned = {tier: max(0.0, float(values.get(tier, 0.0) or 0.0)) for tier in tiers}
+    total = sum(cleaned.values())
+    if total <= 0:
+        return {tier: 0.0 for tier in tiers}
+    return {tier: cleaned[tier] / total for tier in tiers}
+
+
+def _active_memory_ratios() -> dict[str, float]:
+    return _normalize_ratios(
+        MEMORY_CACHE_PROFILES.get(CACHE_PROFILE, MEMORY_CACHE_PROFILES["original_heavy"]),
+        THUMB_TIERS,
+    )
+
+
+def _allocate_by_ratios(total_bytes: int, ratios: dict[str, float], tiers: tuple[str, ...]) -> dict[str, int]:
     total = max(0, int(total_bytes))
+    allocations = {tier: 0 for tier in tiers}
     if total <= 0:
         return allocations
 
-    # Reserve 5% for full-res cache (used in loupe 1:1 view)
-    full_reserve = int(total * 0.05)
-    thumb_budget = total - full_reserve
-
-    # Fixed proportions calibrated for large photo archives:
-    # sm is tiny (~1% of budget), md moderate (~15%), lg dominates (~79%)
-    # This ensures sm is always fully cached for grid browsing.
-    proportions = {"sm": 0.01, "md": 0.15, "lg": 0.79}
-    for size in THUMB_TIERS:
-        allocations[size] = int(thumb_budget * proportions[size])
-    allocations[FULL_TIER] = full_reserve
+    assigned = 0
+    active_tiers = [tier for tier in tiers if ratios.get(tier, 0.0) > 0]
+    for tier in active_tiers[:-1]:
+        amount = int(total * ratios[tier])
+        allocations[tier] = amount
+        assigned += amount
+    if active_tiers:
+        allocations[active_tiers[-1]] = max(0, total - assigned)
     return allocations
+
+
+def _quality_size_factor() -> float:
+    quality = max(40, min(100, int(THUMB_QUALITY)))
+    if quality >= 92:
+        return 1.0 + (quality - 92) * 0.08
+    if quality >= 80:
+        return 0.45 + ((quality - 80) / 12.0) * 0.55
+    if quality >= 60:
+        return 0.28 + ((quality - 60) / 20.0) * 0.17
+    return 0.18 + ((quality - 40) / 20.0) * 0.10
+
+
+def estimated_tier_bytes(size: str) -> int:
+    base = {
+        "sm": 33 * 1024,
+        "md": 450 * 1024,
+        "lg": 1750 * 1024,
+        FULL_TIER: 20 * 1024 * 1024,
+    }
+    if size == FULL_TIER:
+        return base[FULL_TIER]
+    return max(1, int(base.get(size, base["md"]) * _quality_size_factor()))
+
+
+def _cache_archive_estimates() -> dict:
+    fallbacks = {tier: estimated_tier_bytes(tier) for tier in ALL_TIERS}
+    estimates = {
+        "active_images": 0,
+        "total_images": 0,
+        "avg_bytes": dict(fallbacks),
+        "sample_count": {tier: 0 for tier in ALL_TIERS},
+        "needed_bytes": {tier: 0 for tier in ALL_TIERS},
+    }
+    try:
+        with _meta_lock:
+            conn = _db_connect()
+            row = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN status IN ('kept', 'maybe') THEN 1 ELSE 0 END) AS active_images, "
+                "COUNT(*) AS total_images "
+                "FROM images"
+            ).fetchone()
+            active_images = int(row["active_images"] or 0)
+            total_images = int(row["total_images"] or 0)
+            rows = conn.execute(
+                "SELECT size, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes "
+                "FROM cache_entries WHERE cache_root = ? AND (size = ? OR created_at >= ?) GROUP BY size",
+                (SSD_CACHE_DIR, FULL_TIER, _thumb_config_changed_at),
+            ).fetchall()
+    except Exception:
+        active_images = 0
+        total_images = 0
+        rows = []
+
+    for row in rows:
+        size = row["size"]
+        if size not in estimates["avg_bytes"]:
+            continue
+        count = int(row["count"] or 0)
+        size_bytes = int(row["bytes"] or 0)
+        if count > 0 and size_bytes > 0:
+            estimates["avg_bytes"][size] = max(1, int(size_bytes / count))
+            estimates["sample_count"][size] = count
+
+    estimates["active_images"] = active_images
+    estimates["total_images"] = total_images
+    for tier in THUMB_TIERS:
+        estimates["needed_bytes"][tier] = estimates["avg_bytes"][tier] * active_images
+    estimates["needed_bytes"][FULL_TIER] = estimates["avg_bytes"][FULL_TIER] * total_images
+    return estimates
+
+
+def cache_archive_estimates() -> dict:
+    return _cache_archive_estimates()
+
+
+def _allocate_weighted_capped(total_bytes: int, weights: dict[str, float], caps: dict[str, int]) -> dict[str, int]:
+    tiers = tuple(caps.keys())
+    ratios = _normalize_ratios(weights, tiers)
+    allocations = {tier: 0 for tier in tiers}
+    remaining = max(0, int(total_bytes))
+    if remaining <= 0:
+        return allocations
+
+    rough = _allocate_by_ratios(remaining, ratios, tiers)
+    for tier in tiers:
+        allocations[tier] = min(max(0, int(caps.get(tier, 0))), rough.get(tier, 0))
+    remaining -= sum(allocations.values())
+
+    for tier in sorted(tiers, key=lambda item: ratios.get(item, 0.0), reverse=True):
+        if remaining <= 0:
+            break
+        room = max(0, int(caps.get(tier, 0)) - allocations[tier])
+        take = min(room, remaining)
+        allocations[tier] += take
+        remaining -= take
+    return allocations
+
+
+def _allocate_disk_budget(total_bytes: int) -> dict[str, int]:
+    total = max(0, int(total_bytes))
+    allocations = {tier: 0 for tier in ALL_TIERS}
+    if total <= 0:
+        return allocations
+
+    estimates = _cache_archive_estimates()
+    needed = estimates["needed_bytes"]
+    remaining = total
+
+    for tier in ("sm", "md"):
+        amount = min(remaining, int(needed.get(tier, 0) or 0))
+        allocations[tier] = amount
+        remaining -= amount
+        if remaining <= 0:
+            return allocations
+
+    remainder_weights = SSD_REMAINDER_PROFILES.get(
+        CACHE_PROFILE,
+        SSD_REMAINDER_PROFILES["original_heavy"],
+    )
+    remainder = _allocate_weighted_capped(
+        remaining,
+        remainder_weights,
+        {
+            "lg": int(needed.get("lg", 0) or 0),
+            FULL_TIER: int(needed.get(FULL_TIER, 0) or 0),
+        },
+    )
+    allocations["lg"] = remainder["lg"]
+    allocations[FULL_TIER] = remainder[FULL_TIER]
+
+    leftover = remaining - allocations["lg"] - allocations[FULL_TIER]
+    if leftover > 0:
+        allocations["md"] += leftover
+    return allocations
+
+
+def _background_tier_budget(size: str) -> int:
+    budget = int(_disk_allocations.get(size, 0) or 0)
+    if size != "lg" or budget <= 0:
+        return budget
+
+    needed = int(_cache_archive_estimates()["needed_bytes"].get("lg", 0) or 0)
+    if needed <= 0 or budget >= int(needed * 0.95):
+        return budget
+
+    reserve = min(
+        budget,
+        max(
+            HOT_LG_RESERVE_MIN_BYTES,
+            min(HOT_LG_RESERVE_MAX_BYTES, int(budget * HOT_LG_RESERVE_FRACTION)),
+        ),
+    )
+    return max(0, budget - reserve)
+
+
+def cache_budget_config() -> dict:
+    memory_allocations = _allocate_by_ratios(MEMORY_CACHE_BYTES, _active_memory_ratios(), THUMB_TIERS)
+    ssd_ratios = _normalize_ratios(_disk_allocations, ALL_TIERS)
+    return {
+        "profile": CACHE_PROFILE,
+        "ssd_ratios": ssd_ratios,
+        "memory_ratios": _active_memory_ratios(),
+        "ssd_allocations": dict(_disk_allocations),
+        "memory_allocations": memory_allocations,
+    }
 
 
 _SOURCE_STAT_CACHE_MAX = 25000
@@ -276,7 +499,7 @@ def _memory_get(size: str, image_id: int, source_signature: str) -> bytes | None
 def _memory_tier_budget(size: str) -> int:
     if MEMORY_CACHE_BYTES <= 0:
         return 0
-    ratios = {"sm": 0.12, "md": 0.38, "lg": 0.50}
+    ratios = _active_memory_ratios()
     return int(MEMORY_CACHE_BYTES * ratios.get(size, 0.0))
 
 
@@ -426,14 +649,15 @@ def _enforce_tier_budget_locked(conn: sqlite3.Connection, size: str):
     if total <= budget:
         return
 
-    # Evict least-valuable images first: low Elo, low comparisons, oldest access.
-    # This keeps your best-ranked photos in fast cache.
+    # Evict cold background entries before recently viewed/warmed images.
+    # Elo is a secondary tie-breaker once access recency has separated hot
+    # session cache from overnight cache building.
     evict_rows = conn.execute(
         "SELECT c.cache_root, c.size, c.image_id, c.path, c.size_bytes "
         "FROM cache_entries c "
         "LEFT JOIN images i ON c.image_id = i.id "
         "WHERE c.cache_root = ? AND c.size = ? "
-        "ORDER BY COALESCE(i.elo, 1200) ASC, c.last_accessed ASC",
+        "ORDER BY c.last_accessed ASC, COALESCE(i.elo, 1200) ASC",
         (SSD_CACHE_DIR, size),
     ).fetchall()
     for row in evict_rows:
@@ -520,6 +744,34 @@ def _get_disk_entry(
         return row
 
 
+def touch_cached(size: str, filepath: str, image_id: int) -> bool:
+    if size not in ALL_TIERS:
+        return False
+    source_signature = _build_source_signature(filepath, size, image_id)
+    return touch_cached_signature(size, image_id, source_signature)
+
+
+def touch_cached_signature(size: str, image_id: int, source_signature: str | None = None) -> bool:
+    if not SSD_CACHE_DIR or _disk_allocations.get(size, 0) <= 0:
+        return False
+    with _meta_lock:
+        conn = _db_connect()
+        if source_signature:
+            cursor = conn.execute(
+                "UPDATE cache_entries SET last_accessed = ? "
+                "WHERE cache_root = ? AND size = ? AND image_id = ? AND source_signature = ?",
+                (_current_time(), SSD_CACHE_DIR, size, image_id, source_signature),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE cache_entries SET last_accessed = ? "
+                "WHERE cache_root = ? AND size = ? AND image_id = ?",
+                (_current_time(), SSD_CACHE_DIR, size, image_id),
+            )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 # In-memory index: (size, image_id) -> (disk path, source signature).
 # Built on startup and updated on writes/evictions so hot thumbnail requests
 # can skip SQLite without believing stale evicted files still exist.
@@ -589,6 +841,26 @@ def fast_disk_has(size: str, image_id: int, source_signature: str | None = None)
     return False
 
 
+def fast_disk_path_entry(
+    size: str,
+    image_id: int,
+    source_signature: str | None = None,
+) -> tuple[str, str] | None:
+    if not _disk_index_built:
+        _build_disk_path_index()
+    with _disk_index_lock:
+        entry = _disk_path_index.get((size, image_id))
+    if entry is None:
+        return None
+    path, cached_signature = entry
+    if source_signature is not None and cached_signature != source_signature:
+        return None
+    if os.path.exists(path):
+        return cached_signature, path
+    _unindex_disk_entry(size, image_id)
+    return None
+
+
 def fast_disk_read_entry(
     size: str,
     image_id: int,
@@ -647,7 +919,17 @@ def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> byt
     return data
 
 
-def _store_disk_entry(size: str, image_id: int, source_signature: str, path: str, size_bytes: int):
+def _store_disk_entry(
+    size: str,
+    image_id: int,
+    source_signature: str,
+    path: str,
+    size_bytes: int,
+    *,
+    hot: bool = True,
+):
+    now = _current_time()
+    access_time = _cache_access_time(hot=hot)
     with _meta_lock:
         conn = _db_connect()
         previous = conn.execute(
@@ -672,8 +954,8 @@ def _store_disk_entry(size: str, image_id: int, source_signature: str, path: str
                 path,
                 source_signature,
                 int(size_bytes),
-                _current_time(),
-                _current_time(),
+                access_time,
+                now,
             ),
         )
         # Update running total: add new, subtract old (if replacing)
@@ -684,7 +966,7 @@ def _store_disk_entry(size: str, image_id: int, source_signature: str, path: str
         _index_disk_entry(size, image_id, path, source_signature)
 
 
-def _write_thumbnail_to_disk(size: str, image_id: int, source_signature: str, data: bytes):
+def _write_thumbnail_to_disk(size: str, image_id: int, source_signature: str, data: bytes, *, hot: bool):
     budget = _disk_allocations.get(size, 0)
     if not SSD_CACHE_DIR or budget <= 0 or len(data) > budget:
         return
@@ -699,7 +981,7 @@ def _write_thumbnail_to_disk(size: str, image_id: int, source_signature: str, da
     _index_disk_entry(size, image_id, path, source_signature)
     # Queue DB write for bulk flush instead of acquiring _meta_lock per thumbnail.
     with _write_queue_lock:
-        _write_queue.append((size, image_id, source_signature, path, len(data)))
+        _write_queue.append((size, image_id, source_signature, path, len(data), _cache_access_time(hot=hot)))
     _maybe_flush_write_queue()
 
 
@@ -722,7 +1004,8 @@ def _flush_write_queue():
     now = _current_time()
     with _meta_lock:
         conn = _db_connect()
-        for size, image_id, source_signature, path, size_bytes in batch:
+        now = _current_time()
+        for size, image_id, source_signature, path, size_bytes, access_time in batch:
             previous = conn.execute(
                 "SELECT cache_root, size, image_id, path, size_bytes FROM cache_entries "
                 "WHERE cache_root = ? AND size = ? AND image_id = ?",
@@ -736,7 +1019,7 @@ def _flush_write_queue():
                 "INSERT OR REPLACE INTO cache_entries "
                 "(cache_root, size, image_id, path, source_signature, size_bytes, last_accessed, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (SSD_CACHE_DIR, size, image_id, path, source_signature, int(size_bytes), now, now),
+                (SSD_CACHE_DIR, size, image_id, path, source_signature, int(size_bytes), access_time, now),
             )
             if size in _tier_byte_totals:
                 _tier_byte_totals[size] += int(size_bytes) - old_bytes
@@ -754,7 +1037,7 @@ def _maybe_flush_write_queue():
         _flush_write_queue()
 
 
-def _cache_full_image_sync(filepath: str, image_id: int, source_signature: str) -> str:
+def _cache_full_image_sync(filepath: str, image_id: int, source_signature: str, hot: bool = True) -> str:
     if not os.path.exists(filepath):
         return filepath
 
@@ -779,7 +1062,7 @@ def _cache_full_image_sync(filepath: str, image_id: int, source_signature: str) 
     temp_path = f"{path}.{threading.get_ident()}.tmp"
     shutil.copyfile(filepath, temp_path)
     os.replace(temp_path, path)
-    _store_disk_entry(FULL_TIER, image_id, source_signature, path, source_size)
+    _store_disk_entry(FULL_TIER, image_id, source_signature, path, source_size, hot=hot)
 
     row = _get_disk_entry(FULL_TIER, image_id, source_signature)
     if row is not None:
@@ -867,16 +1150,32 @@ def _queue_orientation(image_id: int, img: Image.Image):
         _orientation_queue[image_id] = (orientation, aspect_ratio)
 
 
-def _planned_thumbnail_sizes(filepath: str, image_id: int, requested_size: str) -> list[str]:
+def _planned_thumbnail_sizes(
+    filepath: str,
+    image_id: int,
+    requested_size: str,
+    *,
+    include_smaller_tiers: bool = False,
+) -> list[str]:
     if _source_missing(filepath):
         return []
 
     needed = []
-    for size in THUMB_TIERS:
-        should_consider = size == requested_size or _disk_allocations.get(size, 0) > 0
-        if not should_consider:
+    now = time.time()
+    if include_smaller_tiers:
+        requested_long_side = SIZES.get(requested_size, 0)
+        candidate_sizes = tuple(
+            size for size in THUMB_TIERS
+            if SIZES[size] <= requested_long_side and (size == requested_size or _disk_allocations.get(size, 0) > 0)
+        )
+    else:
+        candidate_sizes = (requested_size,)
+    for size in candidate_sizes:
+        if size not in THUMB_TIERS:
             continue
         source_signature = _build_source_signature(filepath, size, image_id)
+        if _thumbnail_retry_after.get((size, image_id, source_signature), 0) > now:
+            continue
         if _memory_get(size, image_id, source_signature) is not None:
             continue
         # Fast check via in-memory index before expensive DB query.
@@ -885,11 +1184,25 @@ def _planned_thumbnail_sizes(filepath: str, image_id: int, requested_size: str) 
         if _get_disk_entry(size, image_id, source_signature, touch=False) is not None:
             continue
         needed.append(size)
-    return sorted(needed, key=lambda tier: SIZES[tier], reverse=True)
+    if include_smaller_tiers:
+        return sorted(needed, key=lambda tier: SIZES[tier], reverse=True)
+    return needed
 
 
-def _generate_missing_thumbnails_sync(filepath: str, requested_size: str, image_id: int):
-    needed_sizes = _planned_thumbnail_sizes(filepath, image_id, requested_size)
+def _generate_missing_thumbnails_sync(
+    filepath: str,
+    requested_size: str,
+    image_id: int,
+    *,
+    include_smaller_tiers: bool = False,
+    hot: bool = False,
+):
+    needed_sizes = _planned_thumbnail_sizes(
+        filepath,
+        image_id,
+        requested_size,
+        include_smaller_tiers=include_smaller_tiers,
+    )
     if not needed_sizes:
         return
 
@@ -924,12 +1237,17 @@ def _generate_missing_thumbnails_sync(filepath: str, requested_size: str, image_
             data = buf.getvalue()
             source_signature = _build_source_signature(filepath, size, image_id)
             _memory_put(size, image_id, source_signature, data)
-            _write_thumbnail_to_disk(size, image_id, source_signature, data)
+            _write_thumbnail_to_disk(size, image_id, source_signature, data, hot=hot)
+            _thumbnail_retry_after.pop((size, image_id, source_signature), None)
 
             if current is not img:
                 current.close()
             current = variant
     except Exception as e:
+        retry_until = time.time() + THUMBNAIL_RETRY_SECONDS
+        for size in needed_sizes:
+            source_signature = _build_source_signature(filepath, size, image_id)
+            _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
         print(f"Thumbnail error for {filepath}: {e}")
     finally:
         if current is not None and current is not img:
@@ -964,14 +1282,20 @@ async def _run_thumbnail_job(
     size: str,
     image_id: int,
     executor: ThreadPoolExecutor,
+    include_smaller_tiers: bool,
+    hot: bool,
 ):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         executor,
-        _generate_missing_thumbnails_sync,
-        filepath,
-        size,
-        image_id,
+        partial(
+            _generate_missing_thumbnails_sync,
+            filepath,
+            size,
+            image_id,
+            include_smaller_tiers=include_smaller_tiers,
+            hot=hot,
+        ),
     )
 
 
@@ -982,6 +1306,7 @@ async def _ensure_thumbnail_with_executor(
     executor: ThreadPoolExecutor,
     *,
     note_activity: bool,
+    include_smaller_tiers: bool = False,
 ) -> bytes:
     if note_activity:
         note_user_activity()
@@ -1007,7 +1332,7 @@ async def _ensure_thumbnail_with_executor(
     task = _inflight.get(inflight_key)
     if task is None:
         task = asyncio.create_task(
-            _run_thumbnail_job(filepath, size, image_id, executor)
+            _run_thumbnail_job(filepath, size, image_id, executor, include_smaller_tiers, note_activity)
         )
         _inflight[inflight_key] = task
 
@@ -1030,10 +1355,17 @@ async def get_thumbnail(filepath: str, size: str, image_id: int) -> bytes:
         image_id,
         _executor,
         note_activity=True,
+        include_smaller_tiers=False,
     )
 
 
-async def prefetch_images(images: list[dict], size: str, limit: int | None = None) -> int:
+async def prefetch_images(
+    images: list[dict],
+    size: str,
+    limit: int | None = None,
+    *,
+    hot: bool = False,
+) -> int:
     if size not in SIZES or not images:
         return 0
 
@@ -1045,9 +1377,15 @@ async def prefetch_images(images: list[dict], size: str, limit: int | None = Non
         filepath = img.get("filepath")
         if image_id is None or not filepath:
             continue
-        if _memory_get_entry_fast(size, image_id) is not None or fast_disk_has(size, image_id):
+        if _memory_get_entry_fast(size, image_id) is not None:
+            continue
+        if fast_disk_has(size, image_id):
+            if hot:
+                touch_cached(size, filepath, image_id)
             continue
         if has_cached(size, filepath, image_id):
+            if hot:
+                touch_cached(size, filepath, image_id)
             continue
         asyncio.create_task(
             _ensure_thumbnail_with_executor(
@@ -1055,14 +1393,15 @@ async def prefetch_images(images: list[dict], size: str, limit: int | None = Non
                 size,
                 image_id,
                 _prefetch_executor,
-                note_activity=False,
+                note_activity=hot,
+                include_smaller_tiers=True,
             )
         )
         scheduled += 1
     return scheduled
 
 
-async def _run_full_image_job(filepath: str, image_id: int):
+async def _run_full_image_job(filepath: str, image_id: int, hot: bool):
     loop = asyncio.get_running_loop()
     source_signature = _build_source_signature(filepath, FULL_TIER, image_id)
     return await loop.run_in_executor(
@@ -1071,6 +1410,7 @@ async def _run_full_image_job(filepath: str, image_id: int):
         filepath,
         image_id,
         source_signature,
+        hot,
     )
 
 
@@ -1080,19 +1420,21 @@ def get_cached_full_image_path(filepath: str, image_id: int) -> str | None:
     return row["path"] if row is not None else None
 
 
-async def schedule_full_image_cache(filepath: str, image_id: int):
+async def schedule_full_image_cache(filepath: str, image_id: int, *, hot: bool = True):
     if not SSD_CACHE_DIR or _disk_allocations.get(FULL_TIER, 0) <= 0:
         return
     if not os.path.exists(filepath):
         return
 
     source_signature = _build_source_signature(filepath, FULL_TIER, image_id)
+    if touch_cached_signature(FULL_TIER, image_id, source_signature):
+        return
     inflight_key = ("full", image_id, source_signature)
     task = _inflight.get(inflight_key)
     if task is not None:
         return
 
-    task = asyncio.create_task(_run_full_image_job(filepath, image_id))
+    task = asyncio.create_task(_run_full_image_job(filepath, image_id, hot))
     _inflight[inflight_key] = task
 
     async def _release_when_done():
@@ -1117,7 +1459,7 @@ async def get_full_image_path(filepath: str, image_id: int) -> str:
     inflight_key = ("full", image_id, source_signature)
     task = _inflight.get(inflight_key)
     if task is None:
-        task = asyncio.create_task(_run_full_image_job(filepath, image_id))
+        task = asyncio.create_task(_run_full_image_job(filepath, image_id, True))
         _inflight[inflight_key] = task
 
     try:
@@ -1129,7 +1471,7 @@ async def get_full_image_path(filepath: str, image_id: int) -> str:
     return str(result)
 
 
-def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
+def load_embedding_image(filepath: str, image_id: int, *, require_cached: bool = False) -> Image.Image | None:
     """Load an image for embedding. Prefers SSD-cached md thumbnails for speed,
     but falls back to reading the original file from HDD if no cache exists."""
     # Try fast path first (no HDD stat)
@@ -1153,6 +1495,9 @@ def load_embedding_image(filepath: str, image_id: int) -> Image.Image:
             img.close()
             img = converted
         return img
+
+    if require_cached:
+        return None
 
     # No cached thumbnail — load original from HDD and resize to md
     try:
@@ -1196,6 +1541,33 @@ def _set_pregen_state(state: str, message: str = "", phase: str | None = None, e
         _pregen_status["started_at"] = _current_time()
 
 
+def _record_pregen_batch(count: int):
+    global _pregen_session_generated, _pregen_session_started_at
+    if count <= 0:
+        return
+    now = _current_time()
+    if _pregen_session_started_at is None:
+        _pregen_session_started_at = now
+    _pregen_session_generated += count
+    _pregen_history.append({"ended_at": now, "count": int(count)})
+    cutoff = now - 10 * 60
+    while _pregen_history and _pregen_history[0]["ended_at"] < cutoff:
+        _pregen_history.popleft()
+
+
+def _pregen_rates() -> tuple[float, float]:
+    now = _current_time()
+    cutoff = now - 10 * 60
+    while _pregen_history and _pregen_history[0]["ended_at"] < cutoff:
+        _pregen_history.popleft()
+    recent_count = sum(item["count"] for item in _pregen_history)
+    recent_window = max(1.0, min(10 * 60.0, now - _pregen_history[0]["ended_at"])) if _pregen_history else 0.0
+    recent_rate = (recent_count / recent_window) * 60.0 if recent_window > 0 else 0.0
+    session_window = max(1.0, now - _pregen_session_started_at) if _pregen_session_started_at else 0.0
+    overall_rate = (_pregen_session_generated / session_window) * 60.0 if session_window > 0 else 0.0
+    return recent_rate, overall_rate
+
+
 async def _cache_target_total() -> int:
     conn = await db.get_db()
     try:
@@ -1227,7 +1599,17 @@ async def _pregen_candidate_batch(size: str, offset: int, limit: int):
         await conn.close()
 
 
-async def _run_pregen_phase(size: str) -> int:
+async def _run_pregen_phase(size: str, generate_batch: int | None = None) -> int:
+    generate_batch = generate_batch or PREGENERATE_GENERATE_BATCH
+    background_budget = _background_tier_budget(size)
+    if background_budget <= 0:
+        return 0
+
+    with _meta_lock:
+        conn = _db_connect()
+        if _tier_bytes(conn, size) >= background_budget:
+            return 0
+
     offset = _pregen_scan_offsets[size]
     rows = await _pregen_candidate_batch(size, offset, PREGENERATE_SCAN_BATCH)
     if not rows:
@@ -1251,7 +1633,7 @@ async def _run_pregen_phase(size: str) -> int:
         if row["source_signature"] == current_signature and has_cached(size, row["filepath"], row["id"]):
             continue
         pending.append(row)
-        if len(pending) >= PREGENERATE_GENERATE_BATCH:
+        if len(pending) >= generate_batch:
             break
 
     if not pending:
@@ -1262,7 +1644,7 @@ async def _run_pregen_phase(size: str) -> int:
     tasks = [
         _ensure_thumbnail_with_executor(
             row["filepath"], size, row["id"],
-            _prefetch_executor, note_activity=False,
+            _prefetch_executor, note_activity=False, include_smaller_tiers=True,
         )
         for row in pending
     ]
@@ -1271,6 +1653,7 @@ async def _run_pregen_phase(size: str) -> int:
     generated = len(pending)
     _pregen_status["last_generated_at"] = _current_time()
     _pregen_status["generated_this_session"] += generated
+    _record_pregen_batch(generated)
 
     if len(rows) < PREGENERATE_SCAN_BATCH:
         _pregen_scan_offsets[size] = 0
@@ -1317,23 +1700,80 @@ def _thumb_config_signature() -> str:
     return f"{CACHE_VERSION}|{SIZES['sm']}|{SIZES['md']}|{SIZES['lg']}|{THUMB_QUALITY}"
 
 
+def _sync_thumb_config_metadata(new_signature: str, *, replace_thumbnail_cache: bool):
+    global _last_thumb_config_signature, _thumb_config_changed_at
+    now = _current_time()
+
+    with _meta_lock:
+        conn = _db_connect()
+        row = conn.execute(
+            "SELECT thumb_config_signature, thumb_config_changed_at "
+            "FROM cache_metadata WHERE cache_root = ?",
+            (SSD_CACHE_DIR,),
+        ).fetchone()
+        previous_signature = row["thumb_config_signature"] if row else _last_thumb_config_signature
+        previous_changed_at = float(row["thumb_config_changed_at"]) if row else _thumb_config_changed_at
+
+    changed = bool(previous_signature and previous_signature != new_signature)
+    if changed:
+        _clear_memory_tiers(THUMB_TIERS)
+        _thumb_config_changed_at = now
+        if replace_thumbnail_cache:
+            _clear_disk_tiers(THUMB_TIERS)
+    else:
+        _thumb_config_changed_at = previous_changed_at or 0.0
+
+    with _meta_lock:
+        conn = _db_connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_metadata "
+            "(cache_root, thumb_config_signature, thumb_config_changed_at) VALUES (?, ?, ?)",
+            (SSD_CACHE_DIR, new_signature, _thumb_config_changed_at),
+        )
+        conn.commit()
+
+    _last_thumb_config_signature = new_signature
+
+
 def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
     stats = stats or cache_stats()
     phases = {}
+    remaining = 0
     for size in THUMB_TIERS:
         count = stats["disk"]["tiers"][size]["count"]
+        target = target_total
         progress_pct = round((count / target_total) * 100, 1) if target_total > 0 else 0.0
+        if target_total > 0:
+            background_budget = _background_tier_budget(size)
+            avg_bytes = (
+                int(stats["disk"]["tiers"][size]["bytes"] / count)
+                if count > 0 and stats["disk"]["tiers"][size]["bytes"] > 0
+                else estimated_tier_bytes(size)
+            )
+            if avg_bytes > 0 and background_budget > 0:
+                target = min(target_total, max(count, int(background_budget / avg_bytes)))
+            remaining += max(0, target - count)
         phases[size] = {
             "count": count,
-            "total": target_total,
-            "progress_pct": progress_pct,
+            "total": target,
+            "progress_pct": round((count / target) * 100, 1) if target > 0 else progress_pct,
             "budget_bytes": stats["disk"]["tiers"][size]["budget_bytes"],
+            "background_budget_bytes": _background_tier_budget(size),
+            "remaining": max(0, target - count),
         }
+
+    recent_rate, overall_rate = _pregen_rates()
+    effective_rate = recent_rate if recent_rate > 0 else overall_rate
+    eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
 
     return {
         **dict(_pregen_status),
         "idle_seconds": round(max(0.0, time.monotonic() - _last_user_activity), 2),
         "phases": phases,
+        "remaining": remaining,
+        "recent_images_per_min": round(recent_rate, 2),
+        "overall_images_per_min": round(overall_rate, 2),
+        "eta_seconds": eta_seconds,
     }
 
 
@@ -1367,13 +1807,16 @@ def clear_cache() -> dict:
 
 def configure(config: dict):
     global THUMB_QUALITY, SSD_CACHE_DIR, SSD_CACHE_BYTES, MEMORY_CACHE_BYTES
-    global PREGENERATE_ON_IDLE, _memory_cache_bytes
+    global CACHE_PROFILE
+    global PREGENERATE_ON_IDLE, PREGENERATE_GENERATE_BATCH, PREGENERATE_BATCH_PAUSE_SECONDS
+    global _memory_cache_bytes
     global BROWSER_CACHE_MAX_AGE, BROWSER_CACHE_STALE_WHILE_REVALIDATE
     global _executor_workers, _prefetch_workers_count, _executor, _prefetch_executor
-    global _disk_allocations, _last_thumb_config_signature, _pregen_manual_pause
+    global _disk_allocations, _last_thumb_config_signature, _pregen_manual_pause, _thumb_config_changed_at
 
     _flush_write_queue()
     old_cache_dir = SSD_CACHE_DIR
+    replace_thumbnail_cache = _as_bool(config.get("_replace_thumbnail_cache"), False)
 
     SIZES["sm"] = int(config.get("thumb_size_sm", SIZES["sm"]))
     SIZES["md"] = int(config.get("thumb_size_md", SIZES["md"]))
@@ -1397,7 +1840,17 @@ def configure(config: dict):
     except (TypeError, ValueError):
         MEMORY_CACHE_BYTES = int(0.5 * 1024 * 1024 * 1024)
     SSD_CACHE_BYTES = max(0, int(config.get("ssd_cache_gb", 10))) * 1024 * 1024 * 1024
+    profile = str(config.get("cache_profile", CACHE_PROFILE)).strip().lower()
+    CACHE_PROFILE = profile if profile in {"browse_fast", "balanced", "original_heavy"} else "original_heavy"
     PREGENERATE_ON_IDLE = _as_bool(config.get("pregenerate_on_idle"), PREGENERATE_ON_IDLE)
+    PREGENERATE_GENERATE_BATCH = max(
+        4,
+        min(64, int(config.get("pregen_generate_batch", PREGENERATE_GENERATE_BATCH))),
+    )
+    PREGENERATE_BATCH_PAUSE_SECONDS = max(
+        0.0,
+        min(5.0, float(config.get("pregen_batch_pause_ms", 250)) / 1000.0),
+    )
 
     disk_cache_dir = (
         config.get("ssd_cache_dir")
@@ -1410,11 +1863,10 @@ def configure(config: dict):
         _tier_byte_totals.clear()
     _ensure_disk_cache_dirs()
 
-    new_thumb_config_signature = _thumb_config_signature()
-    if _last_thumb_config_signature and new_thumb_config_signature != _last_thumb_config_signature:
-        _clear_memory_tiers(THUMB_TIERS)
-        _clear_disk_tiers(THUMB_TIERS)
-    _last_thumb_config_signature = new_thumb_config_signature
+    _sync_thumb_config_metadata(
+        _thumb_config_signature(),
+        replace_thumbnail_cache=replace_thumbnail_cache,
+    )
 
     _disk_allocations = _allocate_disk_budget(SSD_CACHE_BYTES)
 
@@ -1498,11 +1950,22 @@ async def run_prefetch_worker():
                 _target_total_at = now
             target_total = _target_total_cache
             if target_total <= 0:
-                _set_pregen_state("idle", "No kept or maybe images to pre-generate.")
+                _set_pregen_state("idle", "No images available to warm.")
                 await asyncio.sleep(5)
                 continue
 
-            phases = [size for size in THUMB_TIERS if _disk_allocations.get(size, 0) > 0]
+            decision = resource_governor.get_background_decision(get_idle_seconds())
+            _pregen_status["governor"] = decision.to_dict()
+            if decision.pause:
+                _set_pregen_state(
+                    "throttled",
+                    f"Background work paused: {decision.reason}.",
+                )
+                await asyncio.sleep(decision.sleep_seconds)
+                continue
+
+            phase_order = ("md", "sm", "lg")
+            phases = [size for size in phase_order if _disk_allocations.get(size, 0) > 0]
             if not phases:
                 _set_pregen_state("idle", "No SSD thumbnail budget is available.")
                 await asyncio.sleep(5)
@@ -1510,8 +1973,15 @@ async def run_prefetch_worker():
 
             generated = 0
             for phase in phases:
-                _set_pregen_state("running", f"Pre-generating {phase} thumbnails…", phase=phase)
-                phase_generated = await _run_pregen_phase(phase)
+                _set_pregen_state(
+                    "running",
+                    f"Pre-generating {phase} thumbnails ({decision.mode}: {decision.reason})…",
+                    phase=phase,
+                )
+                phase_generated = await _run_pregen_phase(
+                    phase,
+                    generate_batch=decision.thumbnail_batch_size,
+                )
                 generated += phase_generated
 
             await flush_orientation_updates()
@@ -1529,7 +1999,7 @@ async def run_prefetch_worker():
                 )
                 await asyncio.sleep(5)
             else:
-                await asyncio.sleep(0)  # yield then immediately process next batch
+                await asyncio.sleep(max(PREGENERATE_BATCH_PAUSE_SECONDS, decision.thumbnail_pause_seconds))
 
         except Exception as e:
             _set_pregen_state("error", "Pre-generation worker hit an error.", error=str(e))

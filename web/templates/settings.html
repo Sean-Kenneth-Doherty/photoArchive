@@ -76,50 +76,85 @@
                 <span>Thumbnail JPEG quality</span>
                 <input id="thumb_quality" type="number" min="40" max="100" step="1">
             </label>
+            <div class="thumbnail-change-notice hidden" id="thumbnail-change-notice">
+                <strong>Changing thumbnail output</strong>
+                <span id="thumbnail-change-copy">Existing previews can be kept or replaced.</span>
+                <div class="thumbnail-change-options">
+                    <label>
+                        <input type="radio" name="thumbnail_cache_policy" value="keep" checked>
+                        <span>Keep existing previews and use the new settings going forward</span>
+                    </label>
+                    <label>
+                        <input type="radio" name="thumbnail_cache_policy" value="replace">
+                        <span>Replace existing previews and rebuild the preview cache</span>
+                    </label>
+                </div>
+            </div>
         </section>
 
         <section class="settings-card settings-card-wide">
-            <h2>Cache</h2>
-            <p class="settings-card-copy">RAM and SSD budgets live here. Worker counts, warm-up depth, and browser cache policy are tuned automatically for this desktop.</p>
-            <div class="settings-metric-list" id="cache-tier-guide" style="margin-bottom: 12px; padding: 8px; background: #1a1a1a; border-radius: 4px;">
-                <div style="color: #888; font-size: 11px; margin-bottom: 4px;">Recommended tiers for your archive (calculated from actual image sizes):</div>
-                <div id="cache-tier-table" style="font-family: monospace; font-size: 11px; color: #aaa; white-space: pre;"></div>
+            <h2>Image Cache</h2>
+            <p class="settings-card-copy">Set how much fast storage photoArchive can use. The app chooses the right mix of grid previews, loupe previews, high-res previews, and originals automatically.</p>
+            <div class="cache-summary" id="cache-tier-guide">
+                <div class="cache-summary-head">
+                    <div>
+                        <strong id="cache-health-title">Checking cache…</strong>
+                        <span id="cache-health-subtitle">Looking at RAM and SSD coverage.</span>
+                    </div>
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.applyRecommendedCache()">Apply Defaults</button>
+                </div>
+                <div class="cache-friendly-grid" id="cache-tier-table"></div>
+                <div class="cache-advice" id="cache-storage-advice"></div>
             </div>
-            <label class="settings-field">
-                <span>RAM budget (GB)</span>
-                <input id="memory_cache_gb" type="number" min="0" max="64" step="0.25">
-            </label>
-            <label class="settings-field">
-                <span>Cache directory</span>
-                <input id="ssd_cache_dir" type="text" spellcheck="false" autocomplete="off">
-            </label>
-            <label class="settings-field">
-                <span>Total SSD budget (GB)</span>
-                <input id="ssd_cache_gb" type="number" min="0" max="4096" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Search similarity threshold</span>
-                <input id="search_similarity_threshold" type="number" min="0.1" max="0.8" step="0.05">
-            </label>
+            <div class="settings-main-controls">
+                <label class="settings-field">
+                    <span>RAM to use (GB)</span>
+                    <input id="memory_cache_gb" type="number" min="0" max="64" step="0.25">
+                </label>
+                <label class="settings-field">
+                    <span>SSD space to use (GB)</span>
+                    <input id="ssd_cache_gb" type="number" min="0" max="4096" step="1">
+                </label>
+                <label class="settings-field">
+                    <span>Priority</span>
+                    <select id="cache_profile">
+                        <option value="original_heavy">Best quality</option>
+                        <option value="balanced">Balanced</option>
+                        <option value="browse_fast">Fastest browsing</option>
+                    </select>
+                </label>
+            </div>
+            <div class="settings-help-text" id="cache-profile-hint">photoArchive fills the basics first, then spends leftover SSD space according to this priority.</div>
             <label class="settings-checkbox">
                 <input id="pregenerate_on_idle" type="checkbox">
-                <span>Pre-generate thumbnails while the app is idle</span>
+                <span>Warm image cache while the computer is idle</span>
             </label>
-            <div class="settings-metric-list">
-                <div>RAM cache: <strong id="cache-stats-inline">—</strong></div>
-                <div>RAM tiers: <strong id="cache-ram-usage">—</strong></div>
-                <div>SSD cache: <strong id="cache-ssd-usage">—</strong></div>
-                <div id="cache-tier-sm">sm: —</div>
-                <div id="cache-tier-md">md: —</div>
-                <div id="cache-tier-lg">lg: —</div>
-                <div id="cache-tier-full">full: —</div>
-                <div>Pre-generation: <strong id="cache-pregen-summary">—</strong></div>
-                <div>Auto workers: <strong id="cache-auto-workers">—</strong></div>
-                <div>Auto warm-up: <strong id="cache-auto-prefetch">—</strong></div>
-                <div>Browser policy: <strong id="cache-browser-policy">—</strong></div>
-                <div>Settings file: <code id="settings-path">—</code></div>
-                <div>Tip: changing output size or JPEG quality creates new cache keys. Use “Clear Cache” if you want to reclaim old files.</div>
-            </div>
+            <details class="settings-advanced" id="cache-advanced">
+                <summary>Technical details</summary>
+                <label class="settings-field">
+                    <span>Cache location</span>
+                    <input id="ssd_cache_dir" type="text" spellcheck="false" autocomplete="off">
+                </label>
+                <label class="settings-field">
+                    <span>Search similarity threshold</span>
+                    <input id="search_similarity_threshold" type="number" min="0.1" max="0.8" step="0.05">
+                </label>
+                <div class="settings-metric-list">
+                    <div>RAM cache: <strong id="cache-stats-inline">—</strong></div>
+                    <div>RAM tiers: <strong id="cache-ram-usage">—</strong></div>
+                    <div>SSD cache: <strong id="cache-ssd-usage">—</strong></div>
+                    <div id="cache-tier-sm">sm: —</div>
+                    <div id="cache-tier-md">md: —</div>
+                    <div id="cache-tier-lg">lg: —</div>
+                    <div id="cache-tier-full">full: —</div>
+                    <div>Background work: <strong id="cache-pregen-summary">—</strong></div>
+                    <div>Auto workers: <strong id="cache-auto-workers">—</strong></div>
+                    <div>Auto warm-up: <strong id="cache-auto-prefetch">—</strong></div>
+                    <div>Browser policy: <strong id="cache-browser-policy">—</strong></div>
+                    <div>Settings file: <code id="settings-path">—</code></div>
+                    <div>When output size or JPEG quality changes, choose whether to keep existing previews or replace them during Save.</div>
+                </div>
+            </details>
         </section>
     </form>
 </div>

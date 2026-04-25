@@ -22,6 +22,7 @@ _preload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embed-
 import ai_models
 import db
 import embed_cache
+import resource_governor
 import settings
 import thumbnails
 
@@ -174,7 +175,7 @@ def _load_model(model_dir: str, model_id: str):
 
 
 def _load_image_for_embedding(image_id: int, path: str):
-    return thumbnails.load_embedding_image(path, image_id)
+    return thumbnails.load_embedding_image(path, image_id, require_cached=True)
 
 
 def _preload_images(
@@ -276,7 +277,28 @@ async def run_embedding_worker():
             model_id = config["embed_model_id"]
             model_revision = config["embed_model_revision"]
             model_dir = config["embed_model_dir"]
+            decision = resource_governor.get_background_decision(thumbnails.get_idle_seconds())
+            _worker_status["governor"] = decision.to_dict()
+            batch_pause_seconds = max(
+                0.0,
+                min(
+                    5.0,
+                    max(
+                        float(config.get("embed_batch_pause_ms", 250)) / 1000.0,
+                        decision.embedding_pause_seconds,
+                    ),
+                ),
+            )
             model_installed = ai_models.model_files_present(model_dir)
+
+            if decision.pause:
+                _set_worker_status(
+                    "throttled",
+                    f"Background embedding paused: {decision.reason}.",
+                    ready=_model is not None,
+                )
+                await asyncio.sleep(decision.sleep_seconds)
+                continue
 
             if not model_installed:
                 _model = None
@@ -292,12 +314,22 @@ async def run_embedding_worker():
                 await asyncio.sleep(10)
                 continue
 
-            if (
+            needs_model_load = (
                 _model is None
                 or _loaded_model_dir != model_dir
                 or _loaded_model_id != model_id
                 or _loaded_model_revision != model_revision
-            ):
+            )
+            if needs_model_load and not decision.can_start_heavy_work:
+                _set_worker_status(
+                    "throttled",
+                    f"Model loading deferred until the desktop is idle and quiet: {decision.reason}.",
+                    ready=False,
+                )
+                await asyncio.sleep(max(5.0, decision.embedding_pause_seconds))
+                continue
+
+            if needs_model_load:
                 _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
                 _model = await loop.run_in_executor(_embed_executor, _load_model, model_dir, model_id)
                 _loaded_model_dir = model_dir
@@ -308,6 +340,7 @@ async def run_embedding_worker():
             # Phase 1: Embed unembedded images with pipelined CPU/GPU
             candidates = await db.get_unembedded_images(
                 limit=BATCH_SIZE * EMBED_CANDIDATE_MULTIPLIER,
+                md_cache_root=thumbnails.SSD_CACHE_DIR,
             )
             unembedded, cooled_down, next_retry_at = _select_ready_candidates(candidates)
             if unembedded:
@@ -356,6 +389,8 @@ async def run_embedding_worker():
                         f"Skipping {len(failed)} unavailable files for now; retrying other images. Latest error: {sample_error}",
                         ready=True,
                     )
+                if batch_pause_seconds:
+                    await asyncio.sleep(batch_pause_seconds)
                 continue
 
             if candidates and cooled_down:

@@ -20,6 +20,12 @@
         </button>
     </div>
     <div class="filter-sep"></div>
+    <div class="filter-group" title="Flag">
+        <button class="filter-icon filter-flag" data-flag="picked" onclick="PhotoArchive.toggleFilter('flag','picked',this)" title="Picked">P</button>
+        <button class="filter-icon filter-flag" data-flag="unflagged" onclick="PhotoArchive.toggleFilter('flag','unflagged',this)" title="Unflagged">U</button>
+        <button class="filter-icon filter-flag" data-flag="rejected" onclick="PhotoArchive.toggleFilter('flag','rejected',this)" title="Rejected">X</button>
+    </div>
+    <div class="filter-sep"></div>
     <div class="filter-group filter-stars" title="Minimum rating">
         <button class="filter-star" data-star="1" onclick="PhotoArchive.toggleStar(1)">&#9734;</button>
         <button class="filter-star" data-star="2" onclick="PhotoArchive.toggleStar(2)">&#9734;</button>
