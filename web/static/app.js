@@ -1929,7 +1929,8 @@ const PhotoArchive = (() => {
             thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
             scroll.appendChild(thumb);
         }
-        centerFilmstripActive(scroll, true);
+        // rAF needed: DOM just rebuilt, need reflow before reading offsetLeft
+        requestAnimationFrame(() => centerFilmstripActive(scroll, true));
     }
 
     function updateFilmstripActive() {
@@ -1942,6 +1943,7 @@ const PhotoArchive = (() => {
         scroll.querySelectorAll('.filmstrip-thumb').forEach((el) => {
             el.classList.toggle('active', Number(el.dataset.idx) === lightboxIndex);
         });
+        // No rAF needed: DOM already laid out, just class toggle
         centerFilmstripActive(scroll);
     }
 
@@ -1949,12 +1951,10 @@ const PhotoArchive = (() => {
         const active = scroll.querySelector('.filmstrip-thumb.active');
         if (!active) return;
 
-        requestAnimationFrame(() => {
-            const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
-            const centeredLeft = active.offsetLeft + (active.offsetWidth / 2) - (scroll.clientWidth / 2);
-            const targetLeft = Math.max(0, Math.min(maxScroll, centeredLeft));
-            scroll.scrollTo({ left: targetLeft, behavior: instant ? 'auto' : 'smooth' });
-        });
+        const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+        const centeredLeft = active.offsetLeft + (active.offsetWidth / 2) - (scroll.clientWidth / 2);
+        const targetLeft = Math.max(0, Math.min(maxScroll, centeredLeft));
+        scroll.scrollTo({ left: targetLeft, behavior: instant ? 'auto' : 'smooth' });
     }
 
     // Loupe zoom/pan state
@@ -2002,8 +2002,10 @@ const PhotoArchive = (() => {
         loupeApplyImageSize();
 
         document.body.classList.add('loupe-open');
-        loupe.classList.remove('hidden');
-        requestAnimationFrame(() => loupe.classList.add('loupe-visible'));
+        if (loupe.classList.contains('hidden')) {
+            loupe.classList.remove('hidden');
+            requestAnimationFrame(() => loupe.classList.add('loupe-visible'));
+        }
         loupeCenterFit({ animate: false });
 
         // Progressive loading: sm -> md -> lg -> original. Slow tiers time out
