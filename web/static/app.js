@@ -380,13 +380,13 @@ const PhotoArchive = (() => {
             const img = mosaicImages[index];
             const ar = img.aspect_ratio || 1.5;
             const cell = document.createElement('div');
-            cell.className = 'mosaic-cell';
+            cell.className = 'mosaic-cell skeleton-cell';
             cell.dataset.id = img.id;
             cell.style.height = rowH + 'px';
             cell.style.flexGrow = ar;
             cell.style.flexBasis = (rowH * ar) + 'px';
             cell.onclick = () => mosaicClick(img.id);
-            cell.innerHTML = `<img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
+            cell.innerHTML = `<img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" data-tier-rank="0" onload="this.classList.add('loaded'); this.parentElement.classList.remove('skeleton-cell')">`;
             preloadImage(img.thumb_url);
             grid.appendChild(cell);
             scheduleMosaicImageUpgrade(cell, img, rowH, token, index);
@@ -2260,7 +2260,7 @@ const PhotoArchive = (() => {
                 }
 
                 const card = document.createElement('div');
-                card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
+                card.className = 'rank-card skeleton-cell' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
                 if (batchMode) card.classList.add('selectable');
                 if (batchSelected.has(img.id)) card.classList.add('selected');
                 card.dataset.imageId = img.id;
@@ -2275,7 +2275,7 @@ const PhotoArchive = (() => {
                 const infoLine = libraryCardInfoLine(img, rank, showRank);
 
                 card.innerHTML = `
-                    <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
+                    <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded'); this.parentElement.classList.remove('skeleton-cell')">
                     <div class="select-check">✓</div>
                     ${confDot}
                     ${flagBadge(img.flag)}
@@ -3687,7 +3687,7 @@ const PhotoArchive = (() => {
             const simLabel = similarityLabel(simg);
 
             const card = document.createElement('div');
-            card.className = 'rank-card' + (flagClass(simg.flag) ? ' ' + flagClass(simg.flag) : '');
+            card.className = 'rank-card skeleton-cell' + (flagClass(simg.flag) ? ' ' + flagClass(simg.flag) : '');
             card.dataset.imageId = simg.id;
             card.dataset.ar = ar;
             card.style.height = thumbHeight + 'px';
@@ -3696,7 +3696,7 @@ const PhotoArchive = (() => {
             card.onclick = () => openLightbox(simg);
 
             card.innerHTML = `
-                <img src="${escapeHtml(simg.thumb_url)}" alt="${escapeHtml(simg.filename)}" loading="lazy" onload="this.classList.add('loaded')">
+                <img src="${escapeHtml(simg.thumb_url)}" alt="${escapeHtml(simg.filename)}" loading="lazy" onload="this.classList.add('loaded'); this.parentElement.classList.remove('skeleton-cell')">
                 ${flagBadge(simg.flag)}
                 <div class="rank-card-info">
                     <span class="rank-elo">${escapeHtml(simg.elo)} Elo</span>
