@@ -1306,62 +1306,70 @@ const PhotoArchive = (() => {
         lens: '',
     };
     let filters = { ...EMPTY_FILTERS };
+    const FILTER_QUERY_KEYS = ['orientation', 'compared', 'min_stars', 'folder', 'flag', 'date_taken', 'file_type', 'camera', 'lens'];
 
     function saveFilters() {
         try { sessionStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(currentFilterState())); } catch {}
+        syncLibraryUrlState();
     }
 
     function restoreFilters() {
         try {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (FILTER_QUERY_KEYS.some(key => urlParams.has(key))) {
+                filters = normalizeFilterState({
+                    orientation: urlParams.get('orientation') || '',
+                    compared: urlParams.get('compared') || '',
+                    rating: Number(urlParams.get('min_stars')) || '',
+                    folder: urlParams.get('folder') || '',
+                    flag: urlParams.get('flag') || '',
+                    taken: urlParams.get('date_taken') || '',
+                    fileType: urlParams.get('file_type') || '',
+                    camera: urlParams.get('camera') || '',
+                    lens: urlParams.get('lens') || '',
+                });
+                applyFilterUiState();
+                return;
+            }
             const saved = sessionStorage.getItem(FILTER_STORAGE_KEY);
             if (!saved) return;
             const parsed = JSON.parse(saved);
             filters = normalizeFilterState(parsed);
-
-            // Restore UI state for filter icons
-            if (filters.orientation) {
-                document.querySelectorAll('.filter-icon').forEach(btn => {
-                    if (btn.title?.toLowerCase() === filters.orientation) btn.classList.add('active');
-                });
-            }
-            if (filters.compared) {
-                const titles = { compared: 'Ranked', uncompared: 'Unranked', confident: 'High confidence (10+)' };
-                document.querySelectorAll('.filter-icon').forEach(btn => {
-                    if (btn.title === titles[filters.compared]) btn.classList.add('active');
-                });
-            }
-            if (filters.rating) {
-                document.querySelectorAll('.filter-star').forEach(s => {
-                    s.classList.toggle('lit', Number(s.dataset.star) <= filters.rating);
-                });
-            }
-            if (filters.folder) {
-                const sel = document.getElementById('filter-folder');
-                if (sel) sel.value = filters.folder;
-            }
-            if (filters.taken) {
-                const sel = document.getElementById('filter-taken');
-                if (sel) sel.value = filters.taken;
-            }
-            if (filters.fileType) {
-                const sel = document.getElementById('filter-type');
-                if (sel) sel.value = filters.fileType;
-            }
-            if (filters.camera) {
-                const sel = document.getElementById('filter-camera');
-                if (sel) sel.value = filters.camera;
-            }
-            if (filters.lens) {
-                const sel = document.getElementById('filter-lens');
-                if (sel) sel.value = filters.lens;
-            }
-            if (filters.flag) {
-                document.querySelectorAll('.filter-flag').forEach(btn => {
-                    btn.classList.toggle('active', btn.dataset.flag === filters.flag);
-                });
-            }
-            updateMetadataFilterButton();
+            applyFilterUiState();
         } catch {}
+    }
+
+    function applyFilterUiState() {
+        document.querySelectorAll('.bar-filters .filter-icon').forEach(btn => btn.classList.remove('active'));
+        document.querySelectorAll('.filter-flag').forEach(btn => btn.classList.remove('active'));
+        document.querySelectorAll('.filter-star').forEach(s => {
+            const lit = filters.rating && Number(s.dataset.star) <= Number(filters.rating);
+            s.classList.toggle('lit', lit);
+            s.textContent = lit ? '★' : '☆';
+        });
+
+        if (filters.orientation) {
+            document.querySelectorAll('.filter-icon').forEach(btn => {
+                if (btn.title?.toLowerCase() === filters.orientation) btn.classList.add('active');
+            });
+        }
+        if (filters.compared) {
+            const titles = { compared: 'Ranked', uncompared: 'Unranked', confident: 'High confidence (10+)' };
+            document.querySelectorAll('.filter-icon').forEach(btn => {
+                if (btn.title === titles[filters.compared]) btn.classList.add('active');
+            });
+        }
+        ['folder', 'taken', 'fileType', 'camera', 'lens'].forEach(key => {
+            const ids = { folder: 'filter-folder', taken: 'filter-taken', fileType: 'filter-type', camera: 'filter-camera', lens: 'filter-lens' };
+            const sel = document.getElementById(ids[key]);
+            if (sel) sel.value = filters[key] || '';
+        });
+        if (filters.flag) {
+            document.querySelectorAll('.filter-flag').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.flag === filters.flag);
+            });
+        }
+        updateMetadataFilterButton();
     }
 
     function activeMetadataFilterCount() {
@@ -1414,6 +1422,22 @@ const PhotoArchive = (() => {
         if (normalized.camera) params.set('camera', normalized.camera);
         if (normalized.lens) params.set('lens', normalized.lens);
         return params;
+    }
+
+    function syncLibraryUrlState() {
+        if (!window.history?.replaceState) return;
+        const params = new URLSearchParams(window.location.search);
+        FILTER_QUERY_KEYS.forEach(key => params.delete(key));
+        params.delete('sort');
+        params.delete('dir');
+        appendFilterParams(params);
+        if (sortField !== 'similarity') {
+            params.set('sort', sortField);
+            params.set('dir', sortDesc ? 'desc' : 'asc');
+        }
+        const query = params.toString();
+        const newUrl = query ? `${window.location.pathname}?${query}` : window.location.pathname;
+        history.replaceState(null, '', newUrl);
     }
 
     function filterParams(state = currentQueryState()) {
@@ -1756,6 +1780,7 @@ const PhotoArchive = (() => {
         try {
             sessionStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
         } catch {}
+        syncLibraryUrlState();
     }
 
     function saveSearchState() {
@@ -1787,6 +1812,18 @@ const PhotoArchive = (() => {
 
     function restoreSortState() {
         try {
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlSort = urlParams.get('sort');
+            if (urlSort) {
+                const urlState = SORT_KEYS[urlSort]
+                    ? { field: urlSort, desc: urlParams.get('dir') !== 'asc' }
+                    : sortStateFromValue(urlSort);
+                if (urlState?.field && SORT_KEYS[urlState.field] && urlState.field !== 'similarity') {
+                    const desc = urlParams.has('dir') ? urlParams.get('dir') !== 'asc' : urlState.desc !== false;
+                    applySortState(urlState.field, desc, { persist: false, persistSearch: false });
+                    return;
+                }
+            }
             const saved = sessionStorage.getItem(SORT_STORAGE_KEY);
             if (!saved) return;
             const parsed = JSON.parse(saved);
