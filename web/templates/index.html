@@ -8,7 +8,7 @@
     <div class="scan-section">
         <div class="input-group">
             <input type="text" id="folder-input" placeholder="Enter folder path (e.g. /home/user/Photos)"
-                   value="{{ folder or '/run/media/sean/Expansion/Photos/Exported Edits' }}" autocomplete="off">
+                   value="{{ folder or '' }}" autocomplete="off">
             <button type="button" id="scan-btn" onclick="startScan()">Scan Folder</button>
         </div>
         <div id="scan-progress" class="scan-progress hidden">
