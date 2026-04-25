@@ -11,8 +11,11 @@ const PhotoArchive = (() => {
     let compareActionSeq = 0;
     let undoCount = 0;
     let compareStats = {};
+    let coverageStatsLastFetched = 0;
+    let coverageStatsFetchPromise = null;
     let compareImageToken = 0;
     const compareDisplayedTier = { left: -1, right: -1 };
+    const COVERAGE_STATS_THROTTLE_MS = 5000;
 
     // --- Rankings State ---
     let rankingsOffset = 0;
@@ -950,6 +953,7 @@ const PhotoArchive = (() => {
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
         if (poolEl) poolEl.textContent = visibleTotalLabel(poolVisibleCount(), poolTotalCount());
+        updateCoverageBar();
         if (!compEl) return;
 
         if (_displayedComparisons < 0) {
@@ -961,6 +965,42 @@ const PhotoArchive = (() => {
         if (total === _displayedComparisons) return;
         rollUpCounter(compEl, _displayedComparisons, total);
         _displayedComparisons = total;
+    }
+
+    function renderCoverageBar(stats = compareStats) {
+        const fill = document.getElementById('coverage-fill');
+        const label = document.getElementById('coverage-label');
+        if (!fill || !label) return false;
+        const totalImages = Number(stats.total_images || 0);
+        const ratedImages = Number(stats.rated_images || 0);
+        const pct = totalImages > 0 ? Math.round((ratedImages / totalImages) * 100) : 0;
+        const clamped = Math.max(0, Math.min(100, pct));
+        fill.style.width = `${clamped}%`;
+        label.textContent = `${clamped}% ranked`;
+        return true;
+    }
+
+    function mergeCoverageStats(stats) {
+        for (const key of ['total_images', 'rated_images', 'total_comparisons', 'ranking_signal_count']) {
+            if (stats[key] !== undefined) compareStats[key] = stats[key];
+        }
+    }
+
+    function updateCoverageBar() {
+        if (!renderCoverageBar()) return;
+        const now = Date.now();
+        if (coverageStatsFetchPromise || now - coverageStatsLastFetched < COVERAGE_STATS_THROTTLE_MS) return;
+        coverageStatsLastFetched = now;
+        coverageStatsFetchPromise = fetch('/api/stats')
+            .then((res) => res.json())
+            .then((stats) => {
+                mergeCoverageStats(stats);
+                renderCoverageBar(stats);
+            })
+            .catch(() => {})
+            .finally(() => {
+                coverageStatsFetchPromise = null;
+            });
     }
 
     function rollUpCounter(el, from, to) {

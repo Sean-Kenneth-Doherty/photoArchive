@@ -226,6 +226,32 @@ body.with-bottom-bar > .bottom-bar {
     color: var(--text-muted);
 }
 
+.bar-coverage {
+    gap: var(--space-xs);
+    align-items: center;
+}
+
+.coverage-bar {
+    width: 60px;
+    height: 4px;
+    background: var(--bg-base);
+    border-radius: var(--radius-pill);
+    overflow: hidden;
+}
+
+.coverage-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: var(--radius-pill);
+    transition: width var(--duration-slow);
+    width: 0%;
+}
+
+.coverage-label {
+    font-size: 10px;
+    color: var(--text-muted);
+}
+
 .bar-stat-num {
     color: var(--text-secondary);
     font-weight: 600;
