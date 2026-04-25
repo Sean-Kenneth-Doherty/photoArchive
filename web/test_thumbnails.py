@@ -153,6 +153,33 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         for size in thumbnails.THUMB_TIERS:
             self.assertTrue(os.path.exists(thumbnails._thumbnail_disk_path(size, 1)))
 
+    def test_bulk_generation_marks_missing_source_without_retry(self):
+        image_id = 5
+        missing_path = os.path.join(self.tempdir.name, "missing.jpg")
+        with sqlite3.connect(thumbnails.db.DB_PATH) as conn:
+            conn.execute("CREATE TABLE images (id INTEGER PRIMARY KEY, missing_at REAL DEFAULT NULL)")
+            conn.execute("INSERT INTO images(id, missing_at) VALUES (?, NULL)", (image_id,))
+
+        signatures = {
+            "md": thumbnails._build_source_signature_from_bits(
+                f"catalog|123|456.000000000|{missing_path}",
+                "md",
+                image_id,
+            )
+        }
+        metrics = thumbnails._generate_thumbnail_set_sync(
+            missing_path,
+            image_id,
+            signatures,
+            source_bytes=123,
+        )
+
+        self.assertEqual(metrics["source_read_failures"], 1)
+        with sqlite3.connect(thumbnails.db.DB_PATH) as conn:
+            row = conn.execute("SELECT missing_at FROM images WHERE id = ?", (image_id,)).fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertEqual(thumbnails._thumbnail_retry_after, {})
+
     def test_bulk_candidate_skips_already_cached_tiers(self):
         path = self._make_image()
         signatures, file_size, file_modified_at = self._catalog_signatures(path)

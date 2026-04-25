@@ -582,6 +582,25 @@ def _source_missing(filepath: str) -> bool:
     return _get_source_bits(filepath).startswith("missing|")
 
 
+def _source_missing_error(filepath: str, exc: Exception) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    try:
+        return not os.path.exists(filepath)
+    except OSError:
+        return False
+
+
+def _mark_source_missing_from_error(filepath: str, image_id: int, exc: Exception) -> bool:
+    if not _source_missing_error(filepath, exc):
+        return False
+    try:
+        db.mark_image_missing_sync(image_id)
+    except Exception as mark_error:
+        print(f"Failed to mark missing image {image_id} for {filepath}: {mark_error}")
+    return True
+
+
 def get_etag(filepath: str, size: str, image_id: int) -> str:
     return f"\"{_build_source_signature(filepath, size, image_id)}\""
 
@@ -1475,11 +1494,13 @@ def _generate_missing_thumbnails_sync(
                 current.close()
             current = variant
     except Exception as e:
-        retry_until = time.time() + THUMBNAIL_RETRY_SECONDS
-        for size in needed_sizes:
-            source_signature = _build_source_signature(filepath, size, image_id)
-            _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
-        print(f"Thumbnail error for {filepath}: {e}")
+        source_missing = _mark_source_missing_from_error(filepath, image_id, e)
+        if not source_missing:
+            retry_until = time.time() + THUMBNAIL_RETRY_SECONDS
+            for size in needed_sizes:
+                source_signature = _build_source_signature(filepath, size, image_id)
+                _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
+            print(f"Thumbnail error for {filepath}: {e}")
         return None
     finally:
         if current is not None and current is not img:
@@ -1562,12 +1583,14 @@ def _generate_thumbnail_set_sync(
             current = variant
         metrics["decode_encode_seconds"] = max(0.0, time.monotonic() - process_started)
     except Exception as e:
-        retry_until = time.time() + THUMBNAIL_RETRY_SECONDS
-        for size in needed_sizes:
-            source_signature = size_signatures[size]
-            _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
+        source_missing = _mark_source_missing_from_error(filepath, image_id, e)
+        if not source_missing:
+            retry_until = time.time() + THUMBNAIL_RETRY_SECONDS
+            for size in needed_sizes:
+                source_signature = size_signatures[size]
+                _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
+            print(f"Thumbnail bulk error for {filepath}: {e}")
         metrics["source_read_failures"] = 1
-        print(f"Thumbnail bulk error for {filepath}: {e}")
     finally:
         if current is not None and current is not img:
             try:

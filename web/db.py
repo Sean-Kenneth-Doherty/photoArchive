@@ -1,5 +1,6 @@
 import aiosqlite
 import os
+import sqlite3
 import time as _time
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "photoarchive.db")
@@ -854,6 +855,26 @@ async def mark_source_scan_finished(source_id: int, seen_filepaths: list[str] | 
         invalidate_cached_image_ids_cache()
     finally:
         await db.close()
+
+
+def mark_image_missing_sync(image_id: int, missing_at: float | None = None) -> bool:
+    """Mark one image missing from sync thumbnail/worker code."""
+    when = _time.time() if missing_at is None else float(missing_at)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        cursor = conn.execute(
+            "UPDATE images SET missing_at = COALESCE(missing_at, ?) WHERE id = ?",
+            (when, int(image_id)),
+        )
+        conn.commit()
+        changed = cursor.rowcount > 0
+    finally:
+        conn.close()
+    if changed:
+        _invalidate_stats_cache()
+        _invalidate_filter_options_cache()
+        invalidate_cached_image_ids_cache()
+    return changed
 
 
 async def get_source(source_id: int):
