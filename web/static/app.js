@@ -1928,7 +1928,7 @@ const PhotoArchive = (() => {
             thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
             scroll.appendChild(thumb);
         }
-        centerFilmstripActive(scroll);
+        centerFilmstripActive(scroll, true);
     }
 
     function updateFilmstripActive() {
@@ -1944,7 +1944,7 @@ const PhotoArchive = (() => {
         centerFilmstripActive(scroll);
     }
 
-    function centerFilmstripActive(scroll) {
+    function centerFilmstripActive(scroll, instant) {
         const active = scroll.querySelector('.filmstrip-thumb.active');
         if (!active) return;
 
@@ -1952,7 +1952,7 @@ const PhotoArchive = (() => {
             const maxScroll = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
             const centeredLeft = active.offsetLeft + (active.offsetWidth / 2) - (scroll.clientWidth / 2);
             const targetLeft = Math.max(0, Math.min(maxScroll, centeredLeft));
-            scroll.scrollTo({ left: targetLeft, behavior: 'auto' });
+            scroll.scrollTo({ left: targetLeft, behavior: instant ? 'auto' : 'smooth' });
         });
     }
 
@@ -3432,6 +3432,7 @@ const PhotoArchive = (() => {
         const lgEl = document.getElementById('cache-tier-lg');
         const fullEl = document.getElementById('cache-tier-full');
         const pregenEl = document.getElementById('cache-pregen-summary');
+        const pregenDiagnosticsEl = document.getElementById('cache-pregen-diagnostics');
         const thumbPauseBtn = document.getElementById('thumb-pause-btn');
         const thumbResumeBtn = document.getElementById('thumb-resume-btn');
 
@@ -3462,6 +3463,18 @@ const PhotoArchive = (() => {
             const eta = pregen.eta_seconds ? ` · ETA ${formatEta(pregen.eta_seconds)}` : '';
             const speed = rate > 0 ? ` · ${formatRatePerMinute(rate)}` : '';
             pregenEl.textContent = `${state}${phase}${message}${speed}${eta}`;
+        }
+        if (pregenDiagnosticsEl) {
+            const reads = Number(pregen.recent_source_reads_per_min || 0);
+            const writes = Number(pregen.recent_thumbnails_written_per_min || 0);
+            const mbps = Number(pregen.recent_read_mbps || 0);
+            const readMs = Number(pregen.avg_source_read_seconds || 0) * 1000;
+            const encodeMs = Number(pregen.avg_decode_encode_seconds || 0) * 1000;
+            const failures = Number(pregen.source_read_failures || 0);
+            pregenDiagnosticsEl.textContent =
+                `${reads.toFixed(1)} reads/min · ${writes.toFixed(1)} thumbs/min · ` +
+                `${mbps.toFixed(1)} MB/s · read ${readMs.toFixed(0)}ms · encode ${encodeMs.toFixed(0)}ms · ` +
+                `${failures.toLocaleString()} failures`;
         }
         const thumbnailsPaused = Boolean(pregen.manual_pause);
         if (thumbPauseBtn) thumbPauseBtn.disabled = thumbnailsPaused;
