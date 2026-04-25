@@ -8,6 +8,10 @@ photoArchive is a FastAPI web app for managing, ranking, and searching a large p
 
 ## Running
 
+## Workflow Preferences
+
+Always commit changes atomically: keep each commit focused on one coherent behavior or infrastructure change, and avoid mixing unrelated dirty work into the same commit.
+
 ```bash
 ./scripts/photoarchive-server restart
 ./scripts/photoarchive-server status
