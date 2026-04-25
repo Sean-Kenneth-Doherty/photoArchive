@@ -92,7 +92,8 @@ ON cache_entries(cache_root, size, last_accessed, image_id);
 CREATE TABLE IF NOT EXISTS cache_metadata (
     cache_root TEXT PRIMARY KEY,
     thumb_config_signature TEXT NOT NULL,
-    thumb_config_changed_at REAL NOT NULL
+    thumb_config_changed_at REAL NOT NULL,
+    replace_stale_thumbnails INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -133,6 +134,13 @@ async def init_db():
                 await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
             except Exception:
                 pass  # Column already exists
+        try:
+            await db.execute(
+                "ALTER TABLE cache_metadata "
+                "ADD COLUMN replace_stale_thumbnails INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists
         await db.execute("CREATE INDEX IF NOT EXISTS idx_images_flag ON images(flag)")
         # Backfill aspect_ratio from orientation for images that don't have it yet
         await db.execute(
@@ -160,18 +168,6 @@ async def set_image_orientation(image_id: int, orientation: str):
     try:
         await db.execute("UPDATE images SET orientation = ? WHERE id = ?", (orientation, image_id))
         await db.commit()
-    finally:
-        await db.close()
-
-
-async def get_unculled_by_orientation(orientation: str, limit: int = 12):
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "SELECT id, filename, filepath FROM images WHERE status = 'unculled' AND orientation = ? ORDER BY RANDOM() LIMIT ?",
-            (orientation, limit),
-        )
-        return await cursor.fetchall()
     finally:
         await db.close()
 
@@ -239,18 +235,6 @@ async def set_image_status(image_id: int, status: str):
         await db.close()
 
 
-async def set_image_status_and_elo(image_id: int, status: str, new_elo: float):
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE images SET status = ?, elo = ? WHERE id = ?", (status, new_elo, image_id)
-        )
-        await db.commit()
-        _invalidate_stats_cache()
-    finally:
-        await db.close()
-
-
 async def set_image_flag(image_id: int, flag: str):
     db = await get_db()
     try:
@@ -258,38 +242,6 @@ async def set_image_flag(image_id: int, flag: str):
             "UPDATE images SET flag = ? WHERE id = ?", (flag, image_id)
         )
         await db.commit()
-    finally:
-        await db.close()
-
-
-async def batch_cull(decisions: list[tuple[int, str, float]]):
-    """Apply multiple cull decisions at once. Each tuple: (image_id, status, new_elo)."""
-    db = await get_db()
-    try:
-        await db.executemany(
-            "UPDATE images SET status = ?, elo = ? WHERE id = ?",
-            [(status, new_elo, image_id) for image_id, status, new_elo in decisions],
-        )
-        await db.commit()
-        _invalidate_stats_cache()
-    finally:
-        await db.close()
-
-
-async def undo_last_cull():
-    """Undo the last cull decision by reverting the most recently culled image to unculled."""
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "SELECT id, status FROM images WHERE status != 'unculled' ORDER BY rowid DESC LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        if row:
-            await db.execute("UPDATE images SET status = 'unculled' WHERE id = ?", (row["id"],))
-            await db.commit()
-            _invalidate_stats_cache()
-            return {"id": row["id"], "previous_status": row["status"]}
-        return None
     finally:
         await db.close()
 
@@ -470,7 +422,6 @@ async def get_stats():
         total = sum(counts.values())
         result = {
             "total_images": total,
-            "unculled": counts.get("unculled", 0),
             "kept": counts.get("kept", 0),
             "maybe": counts.get("maybe", 0),
             "rejected": counts.get("rejected", 0),

@@ -81,6 +81,7 @@ _pregen_manual_pause = False
 _pregen_scan_offsets = {tier: 0 for tier in THUMB_TIERS}
 _last_thumb_config_signature = ""
 _thumb_config_changed_at = 0.0
+_replace_stale_thumbnails = False
 _pregen_status = {
     "enabled": True,
     "manual_mode": False,
@@ -133,9 +134,18 @@ def _db_connect() -> sqlite3.Connection:
             "CREATE TABLE IF NOT EXISTS cache_metadata ("
             "cache_root TEXT PRIMARY KEY, "
             "thumb_config_signature TEXT NOT NULL, "
-            "thumb_config_changed_at REAL NOT NULL"
+            "thumb_config_changed_at REAL NOT NULL, "
+            "replace_stale_thumbnails INTEGER NOT NULL DEFAULT 0"
             ")"
         )
+        try:
+            conn.execute(
+                "ALTER TABLE cache_metadata "
+                "ADD COLUMN replace_stale_thumbnails INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
         _persistent_conn = conn
     return _persistent_conn
 
@@ -677,34 +687,6 @@ def _enforce_all_disk_budgets():
             _enforce_tier_budget_locked(conn, size)
 
 
-def _clear_disk_tiers(tiers: tuple[str, ...]):
-    _clear_disk_index(tiers)
-    with _meta_lock:
-        conn = _db_connect()
-        placeholders = ",".join("?" for _ in tiers)
-        rows = conn.execute(
-            f"SELECT cache_root, size, image_id, path FROM cache_entries "
-            f"WHERE cache_root = ? AND size IN ({placeholders})",
-            (SSD_CACHE_DIR, *tiers),
-        ).fetchall()
-        for row in rows:
-            _remove_cache_entry_locked(conn, row)
-        conn.commit()
-        for tier in tiers:
-            _tier_byte_totals.pop(tier, None)
-
-    for tier in tiers:
-        tier_dir = os.path.join(SSD_CACHE_DIR, tier)
-        if not os.path.isdir(tier_dir):
-            continue
-        for entry in os.scandir(tier_dir):
-            if entry.is_file(follow_symlinks=False):
-                try:
-                    os.remove(entry.path)
-                except OSError:
-                    pass
-
-
 def _get_disk_entry(
     size: str,
     image_id: int,
@@ -723,7 +705,9 @@ def _get_disk_entry(
         ).fetchone()
         if row is None:
             return None
-        if row["source_signature"] != source_signature or not os.path.exists(row["path"]):
+        if row["source_signature"] != source_signature:
+            return None
+        if not os.path.exists(row["path"]):
             stale_row = conn.execute(
                 "SELECT cache_root, size, image_id, path FROM cache_entries "
                 "WHERE cache_root = ? AND size = ? AND image_id = ?",
@@ -1156,6 +1140,7 @@ def _planned_thumbnail_sizes(
     requested_size: str,
     *,
     include_smaller_tiers: bool = False,
+    allow_stale_fallback: bool = True,
 ) -> list[str]:
     if _source_missing(filepath):
         return []
@@ -1181,6 +1166,8 @@ def _planned_thumbnail_sizes(
         # Fast check via in-memory index before expensive DB query.
         if fast_disk_has(size, image_id, source_signature):
             continue
+        if allow_stale_fallback and fast_disk_has(size, image_id):
+            continue
         if _get_disk_entry(size, image_id, source_signature, touch=False) is not None:
             continue
         needed.append(size)
@@ -1196,12 +1183,14 @@ def _generate_missing_thumbnails_sync(
     *,
     include_smaller_tiers: bool = False,
     hot: bool = False,
+    allow_stale_fallback: bool = True,
 ):
     needed_sizes = _planned_thumbnail_sizes(
         filepath,
         image_id,
         requested_size,
         include_smaller_tiers=include_smaller_tiers,
+        allow_stale_fallback=allow_stale_fallback,
     )
     if not needed_sizes:
         return
@@ -1284,6 +1273,7 @@ async def _run_thumbnail_job(
     executor: ThreadPoolExecutor,
     include_smaller_tiers: bool,
     hot: bool,
+    allow_stale_fallback: bool,
 ):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
@@ -1295,6 +1285,7 @@ async def _run_thumbnail_job(
             image_id,
             include_smaller_tiers=include_smaller_tiers,
             hot=hot,
+            allow_stale_fallback=allow_stale_fallback,
         ),
     )
 
@@ -1307,6 +1298,7 @@ async def _ensure_thumbnail_with_executor(
     *,
     note_activity: bool,
     include_smaller_tiers: bool = False,
+    allow_stale_fallback: bool = True,
 ) -> bytes:
     if note_activity:
         note_user_activity()
@@ -1317,10 +1309,13 @@ async def _ensure_thumbnail_with_executor(
         return cached
 
     # Try lock-free fast path via in-memory index before DB round-trip
-    if not note_activity:
-        cached = fast_disk_read(size, image_id)
-        if cached is not None:
-            return cached
+    disk_entry = fast_disk_read_entry(
+        size,
+        image_id,
+        None if allow_stale_fallback else source_signature,
+    )
+    if disk_entry is not None:
+        return disk_entry[1]
 
     cached = _read_disk_thumbnail(size, image_id, source_signature)
     if cached is not None:
@@ -1332,7 +1327,15 @@ async def _ensure_thumbnail_with_executor(
     task = _inflight.get(inflight_key)
     if task is None:
         task = asyncio.create_task(
-            _run_thumbnail_job(filepath, size, image_id, executor, include_smaller_tiers, note_activity)
+            _run_thumbnail_job(
+                filepath,
+                size,
+                image_id,
+                executor,
+                include_smaller_tiers,
+                note_activity,
+                allow_stale_fallback,
+            )
         )
         _inflight[inflight_key] = task
 
@@ -1345,7 +1348,14 @@ async def _ensure_thumbnail_with_executor(
     cached = _memory_get(size, image_id, source_signature)
     if cached is not None:
         return cached
-    return fast_disk_read(size, image_id) or _read_disk_thumbnail(size, image_id, source_signature) or b""
+    disk_entry = fast_disk_read_entry(
+        size,
+        image_id,
+        None if allow_stale_fallback else source_signature,
+    )
+    if disk_entry is not None:
+        return disk_entry[1]
+    return _read_disk_thumbnail(size, image_id, source_signature) or b""
 
 
 async def get_thumbnail(filepath: str, size: str, image_id: int) -> bytes:
@@ -1377,11 +1387,20 @@ async def prefetch_images(
         filepath = img.get("filepath")
         if image_id is None or not filepath:
             continue
-        if _memory_get_entry_fast(size, image_id) is not None:
+        source_signature = _build_source_signature(filepath, size, image_id)
+        require_current = _replace_stale_thumbnails
+        if require_current:
+            if _memory_get(size, image_id, source_signature) is not None:
+                continue
+            if fast_disk_has(size, image_id, source_signature):
+                if hot:
+                    touch_cached_signature(size, image_id, source_signature)
+                continue
+        elif _memory_get_entry_fast(size, image_id) is not None:
             continue
-        if fast_disk_has(size, image_id):
+        if not require_current and fast_disk_has(size, image_id):
             if hot:
-                touch_cached(size, filepath, image_id)
+                touch_cached_signature(size, image_id, None)
             continue
         if has_cached(size, filepath, image_id):
             if hot:
@@ -1395,6 +1414,7 @@ async def prefetch_images(
                 _prefetch_executor,
                 note_activity=hot,
                 include_smaller_tiers=True,
+                allow_stale_fallback=not require_current,
             )
         )
         scheduled += 1
@@ -1607,7 +1627,7 @@ async def _run_pregen_phase(size: str, generate_batch: int | None = None) -> int
 
     with _meta_lock:
         conn = _db_connect()
-        if _tier_bytes(conn, size) >= background_budget:
+        if _tier_bytes(conn, size) >= background_budget and not _replace_stale_thumbnails:
             return 0
 
     offset = _pregen_scan_offsets[size]
@@ -1630,8 +1650,11 @@ async def _run_pregen_phase(size: str, generate_batch: int | None = None) -> int
         if _source_missing(row["filepath"]):
             continue
         current_signature = _build_source_signature(row["filepath"], size, row["id"])
-        if row["source_signature"] == current_signature and has_cached(size, row["filepath"], row["id"]):
+        if row["source_signature"] == current_signature and fast_disk_has(size, row["id"], current_signature):
             continue
+        if row["source_signature"] and row["source_signature"] != current_signature:
+            if not _replace_stale_thumbnails and fast_disk_has(size, row["id"]):
+                continue
         pending.append(row)
         if len(pending) >= generate_batch:
             break
@@ -1644,7 +1667,10 @@ async def _run_pregen_phase(size: str, generate_batch: int | None = None) -> int
     tasks = [
         _ensure_thumbnail_with_executor(
             row["filepath"], size, row["id"],
-            _prefetch_executor, note_activity=False, include_smaller_tiers=True,
+            _prefetch_executor,
+            note_activity=False,
+            include_smaller_tiers=True,
+            allow_stale_fallback=False,
         )
         for row in pending
     ]
@@ -1666,6 +1692,10 @@ def cache_stats() -> dict:
         size: {
             "count": 0,
             "bytes": 0,
+            "current_count": 0,
+            "current_bytes": 0,
+            "stale_count": 0,
+            "replacement_mode": False,
             "budget_bytes": _disk_allocations.get(size, 0),
         }
         for size in ALL_TIERS
@@ -1678,11 +1708,35 @@ def cache_stats() -> dict:
             "FROM cache_entries WHERE cache_root = ? GROUP BY size",
             (SSD_CACHE_DIR,),
         ).fetchall()
+        if _replace_stale_thumbnails and _thumb_config_changed_at > 0:
+            current_rows = conn.execute(
+                "SELECT size, COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS bytes "
+                "FROM cache_entries "
+                "WHERE cache_root = ? AND (size = ? OR created_at >= ?) "
+                "GROUP BY size",
+                (SSD_CACHE_DIR, FULL_TIER, _thumb_config_changed_at),
+            ).fetchall()
+        else:
+            current_rows = rows
 
     for row in rows:
         if row["size"] in disk_tiers:
             disk_tiers[row["size"]]["count"] = int(row["count"])
             disk_tiers[row["size"]]["bytes"] = int(row["bytes"])
+    for row in current_rows:
+        if row["size"] in disk_tiers:
+            disk_tiers[row["size"]]["current_count"] = int(row["count"])
+            disk_tiers[row["size"]]["current_bytes"] = int(row["bytes"])
+    for size, info in disk_tiers.items():
+        if not _replace_stale_thumbnails or size == FULL_TIER:
+            info["current_count"] = info["count"]
+            info["current_bytes"] = info["bytes"]
+        info["stale_count"] = max(0, info["count"] - info["current_count"])
+        info["replacement_mode"] = bool(
+            _replace_stale_thumbnails
+            and size in THUMB_TIERS
+            and info["stale_count"] > 0
+        )
 
     disk_used = sum(info["bytes"] for info in disk_tiers.values())
     return {
@@ -1693,6 +1747,10 @@ def cache_stats() -> dict:
             "used_bytes": disk_used,
             "tiers": disk_tiers,
         },
+        "thumbnail_config": {
+            "changed_at": _thumb_config_changed_at,
+            "replace_stale_thumbnails": _replace_stale_thumbnails,
+        },
     }
 
 
@@ -1701,34 +1759,43 @@ def _thumb_config_signature() -> str:
 
 
 def _sync_thumb_config_metadata(new_signature: str, *, replace_thumbnail_cache: bool):
-    global _last_thumb_config_signature, _thumb_config_changed_at
+    global _last_thumb_config_signature, _thumb_config_changed_at, _replace_stale_thumbnails
     now = _current_time()
 
     with _meta_lock:
         conn = _db_connect()
         row = conn.execute(
-            "SELECT thumb_config_signature, thumb_config_changed_at "
+            "SELECT thumb_config_signature, thumb_config_changed_at, replace_stale_thumbnails "
             "FROM cache_metadata WHERE cache_root = ?",
             (SSD_CACHE_DIR,),
         ).fetchone()
         previous_signature = row["thumb_config_signature"] if row else _last_thumb_config_signature
         previous_changed_at = float(row["thumb_config_changed_at"]) if row else _thumb_config_changed_at
+        previous_replace_stale = bool(row["replace_stale_thumbnails"]) if row else _replace_stale_thumbnails
 
     changed = bool(previous_signature and previous_signature != new_signature)
     if changed:
         _clear_memory_tiers(THUMB_TIERS)
         _thumb_config_changed_at = now
-        if replace_thumbnail_cache:
-            _clear_disk_tiers(THUMB_TIERS)
+        _replace_stale_thumbnails = bool(replace_thumbnail_cache)
+        for tier in THUMB_TIERS:
+            _pregen_scan_offsets[tier] = 0
     else:
         _thumb_config_changed_at = previous_changed_at or 0.0
+        _replace_stale_thumbnails = previous_replace_stale
 
     with _meta_lock:
         conn = _db_connect()
         conn.execute(
             "INSERT OR REPLACE INTO cache_metadata "
-            "(cache_root, thumb_config_signature, thumb_config_changed_at) VALUES (?, ?, ?)",
-            (SSD_CACHE_DIR, new_signature, _thumb_config_changed_at),
+            "(cache_root, thumb_config_signature, thumb_config_changed_at, replace_stale_thumbnails) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                SSD_CACHE_DIR,
+                new_signature,
+                _thumb_config_changed_at,
+                1 if _replace_stale_thumbnails else 0,
+            ),
         )
         conn.commit()
 
@@ -1740,14 +1807,27 @@ def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
     phases = {}
     remaining = 0
     for size in THUMB_TIERS:
-        count = stats["disk"]["tiers"][size]["count"]
+        tier_stats = stats["disk"]["tiers"][size]
+        count = int(
+            tier_stats.get("progress_count")
+            if tier_stats.get("progress_count") is not None
+            else (
+                tier_stats.get("current_count", 0)
+                if tier_stats.get("replacement_mode")
+                else tier_stats.get("count", 0)
+            )
+        )
+        available_count = int(tier_stats.get("count", 0))
+        current_count = int(tier_stats.get("current_count", count))
         target = target_total
         progress_pct = round((count / target_total) * 100, 1) if target_total > 0 else 0.0
         if target_total > 0:
             background_budget = _background_tier_budget(size)
             avg_bytes = (
-                int(stats["disk"]["tiers"][size]["bytes"] / count)
-                if count > 0 and stats["disk"]["tiers"][size]["bytes"] > 0
+                int(tier_stats.get("current_bytes", 0) / current_count)
+                if current_count > 0 and tier_stats.get("current_bytes", 0) > 0
+                else int(tier_stats["bytes"] / available_count)
+                if available_count > 0 and tier_stats["bytes"] > 0
                 else estimated_tier_bytes(size)
             )
             if avg_bytes > 0 and background_budget > 0:
@@ -1755,9 +1835,13 @@ def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
             remaining += max(0, target - count)
         phases[size] = {
             "count": count,
+            "available_count": available_count,
+            "current_count": current_count,
+            "stale_count": max(0, available_count - current_count),
+            "replacement_mode": bool(tier_stats.get("replacement_mode")),
             "total": target,
             "progress_pct": round((count / target) * 100, 1) if target > 0 else progress_pct,
-            "budget_bytes": stats["disk"]["tiers"][size]["budget_bytes"],
+            "budget_bytes": tier_stats["budget_bytes"],
             "background_budget_bytes": _background_tier_budget(size),
             "remaining": max(0, target - count),
         }
@@ -1765,6 +1849,7 @@ def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
     recent_rate, overall_rate = _pregen_rates()
     effective_rate = recent_rate if recent_rate > 0 else overall_rate
     eta_seconds = int((remaining / effective_rate) * 60) if remaining > 0 and effective_rate > 0 else None
+    replacement_mode = any(phase["replacement_mode"] for phase in phases.values())
 
     return {
         **dict(_pregen_status),
@@ -1774,10 +1859,12 @@ def get_pregen_status(target_total: int = 0, stats: dict | None = None) -> dict:
         "recent_images_per_min": round(recent_rate, 2),
         "overall_images_per_min": round(overall_rate, 2),
         "eta_seconds": eta_seconds,
+        "replacement_mode": replacement_mode,
     }
 
 
 def clear_cache() -> dict:
+    global _replace_stale_thumbnails
     memory = _clear_memory_cache()
     _flush_write_queue()
 
@@ -1794,7 +1881,13 @@ def clear_cache() -> dict:
     with _meta_lock:
         conn = _db_connect()
         conn.execute("DELETE FROM cache_entries WHERE cache_root = ?", (SSD_CACHE_DIR,))
+        conn.execute(
+            "UPDATE cache_metadata SET replace_stale_thumbnails = 0 WHERE cache_root = ?",
+            (SSD_CACHE_DIR,),
+        )
         conn.commit()
+
+    _replace_stale_thumbnails = False
 
     return {
         "memory_entries_cleared": memory["entries_cleared"],
@@ -1813,6 +1906,7 @@ def configure(config: dict):
     global BROWSER_CACHE_MAX_AGE, BROWSER_CACHE_STALE_WHILE_REVALIDATE
     global _executor_workers, _prefetch_workers_count, _executor, _prefetch_executor
     global _disk_allocations, _last_thumb_config_signature, _pregen_manual_pause, _thumb_config_changed_at
+    global _replace_stale_thumbnails
 
     _flush_write_queue()
     old_cache_dir = SSD_CACHE_DIR

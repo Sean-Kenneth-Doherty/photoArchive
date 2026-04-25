@@ -2474,13 +2474,16 @@ const PhotoArchive = (() => {
         if (!tier) return `${label}: —`;
         const budget = Number(tier.budget_bytes || 0);
         const progressTotal = Number(tier.progress_total || 0);
+        const progressCount = Number((tier.progress_count ?? tier.count) || 0);
+        const staleCount = Number(tier.stale_count || 0);
         const progress = progressTotal > 0
-            ? `${Number(tier.count || 0).toLocaleString()} / ${progressTotal.toLocaleString()} (${Number(tier.progress_pct || 0).toFixed(1)}%)`
+            ? `${progressCount.toLocaleString()} / ${progressTotal.toLocaleString()} (${Number(tier.progress_pct || 0).toFixed(1)}%)`
             : `${Number(tier.count || 0).toLocaleString()} cached`;
         const budgetText = budget > 0
             ? `${formatBytes(tier.bytes)} / ${formatBytes(budget)}`
             : `${formatBytes(tier.bytes)} / off`;
-        return `${label}: ${budgetText} · ${progress}`;
+        const fallbackText = staleCount > 0 ? ` · ${staleCount.toLocaleString()} older usable` : '';
+        return `${label}: ${budgetText} · ${progress}${fallbackText}`;
     }
 
     function renderCacheSettingsStatus(cacheStatus) {
@@ -2520,7 +2523,7 @@ const PhotoArchive = (() => {
         if (lgEl) lgEl.textContent = formatCacheTier('lg', tiers.lg);
         if (fullEl) fullEl.textContent = formatCacheTier('full', tiers.full);
         if (pregenEl) {
-            const state = pregen.state || 'idle';
+            const state = pregen.replacement_mode ? 'refreshing previews' : (pregen.state || 'idle');
             const phase = pregen.active_phase ? ` · ${pregen.active_phase}` : '';
             const message = pregen.message ? ` · ${pregen.message}` : '';
             const rate = Number(pregen.recent_images_per_min || pregen.overall_images_per_min || 0);
@@ -2616,7 +2619,9 @@ const PhotoArchive = (() => {
             const actual = diskTiers[name] || {};
             const pct = Math.max(0, Math.min(100, Number(actual.progress_pct || 0)));
             const capacityPct = Math.max(0, Math.min(100, Number(plan.coverage_pct || 0)));
-            const cached = Number(actual.count || 0).toLocaleString();
+            const progressCount = Number((actual.progress_count ?? actual.count) || 0);
+            const staleCount = Number(actual.stale_count || 0);
+            const cached = progressCount.toLocaleString();
             const total = Number(actual.progress_total || (name === 'full' ? rec.total_images : rec.eligible_images) || 0).toLocaleString();
             const estimated = Number(plan.estimated_cached || 0).toLocaleString();
             const capacityText = capacityPct >= 95
@@ -2625,22 +2630,28 @@ const PhotoArchive = (() => {
             let state = 'Not started';
             let cls = '';
             if (pct >= 95) {
-                state = 'Generated';
+                state = actual.replacement_mode ? 'Refreshed' : 'Generated';
                 cls = 'ready';
             } else if (pct > 0) {
-                state = `${pct.toFixed(0)}% generated`;
+                state = actual.replacement_mode ? `${pct.toFixed(0)}% refreshed` : `${pct.toFixed(0)}% generated`;
+                cls = 'selective';
+            } else if (actual.replacement_mode && staleCount > 0) {
+                state = 'Refreshing';
                 cls = 'selective';
             }
             const remaining = Number(cs.pregen?.phases?.[name]?.remaining || 0);
             const etaText = remaining > 0 && cs.pregen?.eta_seconds
                 ? `<div class="cache-card-meta"><span>${remaining.toLocaleString()} remaining</span><span>ETA ${formatEta(cs.pregen.eta_seconds)}</span></div>`
                 : '';
+            const availabilityText = actual.replacement_mode && staleCount > 0
+                ? `${cached} refreshed · ${staleCount.toLocaleString()} older usable`
+                : `${cached} of ${total} generated`;
             return `
                 <div class="cache-friendly-card ${cls}">
                     <div class="cache-card-meta"><strong>${title}</strong><span>${state}</span></div>
                     <div class="cache-progress"><div class="cache-progress-fill" style="width:${pct}%"></div></div>
                     <span>${copy}</span>
-                    <div class="cache-card-meta"><span>${cached} of ${total} generated</span><span>${capacityText}</span></div>
+                    <div class="cache-card-meta"><span>${availabilityText}</span><span>${capacityText}</span></div>
                     ${etaText}
                 </div>
             `;
@@ -2889,7 +2900,7 @@ const PhotoArchive = (() => {
         const changes = thumbnailOutputChanges();
         notice.classList.toggle('hidden', changes.length === 0);
         if (copy && changes.length) {
-            copy.textContent = `${changes.join(', ')}. Keeping existing previews avoids a full rebuild; replacing them gives one consistent preview quality everywhere.`;
+            copy.textContent = `${changes.join(', ')}. Keeping existing previews avoids extra work. Refreshing them keeps old previews usable while photoArchive replaces each file in the background.`;
         }
     }
 

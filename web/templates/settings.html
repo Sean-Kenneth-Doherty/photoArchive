@@ -86,7 +86,7 @@
                     </label>
                     <label>
                         <input type="radio" name="thumbnail_cache_policy" value="replace">
-                        <span>Replace existing previews and rebuild the preview cache</span>
+                        <span>Refresh existing previews in the background; old previews stay usable until replaced</span>
                     </label>
                 </div>
             </div>
@@ -152,7 +152,7 @@
                     <div>Auto warm-up: <strong id="cache-auto-prefetch">—</strong></div>
                     <div>Browser policy: <strong id="cache-browser-policy">—</strong></div>
                     <div>Settings file: <code id="settings-path">—</code></div>
-                    <div>When output size or JPEG quality changes, choose whether to keep existing previews or replace them during Save.</div>
+                    <div>When output size or JPEG quality changes, replacement happens in place so browsing can keep using the older previews while new ones are generated.</div>
                 </div>
             </details>
         </section>

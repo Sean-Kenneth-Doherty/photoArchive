@@ -449,8 +449,14 @@ async def build_cache_status(ahead: int = 100):
 
     for tier_name, tier in disk["tiers"].items():
         progress_total = active_total if tier_name in thumbnails.THUMB_TIERS else stats["total_images"]
+        progress_count = (
+            tier.get("current_count", 0)
+            if tier.get("replacement_mode")
+            else tier.get("count", 0)
+        )
         tier["progress_total"] = progress_total
-        tier["progress_pct"] = round((tier["count"] / progress_total) * 100, 1) if progress_total > 0 else 0.0
+        tier["progress_count"] = progress_count
+        tier["progress_pct"] = round((progress_count / progress_total) * 100, 1) if progress_total > 0 else 0.0
         tier["utilization_pct"] = round(
             (tier["bytes"] / tier["budget_bytes"]) * 100,
             1,
@@ -470,7 +476,7 @@ async def build_cache_status(ahead: int = 100):
         conn = await db.get_db()
         try:
             cursor = await conn.execute(
-                "SELECT id, filepath FROM images WHERE status = 'unculled' ORDER BY id LIMIT ?",
+                "SELECT id, filepath FROM images WHERE status IN ('kept', 'maybe') ORDER BY id LIMIT ?",
                 (ahead,),
             )
             rows = await cursor.fetchall()
@@ -1727,7 +1733,7 @@ async def build_ai_status():
 
 @app.get("/api/ai/status")
 async def ai_status():
-    """CLIP embedding and taste model status for the bottom bar."""
+    """Embedding worker and taste model status for the bottom bar."""
     return await build_ai_status()
 
 

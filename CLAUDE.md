@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-photoArchive is a FastAPI web app for managing, ranking, and searching a large photo archive using AI-powered embeddings and Elo-based ranking. The workflow: Cull bad images, Compare/rank keepers via mosaic grid, Browse/search in the Library.
+photoArchive is a FastAPI web app for managing, ranking, and searching a large photo archive using AI-powered embeddings and Elo-based ranking. The workflow: browse/search in the Library, flag images with lightweight Picked/Unflagged/Rejected flags, then compare/rank images via mosaic grid.
 
 ## Running
 
@@ -37,45 +37,47 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 |---|---|
 | `app.py` | Routes, startup tasks, API endpoints for all features |
 | `db.py` | SQLite schema, queries, WAL mode. Tables: `images`, `comparisons`, `embeddings` |
-| `clip_worker.py` | Background AI worker: Qwen3-VL-Embedding-2B (int4), taste model training, text search encoding |
+| `embedding_worker.py` | Background AI worker: Qwen3-VL-Embedding-2B (int4), taste model training, text search encoding |
 | `ai_models.py` | Model installation/management, download state tracking |
 | `settings.py` | Runtime settings with JSON persistence, hot-reload support |
 | `scanner.py` | Recursive folder scan, batch inserts (100 at a time) |
 | `pairing.py` | Elo calculation, Swiss-system pairing with 30% random swap |
 | `elo_propagation.py` | Propagate Elo changes to similar images via embedding cosine similarity |
-| `thumbnails.py` | Three-size thumbnail generation (sm/md/lg), LRU cache, disk cache, background prefetch |
+| `thumbnails.py` | Progressive sm/md/lg/original cache tiers, RAM/SSD budgets, disk cache, background prefetch |
 
 ### Frontend (vanilla HTML/CSS/JS)
 
 | File | Purpose |
 |---|---|
-| `static/app.js` | IIFE module (`PhotoArchive`). All UI state for cull, compare, library, settings |
+| `static/app.js` | IIFE module (`PhotoArchive`). All UI state for compare, library, settings |
 | `static/style.css` | Dark theme, justified flex grids, bottom bar, lightbox, filters |
 | `templates/base.html` | Base layout with navbar/bottom_bar blocks |
 | `templates/_filters.html` | Shared filter partial (orientation, ranked status, stars, folder, thumb slider) |
 | `templates/compare.html` | Mosaic/Swiss/Top50 compare modes with AI panel |
 | `templates/library.html` | Justified photo grid with search, filters, lightbox, batch select |
-| `templates/cull.html` | Single-image and grid cull modes |
 | `templates/settings.html` | Thumbnail, cache, and AI model configuration |
 | `templates/index.html` | Landing page with folder scan |
 
 ### Database Schema
 
-**images**: id, filename, filepath (UNIQUE), elo (default 1200), comparisons, status (unculled|kept|maybe|rejected), orientation, predicted_elo, uncertainty, aspect_ratio
+**images**: id, filename, filepath (UNIQUE), elo (default 1200), comparisons, flag (picked|unflagged|rejected), status (legacy internal ranking pool), orientation, predicted_elo, uncertainty, aspect_ratio
 
 **comparisons**: winner_id, loser_id, mode (swiss|topn|mosaic), elo_before_winner, elo_before_loser (for undo)
 
 **embeddings**: image_id (PK), embedding (BLOB, 2048-dim float32), created_at
 
+**cache_entries**: cache_root, size (sm|md|lg|full), image_id, path, source_signature, size_bytes, last_accessed, created_at
+
+**cache_metadata**: cache_root, thumb_config_signature, thumb_config_changed_at, replace_stale_thumbnails
+
 ### Pages
 
 1. **/** — Landing page, folder scan
-2. **/cull** — Filter bad images. Single (arrow keys) or grid mode (batch click)
-3. **/compare** — Rank via mosaic (pick best from justified grid) or Swiss A/B pairs
-4. **/library** — Browse, search, filter, export. Justified flex grid with infinite scroll
-5. **/settings** — Thumbnail sizes, cache config, AI model install/status
+2. **/compare** — Rank via mosaic (pick best from justified grid) or Swiss A/B pairs
+3. **/library** — Browse, search, flag, filter, export. Justified flex grid with infinite scroll
+4. **/settings** — Thumbnail sizes, cache config, AI model install/status
 
-### AI System (`clip_worker.py`)
+### AI System (`embedding_worker.py`)
 
 - **Model**: Qwen3-VL-Embedding-2B, int4 quantized via bitsandbytes, ~3.4GB VRAM
 - **Embeddings**: 2048-dim (Matryoshka truncated from 4096), stored as BLOB in `embeddings` table
@@ -86,7 +88,16 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 - **Auto-collections**: K-means clustering on embeddings
 - **Duplicate detection**: Pairwise cosine similarity above threshold
 - **Elo propagation** (`elo_propagation.py`): After each comparison, propagates scaled Elo adjustments to visually similar images (cosine sim > 0.75, max 10 neighbors, decay 0.3). Only affects images with < 8 direct comparisons. Fire-and-forget background task.
-- **Background loop**: Embeds in batches of 4, trains taste model every 5 batches, reports speed/ETA metrics
+- **Background loop**: Embeds in batches of 4 from cached `md` thumbnails on SSD, trains taste model every 5 batches, reports speed/ETA metrics
+
+### Image Cache (`thumbnails.py`)
+
+- **Progressive display**: UI paths should move from `sm` to `md` to `lg` to `full`/original when available. Library, loupe, compare, and mosaic all use this pattern.
+- **Durable SSD tiers**: `sm` and `md` are filled first for instant grid/loupe browsing. Remaining SSD budget is allocated automatically between `lg` previews and selective hot originals based on the cache profile.
+- **RAM tiering**: RAM is an LRU over `sm`/`md`/`lg`, split by cache profile. It is for recent browsing; SSD is the durable speed layer.
+- **No HDD thumbnail overflow**: thumbnails live in RAM/SSD only. If a tier cannot fit, the app warms the most useful images and regenerates missing previews from source as needed.
+- **In-place refresh**: changing output size or JPEG quality updates `cache_metadata`. If the user chooses refresh, old previews stay readable and background pregeneration overwrites each thumbnail atomically as it reaches that image. Progress counts refreshed previews separately from older usable previews.
+- **Hot warming**: `/api/images/warm` promotes current and nearby images so loupe/compare/mosaic interactions bias the SSD cache toward what the user is about to see.
 
 ### UI Patterns
 
@@ -94,7 +105,7 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 - **Justified flex grid**: Both library and mosaic use `flex-wrap` with `flex-grow: aspectRatio` per card. Library scrolls, mosaic fits viewport via binary-search row height.
 - **Shared filters** (`_filters.html`): Orientation icons, ranked status icons, star rating (hover preview), folder dropdown, thumb size slider. Used on both compare and library pages.
 - **Loupe view**: Lightroom-style full-screen image view with filmstrip navigation, progressive loading (sm→md→lg), EXIF metadata, Find Similar
-- **Fire-and-forget**: Cull and mosaic picks POST without awaiting response
+- **Fire-and-forget**: Mosaic picks POST without awaiting response
 - **Infinite scroll**: Library loads more images when within 600px of bottom
 
 ### Key API Endpoints
@@ -104,11 +115,6 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 | **Scan** | |
 | `POST /api/scan` | Start recursive folder scan |
 | `GET /api/scan/status` | Scan progress |
-| **Cull** | |
-| `GET /api/cull/next` | Get unculled images for review |
-| `POST /api/cull` | Submit single cull decision |
-| `POST /api/cull/batch` | Submit batch cull decisions (grid mode) |
-| `POST /api/cull/undo` | Undo last cull |
 | **Compare** | |
 | `GET /api/mosaic/next` | Get images for mosaic grid with strategy/filter params |
 | `POST /api/mosaic/pick` | Record mosaic comparison (winner vs all losers) + propagate |
@@ -124,7 +130,11 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 | `GET /api/folders` | Folder tree with image counts |
 | `GET /api/export` | Export rankings as JSON/CSV (supports id filtering) |
 | **Images** | |
-| `GET /api/thumb/{size}/{id}` | Serve thumbnail (sm/md/lg) with ETag caching |
+| `GET /api/thumb/{size}/{id}` | Serve thumbnail (sm/md/lg) with ETag caching; `?cached=1` only reads RAM/SSD |
+| `GET /api/full/{id}` | Serve browser-readable original or large preview; `?cached=1` only reads SSD-cached originals |
+| `GET /api/image/{id}/media-status` | Report cached tiers for progressive UI loading |
+| `POST /api/image/{id}/flag` | Set lightweight flag: picked, unflagged, rejected |
+| `POST /api/images/warm` | Warm current/nearby thumbnails and originals into SSD cache |
 | `GET /api/image/{id}/exif` | EXIF metadata from image file |
 | **AI** | |
 | `GET /api/ai/status` | Embedding progress, model state, speed metrics, ETA |
@@ -133,7 +143,10 @@ Photos can be on any mounted drive. The app is designed for slow HDDs with aggre
 | `GET /api/settings` | Current settings + cache stats + model status |
 | `POST /api/settings` | Save settings (hot-reload) |
 | `POST /api/settings/reset` | Reset to defaults |
-| `GET /api/cache/status` | Thumbnail cache fill stats |
+| `GET /api/cache/status` | Cache fill stats, tier budgets, archive-size recommendations |
+| `POST /api/cache/pregen/start` | Force cache pregeneration on |
+| `POST /api/cache/pregen/stop` | Pause manual cache pregeneration |
+| `GET /api/cache/pregen/status` | Cache pregeneration state, phase progress, speed, ETA |
 | `POST /api/cache/clear` | Clear thumbnail caches |
 | `GET /api/stats` | Overall image/comparison counts |
 

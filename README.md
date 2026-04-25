@@ -37,17 +37,19 @@ The port and host are configurable via `PHOTOARCHIVE_PORT` and `PHOTOARCHIVE_HOS
 
 ## What It Does
 
-### The Workflow: Cull → Compare → Browse
+### The Workflow: Browse → Flag → Compare
 
-1. **Cull** — Quickly review and reject bad images. Arrow keys in single mode, or batch-click in grid mode. Undo supported.
+1. **Browse** — Review your archive in a justified Library grid and Lightroom-style loupe.
 
-2. **Compare** — Rank the keepers using Elo ratings. Three modes:
+2. **Flag** — Mark images as Picked, Unflagged, or Rejected with lightweight Lightroom-style flags. Flags are just filters; they do not change ranking behavior.
+
+3. **Compare** — Rank images using Elo ratings. Three modes:
    - **Mosaic**: Pick the best from a justified grid of 12 images. One click = 11 comparisons. Fast.
    - **Swiss**: Side-by-side A/B comparisons with Swiss-system pairing (30% random swap to avoid echo chambers).
    - **Top 50**: Refine rankings among your highest-rated images.
    - Five selection strategies: Learn (AI-guided uncertainty), Explore, Compete, Top Cut, Random.
 
-3. **Library** — Browse your ranked archive. Justified grid, Lightroom-style loupe view with filmstrip, text search, find similar, filter by orientation/stars/folder/ranked status, export rankings as JSON or CSV.
+4. **Library** — Browse your ranked archive. Justified grid, Lightroom-style loupe view with filmstrip, text search, find similar, filter by flag/orientation/stars/folder/ranked status, export rankings as JSON or CSV.
 
 ### AI Features
 
@@ -82,7 +84,7 @@ web/
   scanner.py            Recursive folder scanning with batch inserts
   pairing.py            Elo calculation and Swiss-system pairing
   elo_propagation.py    Propagate Elo to similar images via embedding cosine similarity
-  thumbnails.py         Three-tier thumbnail generation (sm/md/lg), LRU cache, prefetch
+  thumbnails.py         Progressive sm/md/lg/original cache, RAM/SSD budgets, prefetch
   static/
     app.js              Frontend module (vanilla JS IIFE, no framework)
     style.css           Dark theme, justified grids, loupe view
@@ -90,7 +92,6 @@ web/
     base.html           Base layout with navbar/bottom_bar blocks
     _filters.html       Shared filter partial (orientation, stars, folder, ranked status)
     index.html          Landing page with folder scan
-    cull.html            Single and grid cull modes
     compare.html        Mosaic/Swiss/Top50 compare modes with AI panel
     library.html        Justified grid, loupe view, filmstrip, search
     settings.html       Thumbnail, cache, and AI model configuration
@@ -106,7 +107,9 @@ web/
 ### Design Decisions
 
 - **Local-first**: Everything runs on your machine. SQLite database, local thumbnails, local embeddings. No network calls except model download.
-- **Slow storage friendly**: Designed for photos on external HDDs. Three-tier thumbnail cache on fast local storage, aggressive prefetching, background processing.
+- **Slow storage friendly**: Designed for photos on external HDDs. RAM + SSD cache budgets are user-configurable, with automatic tier allocation and progressive image upgrades from `sm` to `md` to `lg` to cached originals.
+- **In-place preview refreshes**: Changing thumbnail size or JPEG quality does not have to wipe the cache. Old previews can remain usable while photoArchive replaces each file in the background.
+- **SSD-first AI workflow**: The embedding worker reads cached `md` previews from SSD, so search indexing does not compete with thumbnail generation for HDD reads.
 - **No framework frontend**: The entire UI is one vanilla JS module. No build step, no dependencies. Just open and edit.
 - **Elo over stars**: Star ratings require absolute judgments. Elo only requires relative ones ("which is better?") and converges to a true ranking automatically.
 - **Selective GZip**: Custom middleware skips compression for binary image payloads to avoid wasting CPU on already-compressed data.
@@ -116,22 +119,24 @@ web/
 Settings are available at **http://localhost:8000/settings** after launch:
 
 - Thumbnail sizes (small, medium, large) and quality
-- Cache limits and prefetch settings
+- RAM/SSD cache budgets, cache profile, tier allocation, and prefetch settings
 - AI model installation and status
 - Embedding model selection
 - Search similarity threshold
+
+When thumbnail size or JPEG quality changes, Settings lets you either keep existing previews as-is or refresh them in the background. Refreshing is progressive: the old preview remains available until the new one is generated and atomically written into place.
 
 Settings persist to `web/settings.local.json` (gitignored). Legacy settings are auto-migrated.
 
 ## Data
 
-All data stays in `web/`:
+All app data stays in `web/` by default:
 - `photoarchive.db` — SQLite database (image metadata, Elo ratings, comparisons, embeddings)
-- `.thumbcache/` — Generated thumbnails
+- `.thumbcache/` — Generated thumbnails plus selective SSD copies of hot originals
 - `.embedcache/` — Cached embedding vectors
 - `.models/` — Downloaded AI models (~3.4GB)
 
-All of these are gitignored. Your photo files are never copied or modified — the app only reads them to generate thumbnails and embeddings.
+All of these are gitignored. Your source photo files are never modified. Browser-readable originals may be copied into the SSD hot cache when there is room, but the archive files themselves remain untouched.
 
 ## License
 
