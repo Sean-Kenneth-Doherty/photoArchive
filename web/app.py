@@ -1421,9 +1421,10 @@ async def _diverse_sample(candidates: list[dict], count: int) -> list[dict]:
         import numpy as np
         import embed_cache
 
-        image_ids, matrix = await embed_cache.get_matrix()
+        image_ids, matrix = embed_cache.get_warm_matrix()
         if image_ids is None:
-            raise ImportError("No embeddings")
+            asyncio.create_task(embed_cache.get_matrix())
+            return random.sample(candidates, min(count, len(candidates)))
 
         # Use id_to_idx for O(1) lookups instead of building a full dict copy
         id_to_idx = embed_cache._cache.get("id_to_idx") or {}

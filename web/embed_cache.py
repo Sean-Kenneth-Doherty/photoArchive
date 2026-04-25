@@ -197,6 +197,13 @@ async def get_matrix():
         return image_ids, _matrix_view()
 
 
+def get_warm_matrix():
+    """Return the current in-memory matrix without triggering a rebuild."""
+    if _cache["matrix"] is None or _cache["image_ids"] is None:
+        return None, None
+    return _cache["image_ids"], _matrix_view()
+
+
 def add_vectors(rows: list[tuple[int, np.ndarray]]):
     """Append freshly stored vectors to the warm cache without a full DB rebuild."""
     if not rows or _cache["matrix"] is None or _cache["image_ids"] is None:
