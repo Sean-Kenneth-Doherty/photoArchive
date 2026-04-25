@@ -1882,10 +1882,12 @@ button:disabled {
 
 .filter-icon:hover {
     color: #aaa;
+    background: rgba(255, 255, 255, 0.06);
 }
 
 .filter-icon.active {
     color: #fff;
+    background: rgba(108, 180, 238, 0.12);
 }
 
 .filter-flag {
