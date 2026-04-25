@@ -32,21 +32,21 @@
 <footer class="bottom-bar" id="compare-bar">
     <div class="bar-section bar-modes">
         <div class="toggle-group toggle-group-sm">
-            <button id="mode-mosaic" class="active" onclick="PhotoArchive.setCompareMode('mosaic')">Mosaic</button>
-            <button id="mode-swiss" onclick="PhotoArchive.setCompareMode('swiss')">Swiss</button>
-            <button id="mode-topn" onclick="PhotoArchive.setCompareMode('topn')">Top 50</button>
+            <button type="button" id="mode-mosaic" class="active" onclick="PhotoArchive.setCompareMode('mosaic')">Mosaic</button>
+            <button type="button" id="mode-swiss" onclick="PhotoArchive.setCompareMode('swiss')">Swiss</button>
+            <button type="button" id="mode-topn" onclick="PhotoArchive.setCompareMode('topn')">Top 50</button>
         </div>
     </div>
     <div class="bar-divider"></div>
     <div class="bar-section bar-strategies" id="bar-strategies">
         <div class="toggle-group toggle-group-sm">
-            <button id="strategy-diverse" class="active" onclick="PhotoArchive.setMosaicStrategy('diverse')" title="Maximize visual variety in the grid">Diverse</button>
-            <button id="strategy-explore" onclick="PhotoArchive.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
-            <button id="strategy-compete" onclick="PhotoArchive.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
-            <button id="strategy-top" onclick="PhotoArchive.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
-            <button id="strategy-random" onclick="PhotoArchive.setMosaicStrategy('random')" title="Uniform random">Random</button>
+            <button type="button" id="strategy-diverse" class="active" onclick="PhotoArchive.setMosaicStrategy('diverse')" title="Maximize visual variety in the grid">Diverse</button>
+            <button type="button" id="strategy-explore" onclick="PhotoArchive.setMosaicStrategy('explore')" title="Favor unseen images">Explore</button>
+            <button type="button" id="strategy-compete" onclick="PhotoArchive.setMosaicStrategy('compete')" title="Match similar Elo levels">Compete</button>
+            <button type="button" id="strategy-top" onclick="PhotoArchive.setMosaicStrategy('top')" title="Top 50 images only">Top Cut</button>
+            <button type="button" id="strategy-random" onclick="PhotoArchive.setMosaicStrategy('random')" title="Uniform random">Random</button>
         </div>
-        <button class="bar-btn" onclick="PhotoArchive.mosaicShuffle()">Shuffle</button>
+        <button type="button" class="bar-btn" onclick="PhotoArchive.mosaicShuffle()">Shuffle</button>
     </div>
     <div class="bar-section bar-hints hidden" id="bar-hints">
         <span class="key">←</span> Left
