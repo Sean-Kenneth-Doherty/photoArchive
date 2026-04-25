@@ -993,6 +993,7 @@ const PhotoArchive = (() => {
     let sortDesc = true;
     let lastDateGroup = null;
     let dateGroupsData = [];
+    let dateScrubberGeneration = 0;
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
@@ -1801,10 +1802,11 @@ const PhotoArchive = (() => {
             if (existing) existing.remove();
             return;
         }
-        // Fetch date groups for the scrubber
+        const gen = ++dateScrubberGeneration;
         const url = `/api/date-groups?${filterParams().replace(/^&/, '')}`;
         try {
             const data = await fetch(url).then(r => r.json());
+            if (gen !== dateScrubberGeneration) return;
             dateGroupsData = data.groups || [];
             if (rankingsSort === 'date_taken_asc') dateGroupsData.reverse();
             renderDateScrubber();
