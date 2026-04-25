@@ -2002,6 +2002,7 @@ const PhotoArchive = (() => {
 
         document.body.classList.add('loupe-open');
         loupe.classList.remove('hidden');
+        requestAnimationFrame(() => loupe.classList.add('loupe-visible'));
         loupeCenterFit({ animate: false });
 
         // Progressive loading: sm -> md -> lg -> original. Slow tiers time out
@@ -2482,7 +2483,10 @@ const PhotoArchive = (() => {
 
     function closeLightbox() {
         const loupe = document.getElementById('loupe');
-        if (loupe) loupe.classList.add('hidden');
+        if (loupe) {
+            loupe.classList.remove('loupe-visible');
+            setTimeout(() => loupe.classList.add('hidden'), 150);
+        }
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
         if (loupeFullLoadTimer) {

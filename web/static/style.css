@@ -2038,6 +2038,12 @@ button:disabled {
     z-index: 1000;
     display: flex;
     flex-direction: column;
+    opacity: 0;
+    transition: opacity 0.15s ease-out;
+}
+
+.loupe.loupe-visible {
+    opacity: 1;
 }
 
 .loupe-main {
