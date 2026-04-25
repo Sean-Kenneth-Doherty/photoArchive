@@ -1007,25 +1007,47 @@ button:disabled {
 .cache-summary-head span {
     display: block;
     color: #8e949b;
-    font-size: 12px;
+    font-size: 13px;
     line-height: 1.45;
     margin-top: 3px;
+}
+
+.cache-summary-head strong .cache-building-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #c9a84c;
+    margin-left: 8px;
+    vertical-align: middle;
+    animation: cache-pulse 2s ease-in-out infinite;
+}
+
+@keyframes cache-pulse {
+    0%, 100% { opacity: .4; }
+    50% { opacity: 1; }
 }
 
 .cache-friendly-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 10px;
+    gap: 8px;
 }
 
 .cache-friendly-card {
     background: #242424;
     border: 1px solid #363636;
+    border-left: 3px solid #363636;
     border-radius: 8px;
-    padding: 12px;
+    padding: 10px 12px;
     display: grid;
-    gap: 8px;
+    gap: 6px;
 }
+
+.cache-friendly-card.tier-sm  { border-left-color: #6cb4ee; }
+.cache-friendly-card.tier-md  { border-left-color: #5fc49c; }
+.cache-friendly-card.tier-lg  { border-left-color: #a78bfa; }
+.cache-friendly-card.tier-full { border-left-color: #c9a84c; }
 
 .cache-friendly-card strong {
     color: #ededed;
@@ -1039,7 +1061,7 @@ button:disabled {
 }
 
 .cache-progress {
-    height: 6px;
+    height: 10px;
     background: #151515;
     border-radius: 999px;
     overflow: hidden;
@@ -1048,17 +1070,16 @@ button:disabled {
 .cache-progress-fill {
     height: 100%;
     width: 0;
-    background: #6cb4ee;
     border-radius: inherit;
+    transition: width .4s ease;
 }
 
-.cache-friendly-card.ready .cache-progress-fill {
-    background: #5fc49c;
-}
+.cache-friendly-card.tier-sm  .cache-progress-fill { background: #6cb4ee; }
+.cache-friendly-card.tier-md  .cache-progress-fill { background: #5fc49c; }
+.cache-friendly-card.tier-lg  .cache-progress-fill { background: #a78bfa; }
+.cache-friendly-card.tier-full .cache-progress-fill { background: #c9a84c; }
 
-.cache-friendly-card.selective .cache-progress-fill {
-    background: #c9a84c;
-}
+.cache-friendly-card.ready .cache-progress-fill { opacity: .7; }
 
 .cache-card-meta {
     display: flex;
@@ -1070,7 +1091,7 @@ button:disabled {
 
 .cache-advice {
     display: grid;
-    gap: 6px;
+    gap: 10px;
     color: #a3a9b0;
     font-size: 12px;
     line-height: 1.45;
@@ -1078,8 +1099,76 @@ button:disabled {
     padding-top: 12px;
 }
 
-.cache-advice strong {
+.cache-budget-bar {
+    height: 14px;
+    background: #151515;
+    border-radius: 999px;
+    overflow: hidden;
+    display: flex;
+}
+
+.cache-budget-seg {
+    height: 100%;
+    min-width: 2px;
+    transition: width .4s ease;
+}
+
+.cache-budget-seg.seg-sm   { background: #6cb4ee; }
+.cache-budget-seg.seg-md   { background: #5fc49c; }
+.cache-budget-seg.seg-lg   { background: #a78bfa; }
+.cache-budget-seg.seg-full { background: #c9a84c; }
+
+.cache-budget-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    font-size: 11px;
+    color: #8e949b;
+}
+
+.cache-budget-legend span::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    margin-right: 5px;
+    vertical-align: -1px;
+}
+
+.cache-budget-legend .leg-sm::before   { background: #6cb4ee; }
+.cache-budget-legend .leg-md::before   { background: #5fc49c; }
+.cache-budget-legend .leg-lg::before   { background: #a78bfa; }
+.cache-budget-legend .leg-full::before { background: #c9a84c; }
+.cache-budget-legend .leg-free::before { background: #303030; }
+
+.cache-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 6px;
+}
+
+.cache-metric {
+    background: #242424;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.cache-metric-label {
+    color: #8e949b;
+    font-size: 11px;
+    margin-bottom: 2px;
+}
+
+.cache-metric-value {
     color: #e5e9ee;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.cache-ram-note {
+    color: #8e949b;
+    font-size: 11px;
 }
 
 .settings-advanced {

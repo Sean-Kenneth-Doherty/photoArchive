@@ -3544,13 +3544,16 @@ const PhotoArchive = (() => {
                 ? 'Grid browsing is warmed; loupe previews are still building'
                 : 'photoArchive is building the fast cache';
 
-        if (titleEl) titleEl.textContent = headline;
+        if (titleEl) {
+            const building = mdWarm < 95;
+            titleEl.innerHTML = headline + (building ? ' <span class="cache-building-dot"></span>' : '');
+        }
         if (subtitleEl) {
             subtitleEl.textContent =
                 `${profileLabel} priority · ${formatBytes(disk.used_bytes)} used of ${formatBytes(disk.limit_bytes)} on SSD`;
         }
 
-        const card = (name, title, copy) => {
+        const card = (name, title) => {
             const plan = rec.tiers[name] || {};
             const actual = diskTiers[name] || {};
             const pct = Math.max(0, Math.min(100, Number(actual.progress_pct || 0)));
@@ -3583,64 +3586,71 @@ const PhotoArchive = (() => {
                 ? `${cached} refreshed · ${staleCount.toLocaleString()} older usable`
                 : `${cached} of ${total} generated`;
             return `
-                <div class="cache-friendly-card ${cls}">
+                <div class="cache-friendly-card tier-${name} ${cls}">
                     <div class="cache-card-meta"><strong>${title}</strong><span>${state}</span></div>
                     <div class="cache-progress"><div class="cache-progress-fill" style="width:${pct}%"></div></div>
-                    <span>${copy}</span>
                     <div class="cache-card-meta"><span>${availabilityText}</span><span>${capacityText}</span></div>
                     ${etaText}
                 </div>
             `;
         };
         el.innerHTML = [
-            card('sm', 'Grid scrolling', 'Small previews that make the library feel instant.'),
-            card('md', 'Loupe previews', 'Medium previews used first when opening an image.'),
-            card('lg', 'High-res previews', 'Sharper previews for zooming and large displays.'),
-            card('full', 'Original files', 'Originals copied to SSD when there is room.'),
+            card('sm', 'Grid scrolling'),
+            card('md', 'Loupe previews'),
+            card('lg', 'High-res previews'),
+            card('full', 'Original files'),
         ].join('');
 
         if (adviceEl) {
             const needs = (name) => Number(rec.tiers[name]?.full_archive_bytes || 0);
+            const used = (name) => Number(diskTiers[name]?.used_bytes || 0);
             const instantBytes = needs('sm') + needs('md');
             const allHighResBytes = instantBytes + needs('lg');
             const originalsBytes = needs('full');
             const ssdBudget = Number(disk.limit_bytes || 0);
             const memoryBudget = Number(cs.memory?.limit_bytes || 0);
-            const lgPlan = rec.tiers.lg || {};
-            const fullPlan = rec.tiers.full || {};
-            const quality = Number(settings?.thumb_quality || 0);
-            const previewSampleCount = Math.min(
-                Number(rec.tiers.sm?.sample_count || 0),
-                Number(rec.tiers.md?.sample_count || 0),
-                Number(rec.tiers.lg?.sample_count || 0),
-            );
-            const previewEstimateEarly = ['sm', 'md', 'lg'].some(estimateIsEarly);
-            const previewEstimateLabel = previewEstimateEarly
-                ? `Early estimate${quality ? ` at JPEG ${quality}` : ''}`
-                : `Estimate${quality ? ` at JPEG ${quality}` : ''}`;
-            const previewEstimateNote = previewEstimateEarly
-                ? ` Based on the first ${previewSampleCount.toLocaleString()} regenerated previews, so this will refine as the cache rebuilds.`
-                : '';
-            const currentHotBytes = Math.max(0, ssdBudget - instantBytes);
-            const ssdFitText = ssdBudget >= allHighResBytes
-                ? `Based on the current estimate, your ${formatBytes(ssdBudget)} SSD budget can fit all preview tiers, with about ${formatBytes(ssdBudget - allHighResBytes)} left for hot originals.`
-                : ssdBudget >= instantBytes
-                    ? `Your current ${formatBytes(ssdBudget)} SSD budget covers the everyday target and leaves about ${formatBytes(currentHotBytes)} for hot high-res previews and originals.`
-                    : `Your current ${formatBytes(ssdBudget)} SSD budget is below the everyday target, so photoArchive will favor the images you touch most.`;
-            const hotPlanText =
-                `At the current priority, the dynamic area has room for about ${Number(lgPlan.estimated_cached || 0).toLocaleString()} high-res previews and ${Number(fullPlan.estimated_cached || 0).toLocaleString()} originals.`;
-            const ramText = memoryBudget >= 3 * 1024 * 1024 * 1024
-                ? `${formatBytes(memoryBudget)} RAM is generous for this app; it will keep recent medium/high-res previews hot while SSD does the durable work.`
+
+            // Budget bar segments (proportional to actual usage within the budget)
+            const seg = (name) => ssdBudget > 0 ? Math.max(0, Math.min(100, used(name) / ssdBudget * 100)) : 0;
+            const usedTotal = used('sm') + used('md') + used('lg') + used('full');
+            const freePct = ssdBudget > 0 ? Math.max(0, 100 - (usedTotal / ssdBudget * 100)) : 100;
+
+            // RAM assessment (short)
+            const ramNote = memoryBudget >= 3 * 1024 * 1024 * 1024
+                ? `${formatBytes(memoryBudget)} RAM — generous; recent previews stay hot.`
                 : memoryBudget >= 1 * 1024 * 1024 * 1024
-                    ? `${formatBytes(memoryBudget)} RAM is a solid browsing cache. More helps long loupe sessions, but SSD cache is still the bigger lever.`
-                    : `${formatBytes(memoryBudget)} RAM is conservative. Browsing will still work, but recently viewed previews will cycle out sooner.`;
+                    ? `${formatBytes(memoryBudget)} RAM — solid for browsing.`
+                    : `${formatBytes(memoryBudget)} RAM — conservative; previews cycle out faster.`;
+
             adviceEl.innerHTML = `
-                <div><strong>Current SSD budget:</strong> ${ssdFitText}</div>
-                <div><strong>Current hot cache:</strong> ${hotPlanText}</div>
-                <div><strong>Everyday target:</strong> ${formatBytes(instantBytes)} covers grid scrolling and loupe previews for this archive. ${formatBytes(Math.ceil(instantBytes * 1.25))} leaves comfortable breathing room.</div>
-                <div><strong>All high-res previews:</strong> ${previewEstimateLabel}: about ${formatBytes(allHighResBytes)} for small + medium + large preview tiers.${previewEstimateNote}</div>
-                <div><strong>All originals:</strong> about ${formatBytes(originalsBytes)}, so originals are treated as a selective hot cache instead of a full duplicate archive.</div>
-                <div><strong>RAM budget:</strong> ${ramText}</div>
+                <div class="cache-budget-bar">
+                    <div class="cache-budget-seg seg-sm" style="width:${seg('sm')}%"></div>
+                    <div class="cache-budget-seg seg-md" style="width:${seg('md')}%"></div>
+                    <div class="cache-budget-seg seg-lg" style="width:${seg('lg')}%"></div>
+                    <div class="cache-budget-seg seg-full" style="width:${seg('full')}%"></div>
+                </div>
+                <div class="cache-budget-legend">
+                    <span class="leg-sm">Grid ${formatBytes(used('sm'))}</span>
+                    <span class="leg-md">Loupe ${formatBytes(used('md'))}</span>
+                    <span class="leg-lg">High-res ${formatBytes(used('lg'))}</span>
+                    <span class="leg-full">Originals ${formatBytes(used('full'))}</span>
+                    <span class="leg-free">${formatBytes(Math.max(0, ssdBudget - usedTotal))} free</span>
+                </div>
+                <div class="cache-metrics">
+                    <div class="cache-metric">
+                        <div class="cache-metric-label">Everyday target</div>
+                        <div class="cache-metric-value">${formatBytes(instantBytes)}</div>
+                    </div>
+                    <div class="cache-metric">
+                        <div class="cache-metric-label">All previews</div>
+                        <div class="cache-metric-value">${formatBytes(allHighResBytes)}</div>
+                    </div>
+                    <div class="cache-metric">
+                        <div class="cache-metric-label">All originals</div>
+                        <div class="cache-metric-value">${formatBytes(originalsBytes)}</div>
+                    </div>
+                </div>
+                <div class="cache-ram-note">${ramNote}</div>
             `;
         }
     }
