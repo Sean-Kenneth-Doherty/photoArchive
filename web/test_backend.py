@@ -367,6 +367,54 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("action_id", columns)
         self.assertIn("idx_comparisons_action_id", indexes)
 
+    async def test_rankings_query_plan_uses_active_sort_indexes(self):
+        source = await self._source()
+        first = await self._image(source["id"], "a.jpg", elo=1500)
+        second = await self._image(source["id"], "b.jpg", elo=1300)
+        conn = await db.get_db()
+        try:
+            await conn.execute(
+                "UPDATE images SET date_taken = ?, file_modified_at = ?, file_size = ?, "
+                "width = ?, height = ?, camera_make = ?, camera_model = ? WHERE id = ?",
+                ("2024-01-02 03:04:05", 1700000000.0, 200, 4000, 3000, "Fuji", "X-T5", first),
+            )
+            await conn.execute(
+                "UPDATE images SET date_taken = ?, file_modified_at = ?, file_size = ?, "
+                "width = ?, height = ?, camera_make = ?, camera_model = ? WHERE id = ?",
+                ("2023-01-02 03:04:05", 1600000000.0, 100, 2000, 1000, "Canon", "R5", second),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        expected = {
+            "elo": "idx_images_active_elo",
+            "date_taken": "idx_images_active_date_taken_sort_desc",
+            "date_modified": "idx_images_active_modified_sort_desc",
+            "file_size": "idx_images_active_file_size_sort_desc",
+            "resolution": "idx_images_active_resolution_sort_desc",
+            "camera": "idx_images_active_camera_sort_asc",
+        }
+        raw = sqlite3.connect(db.DB_PATH)
+        try:
+            for sort, index_name in expected.items():
+                rows = await db.get_rankings(limit=10, sort=sort)
+                self.assertTrue(rows)
+                conditions, params = db._ranking_filter_parts()
+                image_source = db._ranking_image_source(sort, id_filter=None, text_query="")
+                sql = (
+                    f"SELECT i.id FROM {image_source} "
+                    "JOIN catalog_sources s ON s.id = i.source_id "
+                    f"WHERE {' AND '.join(conditions)} "
+                    f"ORDER BY {db.RANKING_SORTS[sort]} LIMIT 10"
+                )
+                plan_rows = raw.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+                plan = " | ".join(row[3] for row in plan_rows)
+                self.assertIn(index_name, plan)
+                self.assertNotIn("USE TEMP B-TREE", plan)
+        finally:
+            raw.close()
+
     async def test_rankings_returns_only_sm_cached_images_with_visible_total_counts(self):
         source = await self._source()
         visible_high = await self._image(source["id"], "visible-high.jpg", elo=1500)

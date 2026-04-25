@@ -92,12 +92,22 @@ RANKING_SQL = {
     "least_compared": "comparisons ASC",
     "filename": "filename ASC",
     "newest": "id DESC",
+    "date_taken": "date_taken IS NULL ASC, date_taken DESC, id DESC",
+    "date_modified": "file_modified_at IS NULL ASC, file_modified_at DESC, id DESC",
+    "file_size": "file_size IS NULL ASC, file_size DESC, id DESC",
+    "resolution": "(width * height) IS NULL ASC, (width * height) DESC, id DESC",
+    "camera": "camera_make IS NULL ASC, camera_make ASC, camera_model ASC, id ASC",
 }
 RANKING_BENCH_INDEXES = {
     "elo": "idx_images_active_elo",
     "least_compared": "idx_images_active_comparisons_asc",
     "filename": "idx_images_active_filename",
     "newest": "idx_images_active_id",
+    "date_taken": "idx_images_active_date_taken_sort_desc",
+    "date_modified": "idx_images_active_modified_sort_desc",
+    "file_size": "idx_images_active_file_size_sort_desc",
+    "resolution": "idx_images_active_resolution_sort_desc",
+    "camera": "idx_images_active_camera_sort_asc",
 }
 
 
@@ -109,6 +119,7 @@ def fetch_rankings_sync(sort: str):
         return conn.execute(
             "SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
             f"FROM images INDEXED BY {index_name} WHERE status IN ('kept', 'maybe') "
+            "AND missing_at IS NULL "
             f"ORDER BY {order} LIMIT 100"
         ).fetchall()
     finally:
@@ -119,9 +130,12 @@ def fetch_pairing_sync():
     conn = sqlite3.connect(db.DB_PATH)
     try:
         return conn.execute(
-            "SELECT id, filename, filepath, elo, comparisons, orientation, aspect_ratio "
-            "FROM images INDEXED BY idx_images_active_elo "
-            "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC"
+            "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, i.orientation, i.aspect_ratio "
+            "FROM images i INDEXED BY idx_images_active_elo "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1 "
+            "AND i.status IN ('kept', 'maybe') AND i.missing_at IS NULL "
+            "ORDER BY i.elo DESC"
         ).fetchall()
     finally:
         conn.close()
@@ -137,7 +151,7 @@ def fetch_matchups_sync():
 
 def bench_db(iterations: int):
     print("\nDB/API helper timings")
-    for sort in ("elo", "least_compared", "filename", "newest"):
+    for sort in ("elo", "least_compared", "filename", "newest", "date_taken", "date_modified", "file_size", "resolution", "camera"):
         time_sync(
             f"get_rankings sort={sort}",
             iterations,
@@ -151,22 +165,31 @@ def bench_db(iterations: int):
         "rankings elo",
         "SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
         "FROM images INDEXED BY idx_images_active_elo "
-        "WHERE status IN ('kept', 'maybe') ORDER BY elo DESC LIMIT 100",
+        "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL "
+        "ORDER BY elo DESC LIMIT 100",
+    )
+    print_query_plan(
+        "rankings date_taken",
+        "SELECT id, filename, filepath, elo, comparisons, status, aspect_ratio "
+        "FROM images INDEXED BY idx_images_active_date_taken_sort_desc "
+        "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL "
+        "ORDER BY date_taken IS NULL ASC, date_taken DESC, id DESC LIMIT 100",
     )
     print_query_plan(
         "pregen md candidates",
-        "SELECT i.id, i.filepath, c.source_signature FROM images i "
-        "INDEXED BY idx_images_active_filepath "
-        "LEFT JOIN cache_entries c "
-        "ON c.cache_root = ? AND c.size = 'md' AND c.image_id = i.id "
-        "WHERE i.status IN ('kept', 'maybe') ORDER BY i.filepath ASC LIMIT 1024",
-        (settings.get_settings()["ssd_cache_dir"],),
+        "SELECT i.id, i.source_id, i.filepath, i.file_size, i.file_modified_at "
+        "FROM images i INDEXED BY idx_images_source_missing_filepath "
+        "JOIN catalog_sources s ON s.id = i.source_id "
+        "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
+        "AND (i.source_id > ? OR (i.source_id = ? AND (i.filepath > ? OR (i.filepath = ? AND i.id > ?)))) "
+        "ORDER BY i.source_id ASC, i.filepath ASC, i.id ASC LIMIT 1024",
+        (0, 0, "", "", 0),
     )
     print_query_plan(
         "embedding md-ready",
         "SELECT i.id, i.filepath FROM images i "
         "INDEXED BY idx_images_active_id "
-        "WHERE i.status IN ('kept', 'maybe') "
+        "WHERE i.status IN ('kept', 'maybe') AND i.missing_at IS NULL "
         "AND EXISTS ("
         "  SELECT 1 FROM cache_entries c "
         "  WHERE c.cache_root = ? AND c.size = 'md' AND c.image_id = i.id"
@@ -269,6 +292,7 @@ async def main():
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
+    await db.init_db()
     print_counts()
     if not args.skip_db:
         bench_db(args.iterations)

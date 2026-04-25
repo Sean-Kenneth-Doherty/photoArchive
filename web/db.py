@@ -113,6 +113,36 @@ CREATE INDEX IF NOT EXISTS idx_images_active_camera
 ON images(camera_make, camera_model) WHERE status IN ('kept', 'maybe');
 CREATE INDEX IF NOT EXISTS idx_images_active_lens
 ON images(lens) WHERE status IN ('kept', 'maybe');
+CREATE INDEX IF NOT EXISTS idx_images_active_date_taken_sort_desc
+ON images((date_taken IS NULL), date_taken DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_date_taken_sort_asc
+ON images((date_taken IS NULL), date_taken ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_file_size_sort_desc
+ON images((file_size IS NULL), file_size DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_file_size_sort_asc
+ON images((file_size IS NULL), file_size ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_modified_sort_desc
+ON images((file_modified_at IS NULL), file_modified_at DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_modified_sort_asc
+ON images((file_modified_at IS NULL), file_modified_at ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_resolution_sort_desc
+ON images(((width * height) IS NULL), (width * height) DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_resolution_sort_asc
+ON images(((width * height) IS NULL), (width * height) ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_camera_sort_asc
+ON images((camera_make IS NULL), camera_make ASC, camera_model ASC, id ASC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_images_active_camera_sort_desc
+ON images((camera_make IS NULL), camera_make DESC, camera_model DESC, id DESC)
+WHERE status IN ('kept', 'maybe') AND missing_at IS NULL;
 
 -- Source-aware indexes for the active working set. Source state now determines
 -- whether an image is active; status is retained only for old DB compatibility.
@@ -488,6 +518,59 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_images_active_lens "
             "ON images(lens) WHERE status IN ('kept', 'maybe')"
         )
+        for name, sql in [
+            (
+                "idx_images_active_date_taken_sort_desc",
+                "ON images((date_taken IS NULL), date_taken DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_date_taken_sort_asc",
+                "ON images((date_taken IS NULL), date_taken ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_file_size_sort_desc",
+                "ON images((file_size IS NULL), file_size DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_file_size_sort_asc",
+                "ON images((file_size IS NULL), file_size ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_modified_sort_desc",
+                "ON images((file_modified_at IS NULL), file_modified_at DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_modified_sort_asc",
+                "ON images((file_modified_at IS NULL), file_modified_at ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_resolution_sort_desc",
+                "ON images(((width * height) IS NULL), (width * height) DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_resolution_sort_asc",
+                "ON images(((width * height) IS NULL), (width * height) ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_camera_sort_asc",
+                "ON images((camera_make IS NULL), camera_make ASC, camera_model ASC, id ASC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+            (
+                "idx_images_active_camera_sort_desc",
+                "ON images((camera_make IS NULL), camera_make DESC, camera_model DESC, id DESC) "
+                "WHERE status IN ('kept', 'maybe') AND missing_at IS NULL",
+            ),
+        ]:
+            await db.execute(f"CREATE INDEX IF NOT EXISTS {name} {sql}")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_images_gps "
             "ON images(latitude, longitude) WHERE latitude IS NOT NULL"
@@ -1112,16 +1195,16 @@ RANKING_INDEXES = {
     "filename_desc": "idx_images_active_filename",
     "newest": "idx_images_active_id",
     "oldest": "idx_images_active_id",
-    "date_taken": None,
-    "date_taken_asc": None,
-    "file_size": None,
-    "file_size_asc": None,
-    "date_modified": None,
-    "date_modified_asc": None,
-    "camera": None,
-    "camera_desc": None,
-    "resolution": None,
-    "resolution_asc": None,
+    "date_taken": "idx_images_active_date_taken_sort_desc",
+    "date_taken_asc": "idx_images_active_date_taken_sort_asc",
+    "file_size": "idx_images_active_file_size_sort_desc",
+    "file_size_asc": "idx_images_active_file_size_sort_asc",
+    "date_modified": "idx_images_active_modified_sort_desc",
+    "date_modified_asc": "idx_images_active_modified_sort_asc",
+    "camera": "idx_images_active_camera_sort_asc",
+    "camera_desc": "idx_images_active_camera_sort_desc",
+    "resolution": "idx_images_active_resolution_sort_desc",
+    "resolution_asc": "idx_images_active_resolution_sort_asc",
 }
 
 STAR_THRESHOLDS = {5: 1500, 4: 1350, 3: 1250, 2: 1150, 1: 0}
@@ -1134,7 +1217,12 @@ def _ranking_filter_parts(
     visible_thumb_size: str = "", cache_root: str = "",
     text_query: str = "",
 ) -> tuple[list[str], list]:
-    conditions = ["s.included = 1", "s.online = 1", "i.missing_at IS NULL"]
+    conditions = [
+        "s.included = 1",
+        "s.online = 1",
+        "i.status IN ('kept', 'maybe')",
+        "i.missing_at IS NULL",
+    ]
     params = []
 
     if orientation in ("landscape", "portrait"):
@@ -1227,6 +1315,19 @@ def _ranking_filter_parts(
     return conditions, params
 
 
+def _ranking_index_for_query(sort: str, *, id_filter: set | None, text_query: str) -> str | None:
+    if id_filter is not None or text_query:
+        return None
+    return RANKING_INDEXES.get(sort)
+
+
+def _ranking_image_source(sort: str, *, id_filter: set | None, text_query: str) -> str:
+    index_name = _ranking_index_for_query(sort, id_filter=id_filter, text_query=text_query)
+    if not index_name:
+        return "images i"
+    return f"images i INDEXED BY {index_name}"
+
+
 async def get_cached_image_ids(
     image_ids: list[int],
     size: str,
@@ -1280,6 +1381,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 
         where = " AND ".join(conditions)
         params.extend([limit, offset])
+        image_source = _ranking_image_source(sort, id_filter=id_filter, text_query=text_query)
 
         cursor = await db.execute(
             f"SELECT i.id, i.source_id, i.filename, i.filepath, i.elo, i.comparisons, "
@@ -1287,7 +1389,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             f"i.status, i.flag, i.aspect_ratio, "
             f"i.date_taken, i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
             f"i.file_modified_at, i.width, i.height, i.latitude, i.longitude, i.created_at "
-            f"FROM images i JOIN catalog_sources s ON s.id = i.source_id "
+            f"FROM {image_source} JOIN catalog_sources s ON s.id = i.source_id "
             f"WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params,
         )
