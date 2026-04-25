@@ -38,6 +38,30 @@ const PhotoArchive = (() => {
     const recentWarmTierIds = new Map();
     const pendingWarmTiers = new Map();
     let warmTierFlushTimer = null;
+    let bottomBarResizeObserver = null;
+    let bottomBarResizeListenerAdded = false;
+
+    function updateBottomBarHeightVar() {
+        const bar = document.querySelector('.bottom-bar');
+        const height = bar?.offsetHeight || 0;
+        document.documentElement.style.setProperty('--current-bottom-bar-height', `${height}px`);
+        if (document.getElementById('mosaic-grid')) scheduleMosaicRender();
+    }
+
+    function initBottomBarMeasurement() {
+        updateBottomBarHeightVar();
+        if (bottomBarResizeObserver) bottomBarResizeObserver.disconnect();
+
+        const bar = document.querySelector('.bottom-bar');
+        if (bar && 'ResizeObserver' in window) {
+            bottomBarResizeObserver = new ResizeObserver(updateBottomBarHeightVar);
+            bottomBarResizeObserver.observe(bar);
+        }
+        if (!bottomBarResizeListenerAdded) {
+            window.addEventListener('resize', updateBottomBarHeightVar);
+            bottomBarResizeListenerAdded = true;
+        }
+    }
 
     function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
         const token = (backgroundWarmTokens.get(key) || 0) + 1;
@@ -206,6 +230,7 @@ const PhotoArchive = (() => {
     let mosaicStrategy = 'diverse';
     let mosaicPropagationCounts = {}; // precomputed: {imageId: predictedCount}
     let mosaicRenderToken = 0;
+    let mosaicResizeRaf = null;
 
     function mosaicGridElo() {
         if (mosaicImages.length === 0) return 0;
@@ -252,14 +277,16 @@ const PhotoArchive = (() => {
         // Calculate row height to fit all images in the viewport
         // using the same justified flex layout as the library
         const gap = 3;
-        const containerW = grid.clientWidth || window.innerWidth;
+        const containerW = grid.clientWidth || grid.parentElement?.clientWidth || window.innerWidth;
         const barH = document.querySelector('.bottom-bar')?.offsetHeight || 60;
-        const containerH = window.innerHeight - barH - 4;
-        const n = mosaicImages.length;
+        const containerH = Math.max(
+            80,
+            grid.clientHeight || grid.parentElement?.clientHeight || window.innerHeight - barH - 4,
+        );
 
         // Simulate row packing to find the right row height
         // Binary search for the height that fits all images in the container
-        let lo = 60, hi = containerH;
+        let lo = 60, hi = Math.max(60, containerH);
         for (let iter = 0; iter < 20; iter++) {
             const mid = (lo + hi) / 2;
             let rows = 1, rowW = 0;
@@ -294,6 +321,14 @@ const PhotoArchive = (() => {
             grid.appendChild(cell);
             scheduleMosaicImageUpgrade(cell, img, rowH, token, index);
         }
+    }
+
+    function scheduleMosaicRender() {
+        if (mosaicResizeRaf) cancelAnimationFrame(mosaicResizeRaf);
+        mosaicResizeRaf = requestAnimationFrame(() => {
+            mosaicResizeRaf = null;
+            if (compareMode === 'mosaic' && mosaicImages.length) renderMosaic();
+        });
     }
 
     function scheduleMosaicImageUpgrade(cell, img, rowH, token, index = 0) {
@@ -508,6 +543,7 @@ const PhotoArchive = (() => {
     }
 
     function showToast(msg) {
+        updateBottomBarHeightVar();
         let toast = document.getElementById('mosaic-toast');
         if (!toast) {
             toast = document.createElement('div');
@@ -537,7 +573,9 @@ const PhotoArchive = (() => {
     // ==================== COMPARE MODE ====================
 
     async function initCompare() {
+        initBottomBarMeasurement();
         document.addEventListener('keydown', handleCompareKey);
+        window.addEventListener('resize', scheduleMosaicRender);
         document.getElementById('compare-left').addEventListener('click', () => submitComparison('left'));
         document.getElementById('compare-right').addEventListener('click', () => submitComparison('right'));
         // Set slider to match default mosaic size (12 images → slider ~168)
@@ -1098,6 +1136,10 @@ const PhotoArchive = (() => {
     let lastDateGroup = null;
     let dateGroupsData = [];
     let dateScrubberGeneration = 0;
+    let dateJumpGeneration = 0;
+    let dateScrubberScrollRoot = null;
+    let dateScrubberScrollHandler = null;
+    let dateScrubberScrollRaf = null;
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
@@ -1323,6 +1365,29 @@ const PhotoArchive = (() => {
         if (clearBatch) clearBatchSelection();
     }
 
+    function libraryScrollRoot() {
+        return document.querySelector('.library-container');
+    }
+
+    function scrollLibraryContainerToElement(el, behavior = 'smooth') {
+        const root = libraryScrollRoot();
+        if (!root || !el) {
+            el?.scrollIntoView({ behavior, block: 'start' });
+            return;
+        }
+        const rootRect = root.getBoundingClientRect();
+        const rect = el.getBoundingClientRect();
+        const top = root.scrollTop + rect.top - rootRect.top;
+        root.scrollTo({ top: Math.max(0, top - 4), behavior });
+    }
+
+    function syncDateScrubberVisibility() {
+        const scrubber = document.getElementById('date-scrubber');
+        const active = Boolean(scrubber) && libraryView !== 'map' && isDateSortActive();
+        document.body.classList.toggle('date-scrubber-active', active);
+        if (scrubber) scrubber.classList.toggle('hidden', !active);
+    }
+
     function scheduleCrossViewWarmup(fromView) {
         if (fromView === 'compare') {
             const libraryUrl = buildRankingsUrl({
@@ -1418,7 +1483,6 @@ const PhotoArchive = (() => {
         'elo':         { desc: 'elo',           asc: 'elo_asc', defaultDesc: true },
         'comparisons': { desc: 'comparisons',   asc: 'least_compared', defaultDesc: true },
         'date_taken':  { desc: 'date_taken',    asc: 'date_taken_asc', defaultDesc: true },
-        'newest':      { desc: 'newest',        asc: 'oldest', defaultDesc: true },
         'date_modified': { desc: 'date_modified', asc: 'date_modified_asc', defaultDesc: true },
         'file_size':   { desc: 'file_size',     asc: 'file_size_asc', defaultDesc: true },
         'resolution':  { desc: 'resolution',    asc: 'resolution_asc', defaultDesc: true },
@@ -1428,6 +1492,7 @@ const PhotoArchive = (() => {
     };
 
     async function initLibrary() {
+        initBottomBarMeasurement();
         resetLibraryResults();
         restoreFilters();
 
@@ -1452,10 +1517,10 @@ const PhotoArchive = (() => {
         sentinel.style.height = '1px';
         document.querySelector('.rankings-grid')?.after(sentinel);
         const scrollObserver = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting && !rankingsLoading && !rankingsExhausted) {
+            if (entries[0].isIntersecting && libraryView === 'grid' && !rankingsLoading && !rankingsExhausted) {
                 loadRankings();
             }
-        }, { rootMargin: '600px' });
+        }, { root: libraryScrollRoot(), rootMargin: '600px 0px' });
         scrollObserver.observe(sentinel);
 
         // Loupe keyboard navigation
@@ -1941,10 +2006,119 @@ const PhotoArchive = (() => {
         return rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc';
     }
 
+    function findDateGroupHeader(group) {
+        return Array.from(document.querySelectorAll('.date-group-header'))
+            .find(header => header.dataset.dateGroup === group);
+    }
+
+    function dateGroupOffset(group) {
+        let offset = 0;
+        for (const item of dateGroupsData) {
+            const itemGroup = item.date || '';
+            if (itemGroup === group) return offset;
+            offset += Number(item.count || 0);
+        }
+        return null;
+    }
+
+    function setActiveDateScrubberGroup(group) {
+        const year = group ? group.substring(0, 4) : '';
+        document.querySelectorAll('.scrubber-label, .scrubber-year').forEach(el => {
+            const elGroup = el.dataset.dateGroup || '';
+            const isYear = el.classList.contains('scrubber-year');
+            const active = isYear && year
+                ? elGroup.substring(0, 4) === year
+                : elGroup === group;
+            el.classList.toggle('active', active);
+        });
+    }
+
+    function updateActiveDateScrubberGroup() {
+        const root = libraryScrollRoot();
+        const headers = Array.from(document.querySelectorAll('.date-group-header'));
+        if (!root || !headers.length) return;
+
+        const currentTop = root.scrollTop + 8;
+        let activeHeader = headers[0];
+        for (const header of headers) {
+            if (header.offsetTop <= currentTop) activeHeader = header;
+            else break;
+        }
+        setActiveDateScrubberGroup(activeHeader?.dataset.dateGroup || '');
+    }
+
+    function teardownDateScrubberScrollTracking() {
+        if (dateScrubberScrollRoot && dateScrubberScrollHandler) {
+            dateScrubberScrollRoot.removeEventListener('scroll', dateScrubberScrollHandler);
+        }
+        if (dateScrubberScrollRaf) cancelAnimationFrame(dateScrubberScrollRaf);
+        dateScrubberScrollRoot = null;
+        dateScrubberScrollHandler = null;
+        dateScrubberScrollRaf = null;
+    }
+
+    function setupDateScrubberScrollTracking() {
+        teardownDateScrubberScrollTracking();
+        const root = libraryScrollRoot();
+        const headers = document.querySelectorAll('.date-group-header');
+        if (!root || !headers.length) return;
+
+        dateScrubberScrollRoot = root;
+        dateScrubberScrollHandler = () => {
+            if (dateScrubberScrollRaf) return;
+            dateScrubberScrollRaf = requestAnimationFrame(() => {
+                dateScrubberScrollRaf = null;
+                updateActiveDateScrubberGroup();
+            });
+        };
+        root.addEventListener('scroll', dateScrubberScrollHandler, { passive: true });
+        updateActiveDateScrubberGroup();
+    }
+
+    async function jumpToDateGroup(group) {
+        if (!isDateSortActive() || searchQuery === '__similar__') return;
+
+        const existingHeader = findDateGroupHeader(group);
+        if (existingHeader) {
+            setActiveDateScrubberGroup(group);
+            scrollLibraryContainerToElement(existingHeader);
+            return;
+        }
+
+        const offset = dateGroupOffset(group);
+        if (offset === null) return;
+
+        const gen = ++dateJumpGeneration;
+        libraryRequestGeneration++;
+        rankingsOffset = offset;
+        rankingsExhausted = false;
+        libraryImages = [];
+        lastDateGroup = null;
+        rankingsLoading = false;
+        rankingsLoadPromise = null;
+        selectedLibraryIndex = -1;
+
+        const grid = document.getElementById('rankings-grid');
+        if (grid) grid.innerHTML = '';
+        libraryScrollRoot()?.scrollTo({ top: 0, behavior: 'auto' });
+
+        await loadRankings(true);
+        if (gen !== dateJumpGeneration) return;
+
+        const loadedHeader = findDateGroupHeader(group);
+        if (loadedHeader) {
+            scrollLibraryContainerToElement(loadedHeader, 'auto');
+            setActiveDateScrubberGroup(group);
+        }
+    }
+
     async function updateDateScrubber() {
         const existing = document.getElementById('date-scrubber');
         if (!isDateSortActive()) {
             if (existing) existing.remove();
+            if (window._scrubberObserver) window._scrubberObserver.disconnect();
+            teardownDateScrubberScrollTracking();
+            syncDateScrubberVisibility();
             return;
         }
         const gen = ++dateScrubberGeneration;
@@ -1964,14 +2138,19 @@ const PhotoArchive = (() => {
         let scrubber = document.getElementById('date-scrubber');
         if (!dateGroupsData.length) {
             if (scrubber) scrubber.remove();
+            teardownDateScrubberScrollTracking();
+            syncDateScrubberVisibility();
             return;
         }
         if (!scrubber) {
             scrubber = document.createElement('div');
             scrubber.id = 'date-scrubber';
             scrubber.className = 'date-scrubber';
-            document.body.appendChild(scrubber);
         }
+        const host = document.querySelector('body.library-shell main') || document.body;
+        if (scrubber.parentElement !== host) host.appendChild(scrubber);
+        syncDateScrubberVisibility();
+
         // Build scrubber labels — show years prominently, months smaller
         let currentYear = '';
         let html = '';
@@ -1994,11 +2173,7 @@ const PhotoArchive = (() => {
         // Click to jump
         scrubber.querySelectorAll('[data-date-group]').forEach(label => {
             label.onclick = () => {
-                const group = label.dataset.dateGroup;
-                const header = document.querySelector(`.date-group-header[data-date-group="${group}"]`);
-                if (header) {
-                    header.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
+                jumpToDateGroup(label.dataset.dateGroup || '');
             };
         });
 
@@ -2007,29 +2182,8 @@ const PhotoArchive = (() => {
     }
 
     function setupScrubberScrollObserver() {
-        const headers = document.querySelectorAll('.date-group-header');
-        if (!headers.length) return;
-
         if (window._scrubberObserver) window._scrubberObserver.disconnect();
-        window._scrubberObserver = new IntersectionObserver((entries) => {
-            // Find the topmost visible header
-            let topHeader = null;
-            let topY = Infinity;
-            entries.forEach(entry => {
-                if (entry.isIntersecting && entry.boundingClientRect.top < topY) {
-                    topY = entry.boundingClientRect.top;
-                    topHeader = entry.target;
-                }
-            });
-            if (topHeader) {
-                const group = topHeader.dataset.dateGroup;
-                document.querySelectorAll('.scrubber-label, .scrubber-year').forEach(el => {
-                    el.classList.toggle('active', el.dataset.dateGroup === group);
-                });
-            }
-        }, { rootMargin: '0px 0px -80% 0px' });
-
-        headers.forEach(h => window._scrubberObserver.observe(h));
+        setupDateScrubberScrollTracking();
     }
 
     function selectLibraryCard(index, cards) {
@@ -2043,10 +2197,18 @@ const PhotoArchive = (() => {
 
     function scrollCardFullyVisible(el) {
         const rect = el.getBoundingClientRect();
-        const barHeight = document.querySelector('.bottom-bar')?.offsetHeight || 48;
-        const viewBottom = window.innerHeight - barHeight;
-        if (rect.bottom > viewBottom) {
-            window.scrollBy({ top: rect.bottom - viewBottom + 8, behavior: 'smooth' });
+        const root = libraryScrollRoot();
+        if (root) {
+            const rootRect = root.getBoundingClientRect();
+            if (rect.bottom > rootRect.bottom) {
+                root.scrollBy({ top: rect.bottom - rootRect.bottom + 8, behavior: 'smooth' });
+            } else if (rect.top < rootRect.top) {
+                root.scrollBy({ top: rect.top - rootRect.top - 8, behavior: 'smooth' });
+            }
+            return;
+        }
+        if (rect.bottom > window.innerHeight) {
+            window.scrollBy({ top: rect.bottom - window.innerHeight + 8, behavior: 'smooth' });
         } else if (rect.top < 0) {
             window.scrollBy({ top: rect.top - 8, behavior: 'smooth' });
         }
@@ -3204,6 +3366,7 @@ const PhotoArchive = (() => {
     let mapCenter = [20, 0];
     let mapZoom = 2;
     let libraryView = 'grid';
+    let libraryScrollBeforeMap = 0;
     let leafletLoaded = false;
     let leafletLoadPromise = null;
     let mapRequestGeneration = 0;
@@ -3214,23 +3377,33 @@ const PhotoArchive = (() => {
         const mapEl = document.getElementById('map-container');
         const gridBtn = document.getElementById('view-grid-btn');
         const mapBtn = document.getElementById('view-map-btn');
+        const scrollRoot = libraryScrollRoot();
 
         if (mode === 'map') {
             clearBatchSelection();
-            grid.classList.add('hidden');
-            mapEl.classList.remove('hidden');
-            gridBtn.classList.remove('active');
-            mapBtn.classList.add('active');
+            libraryScrollBeforeMap = scrollRoot?.scrollTop || 0;
+            scrollRoot?.classList.add('map-active');
+            scrollRoot?.scrollTo({ top: 0, behavior: 'auto' });
+            grid?.classList.add('hidden');
+            mapEl?.classList.remove('hidden');
+            gridBtn?.classList.remove('active');
+            mapBtn?.classList.add('active');
+            syncDateScrubberVisibility();
             loadMap();
         } else {
             if (mapInstance) {
                 mapCenter = [mapInstance.getCenter().lat, mapInstance.getCenter().lng];
                 mapZoom = mapInstance.getZoom();
             }
-            grid.classList.remove('hidden');
-            mapEl.classList.add('hidden');
-            gridBtn.classList.add('active');
-            mapBtn.classList.remove('active');
+            scrollRoot?.classList.remove('map-active');
+            grid?.classList.remove('hidden');
+            mapEl?.classList.add('hidden');
+            gridBtn?.classList.add('active');
+            mapBtn?.classList.remove('active');
+            syncDateScrubberVisibility();
+            requestAnimationFrame(() => {
+                if (scrollRoot) scrollRoot.scrollTop = libraryScrollBeforeMap;
+            });
         }
     }
 
@@ -4312,6 +4485,7 @@ const PhotoArchive = (() => {
     }
 
     async function initSettings() {
+        initBottomBarMeasurement();
         const form = document.getElementById('settings-form');
         if (form) {
             form.addEventListener('submit', (e) => {
