@@ -1,30 +1,44 @@
 {% extends "base.html" %}
-{% block title %}photoArchive — Settings{% endblock %}
+{% block title %}photoArchive — Catalog{% endblock %}
 {% block content %}
 <div class="settings-page">
     <div class="settings-hero">
         <div>
-            <h1>Settings</h1>
-            <p>Configure thumbnail performance, caching, prefetch behavior, and the local AI model. Runtime changes apply immediately to new requests.</p>
+            <h1>Catalog</h1>
+            <p>Manage catalog folders, scan progress, thumbnail caching, preferences, and the local AI model.</p>
         </div>
         <div class="settings-status" id="settings-status">Loading current settings…</div>
     </div>
 
     <form class="settings-grid" id="settings-form">
         <section class="settings-card">
-            <h2>Photo Folder</h2>
-            <p class="settings-card-copy">Root folder to scan for photos. Rescanning adds new images without affecting existing rankings.</p>
+            <h2>Catalog Sources</h2>
+            <p class="settings-card-copy">Folders included in this catalog. Removing a folder can either hide its photos while keeping catalog data, or delete the folder’s catalog rows and generated cache.</p>
             <label class="settings-field">
-                <span>Folder path</span>
+                <span>Add folder</span>
                 <input id="scan-folder" type="text" spellcheck="false" autocomplete="off">
             </label>
+            <div class="settings-actions">
+                <button class="bar-btn" type="button" id="choose-folder-btn" onclick="PhotoArchive.chooseCatalogFolder()">Choose Folder</button>
+                <button class="bar-btn subtle" type="button" onclick="PhotoArchive.toggleDirectoryBrowser()">Tree Browse</button>
+                <button class="bar-btn" type="button" id="scan-btn" onclick="PhotoArchive.addCatalogSource()">Add + Scan</button>
+            </div>
+            <div class="directory-browser hidden" id="directory-browser">
+                <div class="directory-browser-roots" id="directory-browser-roots"></div>
+                <div class="directory-browser-path">
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.browseDirectoryParent()">Up</button>
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.useBrowsedDirectory()">Use This Folder</button>
+                    <div class="directory-crumbs" id="directory-browser-current">—</div>
+                </div>
+                <div class="directory-browser-list" id="directory-browser-list"></div>
+                <div class="directory-browser-error" id="directory-browser-error"></div>
+            </div>
             <div class="settings-metric-list">
-                <div>Images in database: <strong id="scan-total-images">—</strong></div>
+                <div>Active photos: <strong id="scan-total-images">—</strong></div>
+                <div>Catalog photos: <strong id="catalog-total-images">—</strong></div>
                 <div id="scan-progress" class="hidden">Scanning: <strong id="scan-progress-count">0</strong> found</div>
             </div>
-            <div class="settings-actions">
-                <button class="bar-btn" type="button" id="scan-btn" onclick="PhotoArchive.startScan()">Scan Folder</button>
-            </div>
+            <div class="catalog-source-list" id="catalog-source-list"></div>
         </section>
 
         <section class="settings-card">

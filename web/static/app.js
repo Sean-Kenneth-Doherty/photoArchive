@@ -2448,6 +2448,22 @@ const PhotoArchive = (() => {
     let settingsPoller = null;
     let settingsPageData = null;
     let savedThumbnailOutput = null;
+    let catalogSources = [];
+    let catalogBrowsePath = '';
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;',
+        }[ch]));
+    }
+
+    function jsString(value) {
+        return JSON.stringify(String(value ?? '')).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+    }
 
     function setSettingsStatus(message, tone = '') {
         const el = document.getElementById('settings-status');
@@ -2484,6 +2500,301 @@ const PhotoArchive = (() => {
             : `${formatBytes(tier.bytes)} / off`;
         const fallbackText = staleCount > 0 ? ` · ${staleCount.toLocaleString()} older usable` : '';
         return `${label}: ${budgetText} · ${progress}${fallbackText}`;
+    }
+
+    function sourceState(source) {
+        if (!source.included) return { label: 'Removed', cls: 'removed' };
+        if (!source.online) return { label: 'Offline', cls: 'offline' };
+        return { label: 'Online', cls: 'online' };
+    }
+
+    function renderCatalogSources(catalog) {
+        const stats = catalog?.stats || {};
+        const activeEl = document.getElementById('scan-total-images');
+        const catalogEl = document.getElementById('catalog-total-images');
+        if (activeEl) activeEl.textContent = Number(stats.active_images ?? stats.total_images ?? 0).toLocaleString();
+        if (catalogEl) catalogEl.textContent = Number(stats.total_catalog_images ?? stats.total_images ?? 0).toLocaleString();
+
+        catalogSources = catalog?.sources || [];
+        const list = document.getElementById('catalog-source-list');
+        if (!list) return;
+        if (!catalogSources.length) {
+            list.innerHTML = '<div class="catalog-empty">No folders added yet.</div>';
+            return;
+        }
+        list.innerHTML = catalogSources.map((source) => {
+            const state = sourceState(source);
+            const count = Number(source.image_count || 0).toLocaleString();
+            const active = Number(source.active_image_count || 0).toLocaleString();
+            const lastScan = source.last_scan_at ? formatDateTime(source.last_scan_at) : 'Never scanned';
+            const canScan = source.online ? '' : 'disabled';
+            const restoreLabel = source.included ? 'Rescan' : 'Restore + Scan';
+            return `
+                <div class="catalog-source ${state.cls}">
+                    <div class="catalog-source-main">
+                        <div class="catalog-source-title">
+                            <strong>${escapeHtml(source.display_name || source.path)}</strong>
+                            <span class="catalog-source-state ${state.cls}">${state.label}</span>
+                        </div>
+                        <code>${escapeHtml(source.path)}</code>
+                        <div class="catalog-source-meta">${active} active · ${count} catalog · ${escapeHtml(lastScan)}</div>
+                    </div>
+                    <div class="catalog-source-actions">
+                        <button class="bar-btn" type="button" ${canScan} onclick="PhotoArchive.rescanCatalogSource(${source.id})">${restoreLabel}</button>
+                        <button class="bar-btn danger" type="button" onclick="PhotoArchive.openRemoveSourceDialog(${source.id})">Remove</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    async function loadCatalogSources() {
+        try {
+            const res = await fetch('/api/catalog');
+            const data = await res.json();
+            renderCatalogSources(data);
+            return data;
+        } catch (err) {
+            setSettingsStatus(`Could not load catalog sources: ${err.message}`, 'error');
+            return null;
+        }
+    }
+
+    function setScanBusy(busy, label = 'Add + Scan') {
+        const btn = document.getElementById('scan-btn');
+        if (btn) {
+            btn.disabled = busy;
+            btn.textContent = busy ? 'Scanning...' : label;
+        }
+        const progress = document.getElementById('scan-progress');
+        if (progress) progress.classList.toggle('hidden', !busy);
+    }
+
+    async function pollScanUntilDone() {
+        if (_scanPoller) clearInterval(_scanPoller);
+        setScanBusy(true);
+        _scanPoller = setInterval(async () => {
+            try {
+                const res = await fetch('/api/scan/status');
+                const data = await res.json();
+                const countEl = document.getElementById('scan-progress-count');
+                if (countEl) countEl.textContent = Number(data.total_found || 0).toLocaleString();
+                if (!data.scanning) {
+                    clearInterval(_scanPoller);
+                    _scanPoller = null;
+                    setScanBusy(false);
+                    await loadCatalogSources();
+                    if (data.error) {
+                        setSettingsStatus(`Scan stopped: ${data.error}`, 'error');
+                    } else {
+                        setSettingsStatus(`Scan complete. ${Number(data.total_found || 0).toLocaleString()} photos found.`, 'success');
+                    }
+                }
+            } catch {}
+        }, 1000);
+    }
+
+    async function addCatalogSource() {
+        const folderInput = document.getElementById('scan-folder');
+        const folder = folderInput?.value?.trim();
+        if (!folder) return;
+
+        setSettingsStatus('Adding folder and starting scan...', 'muted');
+        try {
+            const res = await fetch('/api/catalog/sources', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: folder, scan: true }),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Could not add folder');
+            renderCatalogSources(data.catalog || { sources: [data.source], stats: settingsPageData?.catalog?.stats || {} });
+            pollScanUntilDone();
+        } catch (err) {
+            setScanBusy(false);
+            setSettingsStatus(`Add folder failed: ${err.message}`, 'error');
+        }
+    }
+
+    async function rescanCatalogSource(sourceId) {
+        setSettingsStatus('Starting folder scan...', 'muted');
+        try {
+            const res = await fetch(`/api/catalog/sources/${sourceId}/rescan`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Could not start scan');
+            pollScanUntilDone();
+        } catch (err) {
+            setSettingsStatus(`Scan failed to start: ${err.message}`, 'error');
+        }
+    }
+
+    function openRemoveSourceDialog(sourceId) {
+        const source = catalogSources.find((item) => Number(item.id) === Number(sourceId));
+        if (!source) return;
+        document.getElementById('catalog-remove-modal')?.remove();
+        const modal = document.createElement('div');
+        modal.id = 'catalog-remove-modal';
+        modal.className = 'modal-backdrop';
+        modal.innerHTML = `
+            <div class="catalog-remove-dialog">
+                <h2>Remove Folder</h2>
+                <p>${escapeHtml(source.path)}</p>
+                <div class="catalog-remove-actions">
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.removeCatalogSource(${source.id}, 'keep')">Remove Folder, Keep Catalog Data</button>
+                    <button class="bar-btn danger" type="button" onclick="PhotoArchive.removeCatalogSource(${source.id}, 'delete')">Remove Folder and Delete Catalog Data</button>
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.closeRemoveSourceDialog()">Cancel</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    }
+
+    function closeRemoveSourceDialog() {
+        document.getElementById('catalog-remove-modal')?.remove();
+    }
+
+    async function removeCatalogSource(sourceId, mode) {
+        closeRemoveSourceDialog();
+        setSettingsStatus(mode === 'delete' ? 'Deleting folder catalog data...' : 'Removing folder from active catalog...', 'muted');
+        try {
+            const res = await fetch(`/api/catalog/sources/${sourceId}/remove`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mode }),
+            });
+            const data = await res.json();
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Remove failed');
+            renderCatalogSources(data.catalog);
+            setSettingsStatus(
+                mode === 'delete'
+                    ? `Catalog data deleted for ${Number(data.images_deleted || 0).toLocaleString()} photos.`
+                    : 'Folder removed from active views. Catalog data was kept.',
+                'success',
+            );
+        } catch (err) {
+            setSettingsStatus(`Remove failed: ${err.message}`, 'error');
+        }
+    }
+
+    async function chooseCatalogFolder() {
+        const input = document.getElementById('scan-folder');
+        const button = document.getElementById('choose-folder-btn');
+        const currentPath = input?.value?.trim() || '';
+        if (button) button.disabled = true;
+        setSettingsStatus('Opening folder chooser...', 'muted');
+        try {
+            const res = await fetch('/api/catalog/select-folder', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: currentPath }),
+            });
+            const data = await res.json();
+            if (data.cancelled) {
+                setSettingsStatus('Folder selection cancelled.', 'muted');
+                return;
+            }
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Native folder chooser is unavailable');
+            selectBrowsedDirectory(data.path);
+            catalogBrowsePath = data.path || catalogBrowsePath;
+            setSettingsStatus('Folder selected. Add + Scan when ready.', 'success');
+        } catch (err) {
+            setSettingsStatus(`Folder chooser unavailable: ${err.message}. Paste a folder path instead.`, 'error');
+        } finally {
+            if (button) button.disabled = false;
+        }
+    }
+
+    async function browseDirectory(path = '') {
+        try {
+            const query = path ? `?path=${encodeURIComponent(path)}` : '';
+            const res = await fetch(`/api/catalog/browse${query}`);
+            const data = await res.json();
+            catalogBrowsePath = data.path || '';
+            renderDirectoryBrowser(data);
+        } catch (err) {
+            const errEl = document.getElementById('directory-browser-error');
+            if (errEl) errEl.textContent = err.message;
+        }
+    }
+
+    function renderDirectoryBrowser(data) {
+        const currentEl = document.getElementById('directory-browser-current');
+        const rootsEl = document.getElementById('directory-browser-roots');
+        const listEl = document.getElementById('directory-browser-list');
+        const errEl = document.getElementById('directory-browser-error');
+        if (errEl) errEl.textContent = data.error || '';
+        const currentPath = data.path || '/';
+        if (currentEl) currentEl.innerHTML = directoryCrumbs(currentPath);
+        if (rootsEl) {
+            rootsEl.innerHTML = (data.roots || []).map((root) =>
+                `<button class="bar-btn" type="button" onclick="PhotoArchive.browseDirectory(${jsString(root.path)})">${escapeHtml(root.label)}</button>`
+            ).join('');
+        }
+        if (!listEl) return;
+        const entries = data.entries || [];
+        const currentName = currentPath.replace(/\/+$/, '').split('/').filter(Boolean).pop() || '/';
+        const currentRow = `
+            <div class="directory-tree-row current">
+                <div class="directory-tree-open">
+                    <span class="tree-expander">-</span>
+                    <span class="tree-folder">${escapeHtml(currentName)}</span>
+                    <code>${escapeHtml(currentPath)}</code>
+                </div>
+                <button class="bar-btn" type="button" onclick="PhotoArchive.useBrowsedDirectory()">Use</button>
+            </div>
+        `;
+        const childRows = entries.map((entry) => `
+            <div class="directory-tree-row child ${entry.readable ? '' : 'restricted'}">
+                <button class="directory-tree-open" type="button" onclick="PhotoArchive.browseDirectory(${jsString(entry.path)})" title="${escapeHtml(entry.path)}">
+                    <span class="tree-branch"></span>
+                    <span class="tree-expander">+</span>
+                    <span class="tree-folder">${escapeHtml(entry.name)}</span>
+                    <small>${entry.readable ? 'Folder' : 'Restricted'}</small>
+                </button>
+                <button class="bar-btn" type="button" onclick="PhotoArchive.selectBrowsedDirectory(${jsString(entry.path)})">Use</button>
+            </div>
+        `).join('');
+        const empty = entries.length ? '' : '<div class="catalog-empty tree-empty">No readable subfolders here.</div>';
+        listEl.innerHTML = currentRow + childRows + empty;
+    }
+
+    function directoryCrumbs(path) {
+        const normalized = String(path || '/').replace(/\/+$/, '') || '/';
+        const parts = normalized.split('/').filter(Boolean);
+        const crumbs = [
+            `<button type="button" onclick="PhotoArchive.browseDirectory('/')">/</button>`,
+        ];
+        let current = '';
+        for (const part of parts) {
+            current += `/${part}`;
+            crumbs.push(
+                `<button type="button" onclick="PhotoArchive.browseDirectory(${jsString(current)})">${escapeHtml(part)}</button>`
+            );
+        }
+        return crumbs.join('<span>/</span>');
+    }
+
+    function toggleDirectoryBrowser() {
+        const browser = document.getElementById('directory-browser');
+        const input = document.getElementById('scan-folder');
+        if (!browser) return;
+        const willOpen = browser.classList.contains('hidden');
+        browser.classList.toggle('hidden', !willOpen);
+        if (willOpen) browseDirectory(input?.value?.trim() || catalogBrowsePath || '');
+    }
+
+    function browseDirectoryParent() {
+        if (!catalogBrowsePath) return;
+        browseDirectory(catalogBrowsePath.replace(/\/+$/, '').split('/').slice(0, -1).join('/') || '/');
+    }
+
+    function selectBrowsedDirectory(path) {
+        const input = document.getElementById('scan-folder');
+        if (input) input.value = path;
+    }
+
+    function useBrowsedDirectory() {
+        if (catalogBrowsePath) selectBrowsedDirectory(catalogBrowsePath);
     }
 
     function renderCacheSettingsStatus(cacheStatus) {
@@ -2575,6 +2886,7 @@ const PhotoArchive = (() => {
         renderModelStatus(data.model_status);
         renderAISettingsStatus(data.ai_status);
         renderCacheTierGuide(data.cache_stats, data.settings);
+        if (data.catalog) renderCatalogSources(data.catalog);
         updateCacheProfileHint();
     }
 
@@ -2952,12 +3264,13 @@ const PhotoArchive = (() => {
 
         try {
             await loadSettingsPage(false);
+            await loadCatalogSources();
             // Load scan folder and stats
             const statsRes = await fetch('/api/stats');
             const stats = await statsRes.json();
             const folderInput = document.getElementById('scan-folder');
             const totalEl = document.getElementById('scan-total-images');
-            if (totalEl) totalEl.textContent = (stats.total_images || 0).toLocaleString();
+            if (totalEl) totalEl.textContent = Number(stats.active_images ?? stats.total_images ?? 0).toLocaleString();
             // Infer folder from DB
             try {
                 const folderRes = await fetch('/api/scan/folder');
@@ -2975,42 +3288,7 @@ const PhotoArchive = (() => {
 
     let _scanPoller = null;
     async function startScan() {
-        const folderInput = document.getElementById('scan-folder');
-        const folder = folderInput?.value?.trim();
-        if (!folder) return;
-
-        const btn = document.getElementById('scan-btn');
-        if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
-        const progress = document.getElementById('scan-progress');
-        if (progress) progress.classList.remove('hidden');
-
-        try {
-            await fetch('/api/scan', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ folder }),
-            });
-        } catch {}
-
-        // Poll scan status
-        if (_scanPoller) clearInterval(_scanPoller);
-        _scanPoller = setInterval(async () => {
-            try {
-                const res = await fetch('/api/scan/status');
-                const data = await res.json();
-                const countEl = document.getElementById('scan-progress-count');
-                if (countEl) countEl.textContent = (data.total_found || 0).toLocaleString();
-                const totalEl = document.getElementById('scan-total-images');
-                if (totalEl) totalEl.textContent = (data.total_inserted || 0).toLocaleString();
-                if (!data.scanning) {
-                    clearInterval(_scanPoller);
-                    _scanPoller = null;
-                    if (btn) { btn.disabled = false; btn.textContent = 'Scan Folder'; }
-                    if (progress) progress.classList.add('hidden');
-                    setSettingsStatus(`Scan complete. ${(data.total_inserted || 0).toLocaleString()} images in database.`, 'success');
-                }
-            } catch {}
-        }, 1000);
+        return addCatalogSource();
     }
 
     async function saveSettings() {
@@ -3210,5 +3488,16 @@ const PhotoArchive = (() => {
         stopCachePregeneration,
         installAIModel,
         startScan,
+        addCatalogSource,
+        rescanCatalogSource,
+        openRemoveSourceDialog,
+        closeRemoveSourceDialog,
+        removeCatalogSource,
+        chooseCatalogFolder,
+        toggleDirectoryBrowser,
+        browseDirectory,
+        browseDirectoryParent,
+        selectBrowsedDirectory,
+        useBrowsedDirectory,
     };
 })();

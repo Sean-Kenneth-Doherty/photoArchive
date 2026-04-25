@@ -2,7 +2,9 @@ import asyncio
 import csv
 import io
 import os
+import shutil
 import subprocess
+import sys
 import time
 
 from fastapi import BackgroundTasks, FastAPI, Request
@@ -153,8 +155,7 @@ async def shutdown():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/library", status_code=302)
+    return templates.TemplateResponse(request, "settings.html")
 
 
 @app.get("/compare", response_class=HTMLResponse)
@@ -174,6 +175,11 @@ async def library_page(request: Request):
 
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
+    return templates.TemplateResponse(request, "settings.html")
+
+
+@app.get("/catalog", response_class=HTMLResponse)
+async def catalog_page(request: Request):
     return templates.TemplateResponse(request, "settings.html")
 
 
@@ -212,8 +218,16 @@ async def start_scan(request: Request):
                 limit=min(len(images), config["scan_prefetch_limit"]),
             )
 
-    asyncio.create_task(scanner.scan_folder(folder, on_batch=on_batch))
-    return {"status": "started", "folder": folder}
+    source = await db.add_or_restore_source(folder)
+    asyncio.create_task(scanner.scan_folder(source["path"], source_id=source["id"], on_batch=on_batch))
+    _invalidate_pairing_cache(matchups=True)
+    _invalidate_folders_cache()
+    try:
+        import embed_cache
+        embed_cache.invalidate()
+    except Exception:
+        pass
+    return {"status": "started", "folder": source["path"], "source_id": source["id"]}
 
 
 @app.get("/api/scan/status")
@@ -225,6 +239,345 @@ async def scan_status():
 async def scan_folder():
     folder = await db.get_scan_folder()
     return {"folder": folder or ""}
+
+
+async def _scan_prefetch_on_batch(count):
+    # Start prefetching thumbnails for early images.
+    if count <= 200:
+        images = await db.get_recent_active_images(limit=50)
+        config = settings.get_settings()
+        await thumbnails.prefetch_images(
+            [dict(r) for r in images],
+            "lg",
+            limit=min(len(images), config["scan_prefetch_limit"]),
+        )
+
+
+def _quick_browse_roots() -> list[dict]:
+    home = os.path.expanduser("~")
+    candidates = [
+        ("Home", home),
+        ("Pictures", os.path.join(home, "Pictures")),
+        ("Media", "/media"),
+        ("Mounts", "/mnt"),
+        ("Run Media", os.path.join("/run/media", os.getenv("USER", ""))),
+        ("Volumes", "/Volumes"),
+    ]
+    roots = []
+    seen = set()
+    for label, path in candidates:
+        normalized = db.normalize_source_path(path)
+        if normalized in seen or not os.path.isdir(normalized):
+            continue
+        seen.add(normalized)
+        roots.append({"label": label, "path": normalized})
+    return roots
+
+
+def _folder_picker_start(path: str = "") -> str:
+    candidate = db.normalize_source_path(path or os.path.expanduser("~"))
+    if os.path.isdir(candidate):
+        return candidate
+    parent = os.path.dirname(candidate)
+    while parent and parent != candidate:
+        if os.path.isdir(parent):
+            return parent
+        candidate = parent
+        parent = os.path.dirname(candidate)
+    return os.path.expanduser("~")
+
+
+def _folder_picker_commands(initial: str) -> list[tuple[str, list[str]]]:
+    commands: list[tuple[str, list[str]]] = []
+    if shutil.which("zenity"):
+        commands.append((
+            "zenity",
+            [
+                "zenity",
+                "--file-selection",
+                "--directory",
+                "--title=Select Catalog Folder",
+                f"--filename={initial.rstrip(os.sep) + os.sep}",
+            ],
+        ))
+    if shutil.which("kdialog"):
+        commands.append((
+            "kdialog",
+            ["kdialog", "--title", "Select Catalog Folder", "--getexistingdirectory", initial],
+        ))
+    if shutil.which("yad"):
+        commands.append((
+            "yad",
+            [
+                "yad",
+                "--file-selection",
+                "--directory",
+                "--title=Select Catalog Folder",
+                f"--filename={initial.rstrip(os.sep) + os.sep}",
+            ],
+        ))
+    if shutil.which("qarma"):
+        commands.append((
+            "qarma",
+            [
+                "qarma",
+                "--file-selection",
+                "--directory",
+                "--title=Select Catalog Folder",
+                f"--filename={initial.rstrip(os.sep) + os.sep}",
+            ],
+        ))
+    commands.append((
+        "tkinter",
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                "try:\n"
+                "    import tkinter as tk\n"
+                "    from tkinter import filedialog\n"
+                "    root = tk.Tk()\n"
+                "    root.withdraw()\n"
+                "    try:\n"
+                "        root.attributes('-topmost', True)\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    path = filedialog.askdirectory(title='Select Catalog Folder', initialdir=sys.argv[1], mustexist=True)\n"
+                "    root.destroy()\n"
+                "    if path:\n"
+                "        print(path)\n"
+                "        raise SystemExit(0)\n"
+                "    raise SystemExit(1)\n"
+                "except SystemExit:\n"
+                "    raise\n"
+                "except Exception as exc:\n"
+                "    print(str(exc), file=sys.stderr)\n"
+                "    raise SystemExit(2)\n"
+            ),
+            initial,
+        ],
+    ))
+    return commands
+
+
+def _native_folder_picker_available() -> bool:
+    if any(shutil.which(cmd) for cmd in ("zenity", "kdialog", "yad", "qarma")):
+        return True
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _run_native_folder_picker(initial: str) -> dict:
+    if not _native_folder_picker_available():
+        return {"ok": False, "cancelled": False, "error": "No native folder picker is available"}
+
+    last_error = ""
+    for tool_name, command in _folder_picker_commands(initial):
+        try:
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3600,
+            )
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "cancelled": False, "error": "Folder picker timed out"}
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        selected = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+        stderr = proc.stderr.strip()
+        if proc.returncode == 0 and selected:
+            selected_path = db.normalize_source_path(selected)
+            if os.path.isdir(selected_path):
+                return {"ok": True, "path": selected_path, "tool": tool_name}
+            last_error = "Selected path is not a folder"
+            continue
+        if proc.returncode in (1, 5) and not selected and not stderr:
+            return {"ok": False, "cancelled": True, "tool": tool_name}
+        last_error = stderr or f"{tool_name} exited with status {proc.returncode}"
+
+    return {"ok": False, "cancelled": False, "error": last_error or "Folder picker failed"}
+
+
+@app.get("/api/catalog/folder-picker")
+async def api_catalog_folder_picker_status():
+    tkinter_available = False
+    try:
+        import tkinter  # noqa: F401
+        tkinter_available = True
+    except Exception:
+        pass
+    return {
+        "available": _native_folder_picker_available(),
+        "tools": [
+            name
+            for name, command in _folder_picker_commands(os.path.expanduser("~"))
+            if shutil.which(command[0]) and (name != "tkinter" or tkinter_available)
+        ],
+    }
+
+
+@app.post("/api/catalog/select-folder")
+async def api_catalog_select_folder(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    initial = _folder_picker_start(body.get("path") or "")
+    result = await asyncio.to_thread(_run_native_folder_picker, initial)
+    if not result.get("ok") and not result.get("cancelled"):
+        return JSONResponse(result, status_code=503)
+    return result
+
+
+@app.get("/api/catalog/browse")
+async def api_catalog_browse(path: str = ""):
+    current = db.normalize_source_path(path or os.path.expanduser("~"))
+    roots = _quick_browse_roots()
+    result = {
+        "path": current,
+        "parent": os.path.dirname(current.rstrip(os.sep)) or current,
+        "exists": os.path.exists(current),
+        "is_dir": os.path.isdir(current),
+        "readable": os.access(current, os.R_OK | os.X_OK) if os.path.isdir(current) else False,
+        "roots": roots,
+        "entries": [],
+        "error": "",
+    }
+    if not result["exists"]:
+        result["error"] = "Path does not exist"
+        return result
+    if not result["is_dir"]:
+        result["error"] = "Path is not a directory"
+        return result
+    if not result["readable"]:
+        result["error"] = "Directory is not readable"
+        return result
+
+    try:
+        entries = []
+        with os.scandir(current) as scan:
+            for entry in scan:
+                try:
+                    if not entry.is_dir(follow_symlinks=True):
+                        continue
+                    entry_path = db.normalize_source_path(entry.path)
+                    entries.append({
+                        "name": entry.name,
+                        "path": entry_path,
+                        "readable": os.access(entry_path, os.R_OK | os.X_OK),
+                    })
+                except OSError:
+                    continue
+        result["entries"] = sorted(entries, key=lambda item: item["name"].lower())
+    except PermissionError:
+        result["readable"] = False
+        result["error"] = "Directory is not readable"
+    except OSError as exc:
+        result["error"] = str(exc)
+    return result
+
+
+@app.get("/api/catalog")
+async def api_catalog_summary():
+    return await db.get_catalog_summary()
+
+
+@app.post("/api/catalog/sources")
+async def api_add_catalog_source(request: Request):
+    body = await request.json()
+    folder = body.get("path") or body.get("folder") or ""
+    scan = body.get("scan", True)
+    if not folder or not os.path.isdir(db.normalize_source_path(folder)):
+        return JSONResponse({"error": "Invalid folder path"}, status_code=400)
+    if scan and scanner.scan_state["scanning"]:
+        return JSONResponse({"error": "Scan already in progress"}, status_code=409)
+
+    source = await db.add_or_restore_source(folder)
+    if scan:
+        asyncio.create_task(scanner.scan_folder(source["path"], source_id=source["id"], on_batch=_scan_prefetch_on_batch))
+    _invalidate_pairing_cache(matchups=True)
+    _invalidate_folders_cache()
+    try:
+        import embed_cache
+        embed_cache.invalidate()
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "source": dict(source),
+        "scan_started": bool(scan),
+        "catalog": await db.get_catalog_summary(),
+    }
+
+
+@app.post("/api/catalog/sources/{source_id}/rescan")
+async def api_rescan_catalog_source(source_id: int):
+    source = await db.get_source(source_id)
+    if not source:
+        return JSONResponse({"error": "Source not found"}, status_code=404)
+    if not os.path.isdir(source["path"]):
+        return JSONResponse({"error": "Source folder is offline"}, status_code=400)
+    if scanner.scan_state["scanning"]:
+        return JSONResponse({"error": "Scan already in progress"}, status_code=409)
+
+    restored = await db.add_or_restore_source(source["path"])
+    asyncio.create_task(scanner.scan_folder(restored["path"], source_id=restored["id"], on_batch=_scan_prefetch_on_batch))
+    _invalidate_pairing_cache(matchups=True)
+    _invalidate_folders_cache()
+    try:
+        import embed_cache
+        embed_cache.invalidate()
+    except Exception:
+        pass
+    return {"ok": True, "source": dict(restored), "scan_started": True}
+
+
+@app.post("/api/catalog/sources/{source_id}/remove")
+async def api_remove_catalog_source(source_id: int, request: Request):
+    body = await request.json()
+    mode = body.get("mode", "keep")
+    source = await db.get_source(source_id)
+    if not source:
+        return JSONResponse({"error": "Source not found"}, status_code=404)
+    if scanner.scan_state["scanning"] and scanner.scan_state.get("source_id") == source_id:
+        return JSONResponse({"error": "Cannot remove a source while it is scanning"}, status_code=409)
+
+    if mode == "keep":
+        await db.remove_source_keep_data(source_id)
+        action = {"kept_data": True, "images_deleted": 0, "comparisons_deleted": 0}
+        try:
+            import embed_cache
+            embed_cache.invalidate()
+        except Exception:
+            pass
+    elif mode in ("delete", "purge"):
+        image_ids = await db.get_source_image_ids(source_id)
+        cache_result = thumbnails.purge_image_cache(image_ids)
+        purge_result = await db.purge_source_catalog_data(source_id)
+        action = {"kept_data": False, **purge_result, "cache": cache_result}
+        try:
+            import embed_cache
+            embed_cache.invalidate()
+        except Exception:
+            pass
+    else:
+        return JSONResponse({"error": "Invalid removal mode"}, status_code=400)
+
+    _invalidate_pairing_cache(matchups=True)
+    _invalidate_folders_cache()
+    return {"ok": True, "source_id": source_id, **action, "catalog": await db.get_catalog_summary()}
 
 
 # --- Thumbnail ---
@@ -476,7 +829,10 @@ async def build_cache_status(ahead: int = 100):
         conn = await db.get_db()
         try:
             cursor = await conn.execute(
-                "SELECT id, filepath FROM images WHERE status IN ('kept', 'maybe') ORDER BY id LIMIT ?",
+                "SELECT i.id, i.filepath FROM images i "
+                "JOIN catalog_sources s ON s.id = i.source_id "
+                "WHERE s.included = 1 AND s.online = 1 "
+                "ORDER BY i.id LIMIT ?",
                 (ahead,),
             )
             rows = await cursor.fetchall()
@@ -528,6 +884,7 @@ async def api_settings():
         "cache_stats": await build_cache_status(ahead=0),
         "model_status": model_status,
         "ai_status": ai_status,
+        "catalog": await db.get_catalog_summary(),
         **settings.settings_metadata(),
     }
 
@@ -567,6 +924,7 @@ async def api_save_settings(request: Request):
         "cache_stats": await build_cache_status(ahead=0),
         "model_status": ai_models.get_model_status(),
         "ai_status": await build_ai_status(),
+        "catalog": await db.get_catalog_summary(),
     }
 
 
@@ -580,6 +938,7 @@ async def api_reset_settings():
         "cache_stats": await build_cache_status(ahead=0),
         "model_status": ai_models.get_model_status(),
         "ai_status": await build_ai_status(),
+        "catalog": await db.get_catalog_summary(),
     }
 
 
@@ -1604,6 +1963,11 @@ async def api_collections(n_clusters: int = 20):
 
 _folders_cache = {"data": None, "expires": 0}
 
+
+def _invalidate_folders_cache():
+    _folders_cache["data"] = None
+    _folders_cache["expires"] = 0
+
 @app.get("/api/folders")
 async def api_folders():
     """Get folder tree with image counts (cached 60s)."""
@@ -1614,7 +1978,9 @@ async def api_folders():
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
-            "SELECT filepath FROM images WHERE status IN ('kept', 'maybe')"
+            "SELECT i.filepath FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
         )
         rows = await cursor.fetchall()
     finally:
@@ -1687,7 +2053,9 @@ async def build_ai_status():
     conn = await db.get_db()
     try:
         cursor = await conn.execute(
-            "SELECT COUNT(*) as c FROM images WHERE comparisons > 0"
+            "SELECT COUNT(*) as c FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1 AND i.comparisons > 0"
         )
         compared = (await cursor.fetchone())["c"]
     finally:
