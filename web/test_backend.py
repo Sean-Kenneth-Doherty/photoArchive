@@ -21,6 +21,11 @@ class JsonRequest:
         return self.payload
 
 
+class BadJsonRequest:
+    async def json(self):
+        raise ValueError("bad json")
+
+
 class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -140,6 +145,12 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         b = await self._image(source["id"], "b.jpg")
         offline_source = await self._source("offline", online=False)
         offline = await self._image(offline_source["id"], "offline.jpg")
+
+        response = await app_module.submit_comparison(BadJsonRequest())
+        self.assertEqual(response.status_code, 400)
+
+        response = await app_module.mosaic_pick(JsonRequest([]))
+        self.assertEqual(response.status_code, 400)
 
         response = await app_module.submit_comparison(JsonRequest({"winner_id": a, "loser_id": a}))
         self.assertEqual(response.status_code, 400)

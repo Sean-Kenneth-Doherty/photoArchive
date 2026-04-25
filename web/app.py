@@ -76,6 +76,16 @@ def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(parsed, maximum))
 
 
+async def _json_object(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "Malformed JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    return body, None
+
+
 def _ranking_signal_count(image: dict) -> int:
     return int(image.get("comparisons") or 0) + int(image.get("propagated_updates") or 0)
 
@@ -300,7 +310,9 @@ async def dev_status():
 
 @app.post("/api/scan")
 async def start_scan(request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     folder = body.get("folder", "")
     if not folder or not os.path.isdir(folder):
         return JSONResponse({"error": "Invalid folder path"}, status_code=400)
@@ -597,7 +609,9 @@ async def api_catalog_summary():
 
 @app.post("/api/catalog/sources")
 async def api_add_catalog_source(request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     folder = body.get("path") or body.get("folder") or ""
     scan = body.get("scan", True)
     if not folder or not os.path.isdir(db.normalize_source_path(folder)):
@@ -647,7 +661,9 @@ async def api_rescan_catalog_source(source_id: int):
 
 @app.post("/api/catalog/sources/{source_id}/remove")
 async def api_remove_catalog_source(source_id: int, request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     mode = body.get("mode", "keep")
     source = await db.get_source(source_id)
     if not source:
@@ -809,6 +825,8 @@ async def warm_images(request: Request):
     try:
         body = await request.json()
     except Exception:
+        body = {}
+    if not isinstance(body, dict):
         body = {}
     tier_requests = body.get("tiers") or {}
     requested: dict[str, list[int]] = {}
@@ -1038,7 +1056,9 @@ async def api_settings():
 
 @app.post("/api/image/{image_id}/flag")
 async def api_set_image_flag(image_id: int, request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     flag = body.get("flag", "unflagged")
     if flag not in ("picked", "unflagged", "rejected"):
         return JSONResponse({"error": "Invalid flag"}, status_code=400)
@@ -1054,7 +1074,9 @@ async def api_set_image_flag(image_id: int, request: Request):
 
 @app.post("/api/images/flag")
 async def api_batch_set_flag(request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     flag = body.get("flag", "unflagged")
     image_ids = body.get("image_ids", [])
     if flag not in ("picked", "unflagged", "rejected"):
@@ -1084,7 +1106,9 @@ async def api_batch_set_flag(request: Request):
 
 @app.post("/api/settings")
 async def api_save_settings(request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     current = settings.get_settings()
     saved = settings.save_settings(body)
     thumbnail_changed = any(
@@ -1640,7 +1664,9 @@ async def mosaic_pick(request: Request):
     Body: { "winner_id": int, "loser_ids": [int, ...] }
     K=12 per pair.
     """
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     picked_id = _positive_int(body.get("winner_id"))
     raw_other_ids = body.get("loser_ids", [])
 
@@ -1738,7 +1764,9 @@ async def propagation_last():
 @app.post("/api/propagation/predict")
 async def propagation_predict(request: Request):
     """Precompute propagation counts for each possible winner in a grid."""
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     grid_ids = body.get("grid_ids", [])
     if not grid_ids:
         return {"counts": {}}
@@ -1858,7 +1886,9 @@ async def compare_next(
 
 @app.post("/api/compare")
 async def submit_comparison(request: Request):
-    body = await request.json()
+    body, error = await _json_object(request)
+    if error:
+        return error
     winner_id = _positive_int(body.get("winner_id"))
     loser_id = _positive_int(body.get("loser_id"))
     mode = body.get("mode", "swiss")
