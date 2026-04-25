@@ -418,7 +418,7 @@ const PhotoArchive = (() => {
                 ...mosaicImages.map(img => img.id),
                 ...mosaicReplacements.map(img => img.id),
             ].join(',');
-            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}${filterParams()}`);
+            const res = await fetch(buildMosaicUrl({ n: 10, exclude: excludeIds }));
             const data = await res.json();
             if (data.stats) {
                 compareStats = data.stats;
@@ -1177,7 +1177,10 @@ const PhotoArchive = (() => {
     let thumbHeight = 220;
     let libraryImages = [];
     let lightboxIndex = -1;
-    let filters = {
+    let loupeStandaloneImage = null;
+    const FILTER_STORAGE_KEY = 'pa_filters';
+    const SORT_STORAGE_KEY = 'pa_sort';
+    const EMPTY_FILTERS = {
         orientation: '',
         compared: '',
         rating: '',
@@ -1188,17 +1191,18 @@ const PhotoArchive = (() => {
         camera: '',
         lens: '',
     };
+    let filters = { ...EMPTY_FILTERS };
 
     function saveFilters() {
-        try { sessionStorage.setItem('pa_filters', JSON.stringify(filters)); } catch {}
+        try { sessionStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(currentFilterState())); } catch {}
     }
 
     function restoreFilters() {
         try {
-            const saved = sessionStorage.getItem('pa_filters');
+            const saved = sessionStorage.getItem(FILTER_STORAGE_KEY);
             if (!saved) return;
             const parsed = JSON.parse(saved);
-            Object.assign(filters, parsed);
+            filters = normalizeFilterState(parsed);
 
             // Restore UI state for filter icons
             if (filters.orientation) {
@@ -1266,32 +1270,48 @@ const PhotoArchive = (() => {
         if (btn) btn.setAttribute('aria-expanded', panel.classList.contains('hidden') ? 'false' : 'true');
     }
 
-    function filterParams(state = filters) {
-        let p = '';
-        if (state.orientation) p += `&orientation=${state.orientation}`;
-        if (state.compared) p += `&compared=${state.compared}`;
-        if (state.rating) p += `&min_stars=${state.rating}`;
-        if (state.folder) p += `&folder=${encodeURIComponent(state.folder)}`;
-        if (state.flag) p += `&flag=${state.flag}`;
-        if (state.taken) p += `&date_taken=${encodeURIComponent(state.taken)}`;
-        if (state.fileType) p += `&file_type=${encodeURIComponent(state.fileType)}`;
-        if (state.camera) p += `&camera=${encodeURIComponent(state.camera)}`;
-        if (state.lens) p += `&lens=${encodeURIComponent(state.lens)}`;
-        return p;
+    function normalizeFilterState(state = {}) {
+        return {
+            orientation: state.orientation || '',
+            compared: state.compared || '',
+            rating: state.rating || '',
+            folder: state.folder || '',
+            flag: state.flag || '',
+            taken: state.taken || '',
+            fileType: state.fileType || '',
+            camera: state.camera || '',
+            lens: state.lens || '',
+        };
     }
 
     function currentFilterState() {
-        return {
-            orientation: filters.orientation || '',
-            compared: filters.compared || '',
-            rating: filters.rating || '',
-            folder: filters.folder || '',
-            flag: filters.flag || '',
-            taken: filters.taken || '',
-            fileType: filters.fileType || '',
-            camera: filters.camera || '',
-            lens: filters.lens || '',
-        };
+        return normalizeFilterState(filters);
+    }
+
+    function appendFilterParams(params, state = currentFilterState()) {
+        const normalized = normalizeFilterState(state);
+        if (normalized.orientation) params.set('orientation', normalized.orientation);
+        if (normalized.compared) params.set('compared', normalized.compared);
+        if (normalized.rating) params.set('min_stars', normalized.rating);
+        if (normalized.folder) params.set('folder', normalized.folder);
+        if (normalized.flag) params.set('flag', normalized.flag);
+        if (normalized.taken) params.set('date_taken', normalized.taken);
+        if (normalized.fileType) params.set('file_type', normalized.fileType);
+        if (normalized.camera) params.set('camera', normalized.camera);
+        if (normalized.lens) params.set('lens', normalized.lens);
+        return params;
+    }
+
+    function filterParams(state = currentQueryState()) {
+        const filtersOnly = state.filters ? state.filters : state;
+        const params = appendFilterParams(new URLSearchParams(), filtersOnly);
+        const query = params.toString();
+        return query ? `&${query}` : '';
+    }
+
+    function filterQueryString(state = currentQueryState()) {
+        const filtersOnly = state.filters ? state.filters : state;
+        return appendFilterParams(new URLSearchParams(), filtersOnly).toString();
     }
 
     function buildFilterNeighborStates(baseState = currentFilterState()) {
@@ -1357,24 +1377,49 @@ const PhotoArchive = (() => {
         return states;
     }
 
-    function buildRankingsUrl({ sort = rankingsSort, filterState = currentFilterState(), limit = LIBRARY_NEIGHBOR_LIMIT, offset = 0 } = {}) {
-        return `/api/rankings?limit=${limit}&offset=${offset}&sort=${sort}${filterParams(filterState)}`;
+    function buildRankingsUrl({
+        queryState = currentQueryState(),
+        sort = queryState.sort || rankingsSort,
+        filterState = null,
+        limit = LIBRARY_NEIGHBOR_LIMIT,
+        offset = 0,
+    } = {}) {
+        const state = currentQueryState({
+            ...queryState,
+            filters: filterState || queryState.filters,
+            sort,
+        });
+        return `/api/rankings?${rankingQueryString({ queryState: state, sort, limit, offset })}`;
     }
 
     function buildMosaicUrl({
         strategy = mosaicStrategy,
-        filterState = currentFilterState(),
+        queryState = currentQueryState(),
+        filterState = null,
         gridElo = mosaicGridElo(),
         n = MOSAIC_NEIGHBOR_LIMIT,
         exclude = '',
     } = {}) {
-        let url = `/api/mosaic/next?n=${n}&strategy=${strategy}&grid_elo=${gridElo}${filterParams(filterState)}`;
-        if (exclude) url += `&exclude=${exclude}`;
-        return url;
+        const state = currentQueryState({
+            ...queryState,
+            filters: filterState || queryState.filters,
+        });
+        const params = new URLSearchParams();
+        params.set('n', String(n));
+        params.set('strategy', strategy);
+        params.set('grid_elo', String(gridElo));
+        appendFilterParams(params, state.filters);
+        if (exclude) params.set('exclude', exclude);
+        return `/api/mosaic/next?${params.toString()}`;
     }
 
-    function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS) {
-        return `/api/compare/next?n=${n}&mode=${mode}${filterParams()}`;
+    function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS, queryState = currentQueryState()) {
+        const state = currentQueryState(queryState);
+        const params = new URLSearchParams();
+        params.set('n', String(n));
+        params.set('mode', mode);
+        appendFilterParams(params, state.filters);
+        return `/api/compare/next?${params.toString()}`;
     }
 
     function currentLibraryPageSize() {
@@ -1411,7 +1456,7 @@ const PhotoArchive = (() => {
 
     function syncDateScrubberVisibility() {
         const scrubber = document.getElementById('date-scrubber');
-        const active = Boolean(scrubber) && libraryView !== 'map' && isDateSortActive();
+        const active = Boolean(scrubber) && libraryView !== 'map' && isDateScrubberActive();
         document.body.classList.toggle('date-scrubber-active', active);
         if (scrubber) scrubber.classList.toggle('hidden', !active);
     }
@@ -1420,7 +1465,6 @@ const PhotoArchive = (() => {
         if (fromView === 'compare') {
             const libraryUrl = buildRankingsUrl({
                 sort: 'elo',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 limit: INITIAL_RANKINGS_PAGE_SIZE,
                 offset: 0,
             });
@@ -1437,7 +1481,6 @@ const PhotoArchive = (() => {
         } else if (fromView === 'library') {
             const compareUrl = buildMosaicUrl({
                 strategy: 'explore',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 gridElo: 0,
                 n: mosaicSize,
             });
@@ -1519,10 +1562,89 @@ const PhotoArchive = (() => {
         'similarity':  { desc: 'similarity',    asc: 'similarity', defaultDesc: true },
     };
 
+    function sortValueForState(field = sortField, desc = sortDesc) {
+        const key = SORT_KEYS[field];
+        return key ? (desc ? key.desc : key.asc) : field;
+    }
+
+    function sortStateFromValue(sort) {
+        for (const [field, key] of Object.entries(SORT_KEYS)) {
+            if (sort === key.desc) return { field, desc: true };
+            if (sort === key.asc) return { field, desc: false };
+        }
+        return null;
+    }
+
+    function currentSearchMode() {
+        if (searchQuery === '__similar__') return 'similar';
+        return searchQuery ? 'search' : 'library';
+    }
+
+    function currentQueryState(overrides = {}) {
+        const field = overrides.sortField || sortField;
+        const desc = overrides.sortDesc ?? sortDesc;
+        const mode = overrides.searchMode || currentSearchMode();
+        const query = overrides.searchQuery ?? (mode === 'search' ? searchQuery : '');
+        return {
+            filters: normalizeFilterState(overrides.filters || overrides.filterState || filters),
+            sortField: field,
+            sortDesc: Boolean(desc),
+            sort: overrides.sort || sortValueForState(field, desc),
+            searchMode: mode,
+            searchQuery: query,
+        };
+    }
+
+    function saveSortState() {
+        try {
+            sessionStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
+        } catch {}
+    }
+
+    function restoreSortState() {
+        try {
+            const saved = sessionStorage.getItem(SORT_STORAGE_KEY);
+            if (!saved) return;
+            const parsed = JSON.parse(saved);
+            const field = SORT_KEYS[parsed?.field] && parsed.field !== 'similarity' ? parsed.field : 'elo';
+            sortField = field;
+            sortDesc = parsed?.desc !== false;
+            rankingsSort = sortValueForState(sortField, sortDesc);
+            syncSortControls();
+        } catch {}
+    }
+
+    function syncSortControls() {
+        const select = document.getElementById('sort-field');
+        if (select && select.querySelector(`option[value="${sortField}"]`)) {
+            select.value = sortField;
+        }
+        updateSortDirIcon();
+    }
+
+    function rankingQueryString({
+        queryState = currentQueryState(),
+        limit = LIBRARY_NEIGHBOR_LIMIT,
+        offset = 0,
+        sort = queryState.sort,
+    } = {}) {
+        const state = currentQueryState({ ...queryState, sort });
+        const params = new URLSearchParams();
+        params.set('limit', String(limit));
+        params.set('offset', String(offset));
+        params.set('sort', sort || state.sort);
+        appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) {
+            params.set('q', state.searchQuery);
+        }
+        return params.toString();
+    }
+
     async function initLibrary() {
         initBottomBarMeasurement();
         resetLibraryResults();
         restoreFilters();
+        restoreSortState();
         loadUiSettings();
 
         // Fire all init requests in parallel — don't block on rankings
@@ -1629,6 +1751,7 @@ const PhotoArchive = (() => {
                     // Search is a filter — reload rankings with the query
                     resetLibraryResults({ clearBatch: true });
                     loadRankings(true);
+                    updateDateScrubber();
                 }, 300);
             });
             input.addEventListener('keydown', (e) => {
@@ -1673,6 +1796,7 @@ const PhotoArchive = (() => {
         updateSimilaritySortOption();
         resetLibraryResults({ clearBatch: true });
         loadRankings(true);
+        updateDateScrubber();
     }
 
     async function loadSearchResults() {
@@ -1719,8 +1843,15 @@ const PhotoArchive = (() => {
         if (loadMoreWrap) loadMoreWrap.classList.add('hidden');
     }
 
-    function setRankingsSort(sort) {
+    function setRankingsSort(sort, { persist = true } = {}) {
         rankingsSort = sort;
+        const state = sortStateFromValue(sort);
+        if (state) {
+            sortField = state.field;
+            sortDesc = state.desc;
+            syncSortControls();
+            if (persist && sortField !== 'similarity') saveSortState();
+        }
         resetLibraryResults({ clearBatch: true });
         dateGroupsData = [];
         loadRankings(true);  // true = clear grid before appending
@@ -1728,21 +1859,23 @@ const PhotoArchive = (() => {
     }
 
     function setSortField(field) {
+        if (!SORT_KEYS[field]) return;
         sortField = field;
         const key = SORT_KEYS[field];
         sortDesc = key?.defaultDesc !== false;
-        updateSortDirIcon();
-        setRankingsSort(key ? (sortDesc ? key.desc : key.asc) : field);
+        rankingsSort = sortValueForState(sortField, sortDesc);
+        syncSortControls();
+        if (field !== 'similarity') saveSortState();
+        setRankingsSort(rankingsSort, { persist: false });
     }
 
     function toggleSortDir() {
         if (searchQuery) return;
         sortDesc = !sortDesc;
-        updateSortDirIcon();
-        const key = SORT_KEYS[sortField];
-        if (key) {
-            setRankingsSort(sortDesc ? key.desc : key.asc);
-        }
+        rankingsSort = sortValueForState(sortField, sortDesc);
+        syncSortControls();
+        if (sortField !== 'similarity') saveSortState();
+        setRankingsSort(rankingsSort, { persist: false });
     }
 
     function updateSortDirIcon() {
@@ -1835,6 +1968,8 @@ const PhotoArchive = (() => {
         for (const img of libraryImages) {
             if (img.id === imageId) img.flag = flag;
         }
+        if (loupeStandaloneImage?.id === imageId) loupeStandaloneImage.flag = flag;
+        if (loupeCurrentImage?.id === imageId) loupeCurrentImage.flag = flag;
 
         document.querySelectorAll(`.rank-card[data-image-id="${imageId}"]`).forEach((card) => {
             card.classList.remove('flag-picked', 'flag-rejected');
@@ -1852,7 +1987,10 @@ const PhotoArchive = (() => {
             if (cls) thumb.classList.add(cls);
         });
 
-        if (lightboxIndex >= 0 && libraryImages[lightboxIndex]?.id === imageId) {
+        if (
+            (lightboxIndex >= 0 && libraryImages[lightboxIndex]?.id === imageId)
+            || (lightboxIndex < 0 && loupeStandaloneImage?.id === imageId)
+        ) {
             updateLoupeFlagDisplay(flag);
         }
     }
@@ -1879,7 +2017,7 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         const loupeOpen = loupe && !loupe.classList.contains('hidden');
         const img = loupeOpen
-            ? libraryImages[lightboxIndex]
+            ? (libraryImages[lightboxIndex] || loupeStandaloneImage)
             : libraryImages[selectedLibraryIndex];
         if (!img) return;
         setImageFlag(img.id, flag);
@@ -1901,8 +2039,12 @@ const PhotoArchive = (() => {
         const requestGeneration = libraryRequestGeneration;
         const requestOffset = rankingsOffset;
         const limit = currentLibraryPageSize();
-        let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
-        if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
+        const url = buildRankingsUrl({
+            queryState: currentQueryState({ sort: rankingsSort }),
+            limit,
+            offset: requestOffset,
+            sort: rankingsSort,
+        });
         try {
             const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
             if (!data) return 0;
@@ -1982,7 +2124,7 @@ const PhotoArchive = (() => {
                 // Always warm neighbors — not just on first load
                 scheduleLibraryNeighborWarmup();
                 if (requestOffset === 0) scheduleCrossViewWarmup('library');
-                if (isDateSortActive()) setupScrubberScrollObserver();
+                if (isDateScrubberActive()) setupScrubberScrollObserver();
             }
             return data.images.length;
         } finally {
@@ -2033,6 +2175,10 @@ const PhotoArchive = (() => {
 
     function isDateSortActive() {
         return rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc';
+    }
+
+    function isDateScrubberActive() {
+        return isDateSortActive() && currentSearchMode() === 'library';
     }
 
     function findDateGroupHeader(group) {
@@ -2105,7 +2251,7 @@ const PhotoArchive = (() => {
     }
 
     async function jumpToDateGroup(group) {
-        if (!isDateSortActive() || searchQuery === '__similar__') return;
+        if (!isDateScrubberActive()) return;
 
         const existingHeader = findDateGroupHeader(group);
         if (existingHeader) {
@@ -2143,7 +2289,7 @@ const PhotoArchive = (() => {
 
     async function updateDateScrubber() {
         const existing = document.getElementById('date-scrubber');
-        if (!isDateSortActive()) {
+        if (!isDateScrubberActive()) {
             if (existing) existing.remove();
             if (window._scrubberObserver) window._scrubberObserver.disconnect();
             teardownDateScrubberScrollTracking();
@@ -2151,7 +2297,8 @@ const PhotoArchive = (() => {
             return;
         }
         const gen = ++dateScrubberGeneration;
-        const url = `/api/date-groups?${filterParams().replace(/^&/, '')}`;
+        const query = filterQueryString(currentQueryState());
+        const url = `/api/date-groups${query ? `?${query}` : ''}`;
         try {
             const data = await fetch(url).then(r => r.json());
             if (gen !== dateScrubberGeneration) return;
@@ -2256,20 +2403,40 @@ const PhotoArchive = (() => {
     function openLightbox(img) {
         lightboxIndex = libraryImages.findIndex(i => i.id === img.id);
         if (lightboxIndex < 0) {
-            libraryImages.push(img);
-            lightboxIndex = libraryImages.length - 1;
+            openStandaloneLightbox(img);
+            return;
         }
+        loupeStandaloneImage = null;
         buildFilmstrip();
         showLoupeImage(libraryImages[lightboxIndex], 0);
+    }
+
+    function openStandaloneLightbox(img) {
+        loupeStandaloneImage = img;
+        lightboxIndex = -1;
+        clearFilmstrip();
+        showLoupeImage(img, 0);
     }
 
     let _filmstripBuiltFor = null;  // track which image set the filmstrip was built for
     let _filmstripWindowStart = 0;
     let _filmstripWindowEnd = 0;
 
+    function clearFilmstrip() {
+        const scroll = document.getElementById('filmstrip-scroll');
+        if (scroll) scroll.innerHTML = '';
+        _filmstripBuiltFor = null;
+        _filmstripWindowStart = 0;
+        _filmstripWindowEnd = 0;
+    }
+
     function buildFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        if (lightboxIndex < 0) {
+            clearFilmstrip();
+            return;
+        }
         const start = Math.max(0, lightboxIndex - FILMSTRIP_WINDOW_RADIUS);
         const end = Math.min(libraryImages.length, lightboxIndex + FILMSTRIP_WINDOW_RADIUS + 1);
         const windowStillUseful = (
@@ -2316,6 +2483,7 @@ const PhotoArchive = (() => {
     function updateFilmstripActive() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        if (lightboxIndex < 0) return;
         if (lightboxIndex < _filmstripWindowStart || lightboxIndex >= _filmstripWindowEnd) {
             buildFilmstrip();
             return;
@@ -2482,7 +2650,8 @@ const PhotoArchive = (() => {
     }
 
     function isCurrentLoupeImage(img, token) {
-        return token === loupeImageToken && libraryImages[lightboxIndex]?.id === img.id;
+        const current = lightboxIndex >= 0 ? libraryImages[lightboxIndex] : loupeStandaloneImage;
+        return token === loupeImageToken && current?.id === img.id;
     }
 
     async function getMediaStatus(imageId, { force = false } = {}) {
@@ -2773,6 +2942,7 @@ const PhotoArchive = (() => {
     }
 
     function preloadLoupeNeighbors(direction = 0) {
+        if (lightboxIndex < 0) return;
         for (const offset of loupeNeighborOffsets(LOUPE_PRELOAD_RADIUS, direction)) {
             const ni = lightboxIndex + offset;
             if (ni < 0 || ni >= libraryImages.length) continue;
@@ -3038,6 +3208,7 @@ const PhotoArchive = (() => {
             loupeFullLoadTimer = null;
         }
         loupeCurrentImage = null;
+        loupeStandaloneImage = null;
         loupeFullLoadToken = 0;
         loupeCurrentMediaStatus = null;
         loupeDisplayedTierRank = -1;
@@ -3086,8 +3257,14 @@ const PhotoArchive = (() => {
             if (isDateSortActive()) updateDateScrubber();
             if (libraryView === 'map') loadMap();
         } else {
-            // Compare page — reload mosaic
-            loadMosaicBatch();
+            // Compare page — reload the active compare surface with the same filters
+            if (compareMode === 'mosaic') {
+                loadMosaicBatch();
+            } else {
+                comparePairs = [];
+                compareIndex = 0;
+                fetchComparePairs().then(() => showComparePair());
+            }
         }
     }
 
@@ -3261,6 +3438,7 @@ const PhotoArchive = (() => {
         if (clearBtn) clearBtn.classList.remove('hidden');
         const sortToggles = document.getElementById('sort-toggles');
         if (sortToggles) sortToggles.style.opacity = '0.3';
+        updateDateScrubber();
 
         libraryRequestGeneration++;
         clearBatchSelection();
@@ -3608,7 +3786,8 @@ const PhotoArchive = (() => {
         }
 
         // Fetch markers
-        const url = `/api/map/markers?${filterParams().replace(/^&/, '')}`;
+        const query = filterQueryString(currentQueryState());
+        const url = `/api/map/markers${query ? `?${query}` : ''}`;
         try {
             const data = await fetch(url).then(r => r.json());
             if (requestGeneration !== mapRequestGeneration) return;
@@ -3653,10 +3832,10 @@ const PhotoArchive = (() => {
         if (img) {
             openLightbox(img);
         } else {
-            // Image not in library list — fetch minimal info
+            // Image is outside the active ordered list, so open it without mutating that list.
             fetch(`/api/image/${id}/exif`).then(r => r.json()).then(data => {
                 const exif = data.exif || {};
-                openLightbox({
+                openStandaloneLightbox({
                     id,
                     filename: exif.filename || `Image ${id}`,
                     thumb_url: `/api/thumb/sm/${id}`,
