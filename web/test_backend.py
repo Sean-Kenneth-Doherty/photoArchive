@@ -322,6 +322,43 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["ranking_signal_count"], 8)
         self.assertEqual(stats["total_comparisons"], 8)
 
+    async def test_init_db_migrates_legacy_comparison_action_id_before_indexes(self):
+        original_path = db.DB_PATH
+        legacy_path = os.path.join(self.tempdir.name, "legacy-comparisons.db")
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.execute(
+                "CREATE TABLE comparisons ("
+                "id INTEGER PRIMARY KEY, "
+                "winner_id INTEGER, "
+                "loser_id INTEGER, "
+                "mode TEXT, "
+                "elo_before_winner REAL, "
+                "elo_before_loser REAL, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        db.DB_PATH = legacy_path
+        db.invalidate_stats_cache()
+        try:
+            await db.init_db()
+            conn = sqlite3.connect(legacy_path)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(comparisons)")}
+                indexes = {row[1] for row in conn.execute("PRAGMA index_list(comparisons)")}
+            finally:
+                conn.close()
+        finally:
+            db.DB_PATH = original_path
+            db.invalidate_stats_cache()
+
+        self.assertIn("action_id", columns)
+        self.assertIn("idx_comparisons_action_id", indexes)
+
     async def test_rankings_returns_only_sm_cached_images_with_visible_total_counts(self):
         source = await self._source()
         visible_high = await self._image(source["id"], "visible-high.jpg", elo=1500)

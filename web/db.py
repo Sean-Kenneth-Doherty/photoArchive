@@ -357,6 +357,17 @@ async def init_db():
                         await db.execute(f"ALTER TABLE images ADD COLUMN {col} {defn}")
                     except Exception:
                         pass
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'comparisons'"
+            )
+            if await cursor.fetchone():
+                try:
+                    await db.execute(
+                        "ALTER TABLE comparisons "
+                        "ADD COLUMN action_id TEXT DEFAULT NULL"
+                    )
+                except Exception:
+                    pass
         await db.executescript(SCHEMA)
         # Migrations: add columns if missing
         for col, defn in [
