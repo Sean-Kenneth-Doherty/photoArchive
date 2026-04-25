@@ -1560,6 +1560,19 @@ const PhotoArchive = (() => {
         return document.querySelector('.library-container');
     }
 
+    function updateBackToTopButton() {
+        const btn = document.getElementById('back-to-top');
+        const root = libraryScrollRoot();
+        if (!btn || !root) return;
+        const visible = root.scrollTop > 600;
+        btn.classList.toggle('hidden', !visible);
+        btn.classList.toggle('visible', visible);
+    }
+
+    function scrollToTop() {
+        libraryScrollRoot()?.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
     function scrollLibraryContainerToElement(el, behavior = 'smooth') {
         const root = libraryScrollRoot();
         if (!root || !el) {
@@ -1858,6 +1871,11 @@ const PhotoArchive = (() => {
             }
         }, { root: libraryScrollRoot(), rootMargin: '600px 0px' });
         scrollObserver.observe(sentinel);
+        const scrollRoot = libraryScrollRoot();
+        if (scrollRoot) {
+            scrollRoot.addEventListener('scroll', updateBackToTopButton, { passive: true });
+            updateBackToTopButton();
+        }
 
         // Loupe keyboard navigation
         document.addEventListener('keydown', (e) => {
@@ -5269,6 +5287,7 @@ const PhotoArchive = (() => {
         initSettings,
         showShortcuts,
         hideShortcuts,
+        scrollToTop,
         clearSearch,
         setCompareMode,
         setRankingsSort,
