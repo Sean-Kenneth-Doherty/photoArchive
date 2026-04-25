@@ -5166,6 +5166,32 @@ const PhotoArchive = (() => {
         return promise;
     }
 
+    function showShortcuts() {
+        document.getElementById('shortcut-overlay')?.classList.remove('hidden');
+    }
+
+    function hideShortcuts() {
+        document.getElementById('shortcut-overlay')?.classList.add('hidden');
+    }
+
+    function handleShortcutOverlayKey(e) {
+        const overlay = document.getElementById('shortcut-overlay');
+        const overlayVisible = overlay && !overlay.classList.contains('hidden');
+        if (overlayVisible && e.key === 'Escape') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            hideShortcuts();
+            return;
+        }
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
+            e.preventDefault();
+            showShortcuts();
+        }
+    }
+
+    document.addEventListener('keydown', handleShortcutOverlayKey);
+
     // ==================== PUBLIC API ====================
 
     return {
@@ -5173,6 +5199,8 @@ const PhotoArchive = (() => {
         initLibrary,
         initRankings,
         initSettings,
+        showShortcuts,
+        hideShortcuts,
         clearSearch,
         setCompareMode,
         setRankingsSort,

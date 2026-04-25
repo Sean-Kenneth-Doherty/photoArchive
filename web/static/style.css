@@ -844,6 +844,84 @@ button:disabled {
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
 
+.shortcut-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.62);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: var(--z-modal);
+}
+
+.shortcut-overlay.hidden { display: none; }
+
+.shortcut-overlay-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-xl);
+    max-width: 480px;
+    width: 90%;
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.shortcut-overlay-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-lg);
+    border-bottom: 1px solid var(--border-default);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-bright);
+}
+
+.shortcut-overlay-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 20px;
+    cursor: pointer;
+    padding: var(--space-xs);
+}
+
+.shortcut-overlay-close:hover { color: var(--text-bright); }
+
+.shortcut-overlay-body {
+    padding: var(--space-lg);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-xl);
+}
+
+.shortcut-group h4 {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: var(--space-sm);
+}
+
+.shortcut-row {
+    font-size: 13px;
+    color: var(--text-primary);
+    padding: 3px 0;
+}
+
+.shortcut-row kbd {
+    display: inline-block;
+    background: var(--bg-interactive);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 1px 6px;
+    font-size: 11px;
+    font-family: inherit;
+    color: var(--text-secondary);
+    margin-right: 2px;
+}
+
 .compare-side img {
     max-width: 100%;
     max-height: calc(100% - 28px);
