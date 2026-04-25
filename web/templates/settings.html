@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}photoArchive — Catalog{% endblock %}
+{% block body_class %}with-bottom-bar settings-shell{% endblock %}
 {% block content %}
 <div class="settings-page">
     <div class="settings-hero">
@@ -57,6 +58,10 @@
             <label class="settings-field">
                 <span>Local model directory</span>
                 <input id="embed_model_dir" type="text" spellcheck="false" autocomplete="off">
+            </label>
+            <label class="settings-field">
+                <span>Embedding batch target</span>
+                <input id="embed_batch_size" type="number" min="1" max="32" step="1">
             </label>
             <div class="settings-metric-list">
                 <div>Install status: <strong id="model-install-status">—</strong></div>
@@ -140,6 +145,10 @@
             <label class="settings-checkbox">
                 <input id="pregenerate_on_idle" type="checkbox">
                 <span>Warm image cache while the computer is idle</span>
+            </label>
+            <label class="settings-checkbox">
+                <input id="show_loupe_cache_status" type="checkbox">
+                <span>Show loupe cache status beside metadata.</span>
             </label>
             <details class="settings-advanced" id="cache-advanced">
                 <summary>Technical details</summary>

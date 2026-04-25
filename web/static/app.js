@@ -7,6 +7,7 @@ const PhotoArchive = (() => {
     let compareIndex = 0;
     let compareMode = 'swiss';
     let compareBusy = false;
+    let compareActionSeq = 0;
     let compareStats = {};
     let compareImageToken = 0;
     const compareDisplayedTier = { left: -1, right: -1 };
@@ -16,44 +17,117 @@ const PhotoArchive = (() => {
     const INITIAL_RANKINGS_PAGE_SIZE = 48;
     const RANKINGS_PAGE_SIZE = 100;
     const BACKGROUND_WARM_DELAY_MS = 250;
+    const CROSS_VIEW_WARM_DELAY_MS = 1000;
+    const WARMUP_QUEUE_CONCURRENCY = 1;
     const LIBRARY_NEIGHBOR_LIMIT = 24;
     const MOSAIC_NEIGHBOR_LIMIT = 8;
     const COMPARE_NEIGHBOR_PAIRS = 4;
     const FILMSTRIP_WINDOW_RADIUS = 55;
     const LOUPE_TIER_LABELS = ['Thumbnail (sm)', 'Medium (md)', 'Large (lg)', 'Original'];
+    const LOUPE_TIER_NAMES = ['sm', 'md', 'lg', 'full'];
     const LOUPE_TIER_TIMEOUTS = { md: 1800, lg: 2600, full: 5000 };
     const LOUPE_TIER_RANKS = { sm: 0, md: 1, lg: 2, full: 3 };
+    const LOUPE_BLANK_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
     const MEDIA_STATUS_MAX_AGE_MS = 15000;
     const mediaStatusCache = new Map();
+    const mediaStatusInflight = new Map();
+    let uiSettings = { show_loupe_cache_status: true };
+    let uiSettingsPromise = null;
     let selectedLibraryIndex = -1;
     let selectedMosaicIndex = -1;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
+    const warmupQueue = [];
+    let warmupActive = 0;
+    let warmupGeneration = 0;
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
     const WARM_CACHE_MAX_AGE_MS = 30000;
+    const WARM_TIER_DEDUPE_MS = 8000;
+    const WARM_TIER_BATCH_DELAY_MS = 120;
+    const recentWarmTierIds = new Map();
+    const pendingWarmTiers = new Map();
+    let warmTierFlushTimer = null;
+    let bottomBarResizeObserver = null;
+    let bottomBarResizeListenerAdded = false;
+
+    function updateBottomBarHeightVar() {
+        const bar = document.querySelector('.bottom-bar');
+        const height = bar?.offsetHeight || 0;
+        document.documentElement.style.setProperty('--current-bottom-bar-height', `${height}px`);
+        if (document.getElementById('mosaic-grid')) scheduleMosaicRender();
+    }
+
+    function initBottomBarMeasurement() {
+        updateBottomBarHeightVar();
+        if (bottomBarResizeObserver) bottomBarResizeObserver.disconnect();
+
+        const bar = document.querySelector('.bottom-bar');
+        if (bar && 'ResizeObserver' in window) {
+            bottomBarResizeObserver = new ResizeObserver(updateBottomBarHeightVar);
+            bottomBarResizeObserver.observe(bar);
+        }
+        if (!bottomBarResizeListenerAdded) {
+            window.addEventListener('resize', updateBottomBarHeightVar);
+            bottomBarResizeListenerAdded = true;
+        }
+    }
+
+    function clearWarmups() {
+        warmupGeneration++;
+        for (const timer of backgroundWarmTimers.values()) clearTimeout(timer);
+        backgroundWarmTimers.clear();
+        for (const item of warmupQueue.splice(0)) {
+            if (item.onDrop) item.onDrop();
+        }
+    }
+
+    function enqueueWarmup(task, { generation = warmupGeneration, onDrop = null } = {}) {
+        warmupQueue.push({ task, generation, onDrop });
+        pumpWarmupQueue();
+    }
+
+    async function pumpWarmupQueue() {
+        if (warmupActive >= WARMUP_QUEUE_CONCURRENCY) return;
+        const item = warmupQueue.shift();
+        if (!item) return;
+        if (item.generation !== warmupGeneration) {
+            if (item.onDrop) item.onDrop();
+            pumpWarmupQueue();
+            return;
+        }
+
+        warmupActive++;
+        try {
+            await item.task();
+        } catch {
+            // Warmups are opportunistic.
+        } finally {
+            warmupActive = Math.max(0, warmupActive - 1);
+            pumpWarmupQueue();
+        }
+    }
 
     function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
         const token = (backgroundWarmTokens.get(key) || 0) + 1;
         backgroundWarmTokens.set(key, token);
+        const generation = warmupGeneration;
 
         const existingTimer = backgroundWarmTimers.get(key);
         if (existingTimer) clearTimeout(existingTimer);
 
         const timer = setTimeout(() => {
             backgroundWarmTimers.delete(key);
-            const run = () => Promise.resolve(task(token)).catch(() => {});
-            if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-                window.requestIdleCallback(run, { timeout: 1500 });
-            } else {
-                run();
-            }
+            enqueueWarmup(
+                () => task(token, generation),
+                { generation },
+            );
         }, delay);
 
         backgroundWarmTimers.set(key, timer);
     }
 
-    function isWarmTokenCurrent(key, token) {
-        return backgroundWarmTokens.get(key) === token;
+    function isWarmTokenCurrent(key, token, generation = warmupGeneration) {
+        return backgroundWarmTokens.get(key) === token && generation === warmupGeneration;
     }
 
     async function fetchWarmJson(url) {
@@ -96,34 +170,84 @@ const PhotoArchive = (() => {
         }
     }
 
-    function warmImageUrls(urls) {
+    async function warmImageUrls(urls, generation = warmupGeneration) {
         for (const url of urls || []) {
-            preloadImage(url, 'low');
+            if (generation !== warmupGeneration) return;
+            await preloadImageWithTimeout(url, 'low', 1200);
         }
     }
 
     function warmImageTiers(tiers) {
-        const payload = {};
+        const now = Date.now();
+        let queued = false;
         for (const [tier, ids] of Object.entries(tiers || {})) {
             const unique = [...new Set((ids || []).map((id) => Number(id)).filter((id) => id > 0))];
-            if (unique.length) payload[tier] = unique;
+            for (const id of unique) {
+                const key = `${tier}:${id}`;
+                const lastWarm = recentWarmTierIds.get(key) || 0;
+                if (now - lastWarm < WARM_TIER_DEDUPE_MS) continue;
+                recentWarmTierIds.set(key, now);
+                if (!pendingWarmTiers.has(tier)) pendingWarmTiers.set(tier, new Set());
+                pendingWarmTiers.get(tier).add(id);
+                queued = true;
+            }
         }
+        if (!queued || warmTierFlushTimer) return;
+        warmTierFlushTimer = setTimeout(flushWarmImageTiers, WARM_TIER_BATCH_DELAY_MS);
+    }
+
+    function flushWarmImageTiers() {
+        warmTierFlushTimer = null;
+        const payload = {};
+        for (const [tier, ids] of pendingWarmTiers.entries()) {
+            if (ids.size) payload[tier] = Array.from(ids).slice(0, 96);
+        }
+        pendingWarmTiers.clear();
         if (!Object.keys(payload).length) return;
+        const cutoff = Date.now() - (WARM_TIER_DEDUPE_MS * 3);
+        for (const [key, warmedAt] of recentWarmTierIds.entries()) {
+            if (warmedAt < cutoff) recentWarmTierIds.delete(key);
+        }
         fetch('/api/images/warm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tiers: payload }),
             keepalive: true,
+        }).then(() => {
+            const currentId = Number(loupeCurrentImage?.id || 0);
+            if (!currentId) return;
+            const includesCurrent = Object.values(payload).some((ids) => (ids || []).includes(currentId));
+            if (includesCurrent) refreshLoupeMediaStatus(loupeCurrentImage, loupeImageToken);
         }).catch(() => {});
     }
 
-    async function warmRequests(key, token, requests) {
+    async function loadUiSettings() {
+        if (uiSettingsPromise) return uiSettingsPromise;
+        uiSettingsPromise = fetch('/api/ui/settings')
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) => {
+                const values = data?.settings || data || {};
+                uiSettings = {
+                    ...uiSettings,
+                    show_loupe_cache_status: values.show_loupe_cache_status !== false,
+                };
+                renderLoupeStatusLine();
+                return uiSettings;
+            })
+            .catch(() => uiSettings)
+            .finally(() => {
+                uiSettingsPromise = null;
+            });
+        return uiSettingsPromise;
+    }
+
+    async function warmRequests(key, token, generation, requests) {
         for (const request of requests) {
-            if (!isWarmTokenCurrent(key, token)) return;
+            if (!isWarmTokenCurrent(key, token, generation)) return;
             const data = await fetchWarmJson(request.url);
-            if (!data || !isWarmTokenCurrent(key, token)) return;
+            if (!data || !isWarmTokenCurrent(key, token, generation)) return;
             if (request.cacheKey) saveWarmCache(request.cacheKey, data);
-            warmImageUrls(request.extract(data));
+            await warmImageUrls(request.extract(data), generation);
         }
     }
 
@@ -134,9 +258,7 @@ const PhotoArchive = (() => {
     function compareThumbUrls(data) {
         const urls = [];
         for (const pair of data.pairs || []) {
-            if (pair.left?.id) urls.push(`/api/thumb/sm/${pair.left.id}`);
             if (pair.left?.thumb_url) urls.push(pair.left.thumb_url);
-            if (pair.right?.id) urls.push(`/api/thumb/sm/${pair.right.id}`);
             if (pair.right?.thumb_url) urls.push(pair.right.thumb_url);
         }
         return urls;
@@ -177,6 +299,7 @@ const PhotoArchive = (() => {
     let mosaicStrategy = 'diverse';
     let mosaicPropagationCounts = {}; // precomputed: {imageId: predictedCount}
     let mosaicRenderToken = 0;
+    let mosaicResizeRaf = null;
 
     function mosaicGridElo() {
         if (mosaicImages.length === 0) return 0;
@@ -215,6 +338,7 @@ const PhotoArchive = (() => {
 
     function renderMosaic() {
         const grid = document.getElementById('mosaic-grid');
+        if (!grid) return;
         grid.innerHTML = '';
         selectedMosaicIndex = -1;
         const token = ++mosaicRenderToken;
@@ -222,14 +346,16 @@ const PhotoArchive = (() => {
         // Calculate row height to fit all images in the viewport
         // using the same justified flex layout as the library
         const gap = 3;
-        const containerW = grid.clientWidth || window.innerWidth;
+        const containerW = grid.clientWidth || grid.parentElement?.clientWidth || window.innerWidth;
         const barH = document.querySelector('.bottom-bar')?.offsetHeight || 60;
-        const containerH = window.innerHeight - barH - 4;
-        const n = mosaicImages.length;
+        const containerH = Math.max(
+            80,
+            grid.clientHeight || grid.parentElement?.clientHeight || window.innerHeight - barH - 4,
+        );
 
         // Simulate row packing to find the right row height
         // Binary search for the height that fits all images in the container
-        let lo = 60, hi = containerH;
+        let lo = 60, hi = Math.max(60, containerH);
         for (let iter = 0; iter < 20; iter++) {
             const mid = (lo + hi) / 2;
             let rows = 1, rowW = 0;
@@ -259,11 +385,19 @@ const PhotoArchive = (() => {
             cell.style.flexGrow = ar;
             cell.style.flexBasis = (rowH * ar) + 'px';
             cell.onclick = () => mosaicClick(img.id);
-            cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
+            cell.innerHTML = `<img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
             preloadImage(img.thumb_url);
             grid.appendChild(cell);
             scheduleMosaicImageUpgrade(cell, img, rowH, token, index);
         }
+    }
+
+    function scheduleMosaicRender() {
+        if (mosaicResizeRaf) cancelAnimationFrame(mosaicResizeRaf);
+        mosaicResizeRaf = requestAnimationFrame(() => {
+            mosaicResizeRaf = null;
+            if (compareMode === 'mosaic' && mosaicImages.length) renderMosaic();
+        });
     }
 
     function scheduleMosaicImageUpgrade(cell, img, rowH, token, index = 0) {
@@ -317,63 +451,94 @@ const PhotoArchive = (() => {
     let mosaicReplacements = [];
     let mosaicFilling = false;
 
-    async function mosaicFillReplacements() {
+    function mosaicFillReplacements() {
         if (mosaicFilling || mosaicReplacements.length >= 10) return;
         mosaicFilling = true;
-        try {
-            const excludeIds = [
-                ...mosaicImages.map(img => img.id),
-                ...mosaicReplacements.map(img => img.id),
-            ].join(',');
-            const res = await fetch(`/api/mosaic/next?n=10&exclude=${excludeIds}&strategy=${mosaicStrategy}&grid_elo=${mosaicGridElo()}${filterParams()}`);
-            const data = await res.json();
-            if (data.stats) {
-                compareStats = data.stats;
-                updateCompareProgress();
-            }
-            // Deduplicate against current grid and existing replacements
-            const onGrid = new Set(mosaicImages.map(img => img.id));
-            const inBuffer = new Set(mosaicReplacements.map(img => img.id));
-            for (const img of data.images) {
-                if (!onGrid.has(img.id) && !inBuffer.has(img.id)) {
-                    mosaicReplacements.push(img);
-                    inBuffer.add(img.id);
-                    preloadImage(img.thumb_url);
+        const generation = warmupGeneration;
+        const renderToken = mosaicRenderToken;
+        enqueueWarmup(async () => {
+            try {
+                if (generation !== warmupGeneration || renderToken !== mosaicRenderToken) return;
+                const excludeIds = [
+                    ...mosaicImages.map(img => img.id),
+                    ...mosaicReplacements.map(img => img.id),
+                ].join(',');
+                const res = await fetch(buildMosaicUrl({ n: 10, exclude: excludeIds }));
+                const data = await res.json();
+                if (generation !== warmupGeneration || renderToken !== mosaicRenderToken) return;
+                if (data.stats) {
+                    compareStats = data.stats;
+                    updateCompareProgress();
                 }
+                // Deduplicate against current grid and existing replacements
+                const onGrid = new Set(mosaicImages.map(img => img.id));
+                const inBuffer = new Set(mosaicReplacements.map(img => img.id));
+                const replacementUrls = [];
+                for (const img of data.images) {
+                    if (!onGrid.has(img.id) && !inBuffer.has(img.id)) {
+                        mosaicReplacements.push(img);
+                        inBuffer.add(img.id);
+                        if (img.thumb_url) replacementUrls.push(img.thumb_url);
+                    }
+                }
+                warmImageUrls(replacementUrls, generation).catch(() => {});
+            } catch {} finally {
+                mosaicFilling = false;
             }
-        } catch {} finally {
-            mosaicFilling = false;
-        }
+        }, {
+            generation,
+            onDrop: () => {
+                mosaicFilling = false;
+            },
+        });
     }
 
     let mosaicBusy = false;
+    let mosaicActionSeq = 0;
 
     function mosaicClick(id) {
         if (mosaicBusy) return;
         const idx = mosaicImages.findIndex(img => img.id === id);
         if (idx === -1) return;
         mosaicBusy = true;
+        const actionSeq = ++mosaicActionSeq;
 
         const otherIds = mosaicImages.filter(img => img.id !== id).map(img => img.id);
 
-        // Fire and forget with error handling
-        fetch('/api/mosaic/pick', {
+        const snapshot = {
+            renderToken: mosaicRenderToken,
+            images: mosaicImages.slice(),
+            age: mosaicAge.slice(),
+            replacements: mosaicReplacements.slice(),
+            stats: { ...compareStats },
+            propagationCounts: { ...mosaicPropagationCounts },
+        };
+
+        const savePick = fetch('/api/mosaic/pick', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ winner_id: id, loser_ids: otherIds }),
-        }).catch(() => {
-            showToast('Failed to save pick — check connection');
-        });
+        }).then(async (res) => {
+            let payload = {};
+            try {
+                payload = await res.json();
+            } catch {}
+            if (!res.ok || payload.ok === false) {
+                throw new Error(payload.error || 'Failed to save pick');
+            }
+            return payload;
+        }).then(
+            (payload) => ({ ok: true, payload }),
+            (error) => ({ ok: false, error }),
+        );
 
         // Update stats using precomputed propagation count if available
         const propagated = mosaicPropagationCounts[id] || 0;
         bumpRankingSignals(otherIds.length + propagated, otherIds.length);
         updateCompareProgress();
+        const needsPropagationPoll = propagated <= 0;
         if (propagated > 0) {
             showPropagationBadge(propagated);
-        } else {
-            // Precompute not ready — poll immediately
-            fetchPropagationCount(0);
         }
 
         // Green flash + scale pulse on the picked cell
@@ -399,11 +564,15 @@ const PhotoArchive = (() => {
         const replaceIndices = [idx];
         if (oldestIdx >= 0 && oldestAge >= 10) replaceIndices.push(oldestIdx);
 
-        // Swap after animation completes
-        setTimeout(() => {
+        if (mosaicRenderToken === snapshot.renderToken) {
             for (const ri of replaceIndices) {
                 const targetCell = cells[ri];
-                if (!targetCell || mosaicReplacements.length === 0) continue;
+                if (!targetCell) continue;
+                if (mosaicReplacements.length === 0) {
+                    targetCell.classList.remove('mosaic-picked');
+                    mosaicFillReplacements();
+                    continue;
+                }
                 const newImg = mosaicReplacements.shift();
                 mosaicImages[ri] = newImg;
                 mosaicAge[ri] = 0;
@@ -419,20 +588,43 @@ const PhotoArchive = (() => {
                 targetCell.classList.remove('mosaic-picked');
                 scheduleMosaicImageUpgrade(targetCell, newImg, targetCell.clientHeight || 220, mosaicRenderToken, ri);
             }
+            mosaicFillReplacements();
+        }
 
-            mosaicBusy = false;
+        mosaicBusy = false;
+
+        savePick.then((saveResult) => {
+            if (!saveResult.ok) {
+                if (mosaicRenderToken === snapshot.renderToken && mosaicActionSeq === actionSeq) {
+                    mosaicImages = snapshot.images;
+                    mosaicAge = snapshot.age;
+                    mosaicReplacements = snapshot.replacements;
+                    compareStats = snapshot.stats;
+                    mosaicPropagationCounts = snapshot.propagationCounts;
+                    renderMosaic();
+                    updateCompareProgress();
+                    showToast('Failed to save pick; restored the previous grid');
+                } else {
+                    showToast('Failed to save pick');
+                }
+                return;
+            }
 
             // Refill replacement buffer and recompute propagation for new grid
+            if (needsPropagationPoll) {
+                fetchPropagationCount(0);
+            }
             mosaicFillReplacements();
             precomputePropagation();
 
             if (mosaicImages.length < 2) {
                 showCompareEmpty();
             }
-        }, 150);
+        });
     }
 
     function showToast(msg) {
+        updateBottomBarHeightVar();
         let toast = document.getElementById('mosaic-toast');
         if (!toast) {
             toast = document.createElement('div');
@@ -446,6 +638,7 @@ const PhotoArchive = (() => {
     }
 
     function setMosaicStrategy(strategy) {
+        clearWarmups();
         mosaicStrategy = strategy;
         const btn = document.getElementById('strategy-' + strategy);
         if (btn) {
@@ -462,7 +655,9 @@ const PhotoArchive = (() => {
     // ==================== COMPARE MODE ====================
 
     async function initCompare() {
+        initBottomBarMeasurement();
         document.addEventListener('keydown', handleCompareKey);
+        window.addEventListener('resize', scheduleMosaicRender);
         document.getElementById('compare-left').addEventListener('click', () => submitComparison('left'));
         document.getElementById('compare-right').addEventListener('click', () => submitComparison('right'));
         // Set slider to match default mosaic size (12 images → slider ~168)
@@ -472,6 +667,7 @@ const PhotoArchive = (() => {
             slider.value = Math.round(120 + t * 280);
         }
         restoreFilters();
+        restoreSearchState();
         setCompareMode('mosaic');
         pollAIStatus();
         setInterval(pollAIStatus, 5000);
@@ -632,8 +828,8 @@ const PhotoArchive = (() => {
         imgEl.onerror = () => {
             if (isCurrentCompareImage(token)) imgEl.classList.remove('fading');
         };
-        imgEl.src = `/api/thumb/sm/${img.id}`;
-        compareDisplayedTier[side] = 0;
+        imgEl.src = img.thumb_url || `/api/thumb/md/${img.id}`;
+        compareDisplayedTier[side] = LOUPE_TIER_RANKS.md;
         upgradeCompareImage(img, imgEl, side, token).catch(() => {});
     }
 
@@ -681,6 +877,37 @@ const PhotoArchive = (() => {
         return Number(compareStats.ranking_signal_count ?? compareStats.total_comparisons ?? 0);
     }
 
+    function visibleTotalLabel(visible, total) {
+        const visibleNum = Number(visible ?? 0);
+        const totalNum = Number(total ?? visibleNum);
+        const visibleText = visibleNum.toLocaleString();
+        if (Number.isFinite(totalNum) && totalNum !== visibleNum) {
+            return `${visibleText} / ${totalNum.toLocaleString()}`;
+        }
+        return visibleText;
+    }
+
+    function poolVisibleCount(stats = compareStats) {
+        return Number(
+            stats.filtered_pool_visible
+            ?? stats.visible_images
+            ?? stats.filtered_pool
+            ?? stats['ke' + 'pt']
+            ?? 0
+        );
+    }
+
+    function poolTotalCount(stats = compareStats) {
+        const visible = poolVisibleCount(stats);
+        return Number(
+            stats.filtered_pool_total
+            ?? stats.total_images
+            ?? stats.total_kept
+            ?? stats.filtered_pool
+            ?? visible
+        );
+    }
+
     function bumpRankingSignals(signalDelta, directDelta = 0) {
         const next = Math.max(0, displayedRankingSignalCount() + Number(signalDelta || 0));
         compareStats.ranking_signal_count = next;
@@ -695,10 +922,9 @@ const PhotoArchive = (() => {
 
     function updateCompareProgress() {
         const total = displayedRankingSignalCount();
-        const poolCount = compareStats.filtered_pool ?? compareStats['ke' + 'pt'] ?? 0;
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
-        if (poolEl) poolEl.textContent = poolCount.toLocaleString();
+        if (poolEl) poolEl.textContent = visibleTotalLabel(poolVisibleCount(), poolTotalCount());
         if (!compEl) return;
 
         if (_displayedComparisons < 0) {
@@ -773,37 +999,48 @@ const PhotoArchive = (() => {
         _propagationBadgeTimer = setTimeout(() => badge.classList.remove('visible'), 3000);
     }
 
-    async function submitComparison(side) {
+    function submitComparison(side) {
         if (compareBusy || compareIndex >= comparePairs.length) return;
         compareBusy = true;
+        const actionSeq = ++compareActionSeq;
 
         const pair = comparePairs[compareIndex];
+        const previousIndex = compareIndex;
         const winnerId = side === 'left' ? pair.left.id : pair.right.id;
         const loserId = side === 'left' ? pair.right.id : pair.left.id;
 
-        try {
-            const res = await fetch('/api/compare', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ winner_id: winnerId, loser_id: loserId, mode: compareMode }),
-            });
-            if (res.ok) {
-                const result = await res.json();
-                // Update local elo for display
-                if (side === 'left') {
-                    pair.left.elo = result.winner_elo;
-                    pair.right.elo = result.loser_elo;
-                } else {
-                    pair.right.elo = result.winner_elo;
-                    pair.left.elo = result.loser_elo;
-                }
-                compareIndex++;
-                showComparePair();
-                fetchPropagationCount(1);
+        compareIndex++;
+        showComparePair();
+        compareBusy = false;
+
+        fetch('/api/compare', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ winner_id: winnerId, loser_id: loserId, mode: compareMode }),
+        }).then(async (res) => {
+            let result = {};
+            try {
+                result = await res.json();
+            } catch {}
+            if (!res.ok) throw new Error(result.error || 'Failed to save comparison');
+
+            if (side === 'left') {
+                pair.left.elo = result.winner_elo;
+                pair.right.elo = result.loser_elo;
+            } else {
+                pair.right.elo = result.winner_elo;
+                pair.left.elo = result.loser_elo;
             }
-        } finally {
-            compareBusy = false;
-        }
+            fetchPropagationCount(1);
+        }).catch(() => {
+            if (compareActionSeq === actionSeq && compareMode !== 'mosaic') {
+                compareIndex = previousIndex;
+                showComparePair();
+                showToast('Failed to save comparison; restored the previous pair');
+            } else {
+                showToast('Failed to save comparison');
+            }
+        });
     }
 
     async function undoComparison() {
@@ -943,6 +1180,7 @@ const PhotoArchive = (() => {
     }
 
     function setCompareMode(mode) {
+        clearWarmups();
         compareMode = mode;
         const btn = document.getElementById('mode-' + mode);
         if (btn) {
@@ -992,15 +1230,26 @@ const PhotoArchive = (() => {
     let sortDesc = true;
     let lastDateGroup = null;
     let dateGroupsData = [];
+    let dateScrubberGeneration = 0;
+    let dateJumpGeneration = 0;
+    let dateScrubberScrollRoot = null;
+    let dateScrubberScrollHandler = null;
+    let dateScrubberScrollRaf = null;
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
+    let rankingsLoadPromise = null;
     let rankingsExhausted = false;
     let libraryRequestGeneration = 0;
     let thumbHeight = 220;
     let libraryImages = [];
     let lightboxIndex = -1;
-    let filters = {
+    let loupeStandaloneImage = null;
+    const FILTER_STORAGE_KEY = 'pa_filters';
+    const SORT_STORAGE_KEY = 'pa_sort';
+    const SEARCH_STORAGE_KEY = 'pa_search_query';
+    const SEARCH_SORT_STORAGE_KEY = 'pa_search_sort';
+    const EMPTY_FILTERS = {
         orientation: '',
         compared: '',
         rating: '',
@@ -1011,17 +1260,18 @@ const PhotoArchive = (() => {
         camera: '',
         lens: '',
     };
+    let filters = { ...EMPTY_FILTERS };
 
     function saveFilters() {
-        try { sessionStorage.setItem('pa_filters', JSON.stringify(filters)); } catch {}
+        try { sessionStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(currentFilterState())); } catch {}
     }
 
     function restoreFilters() {
         try {
-            const saved = sessionStorage.getItem('pa_filters');
+            const saved = sessionStorage.getItem(FILTER_STORAGE_KEY);
             if (!saved) return;
             const parsed = JSON.parse(saved);
-            Object.assign(filters, parsed);
+            filters = normalizeFilterState(parsed);
 
             // Restore UI state for filter icons
             if (filters.orientation) {
@@ -1089,32 +1339,48 @@ const PhotoArchive = (() => {
         if (btn) btn.setAttribute('aria-expanded', panel.classList.contains('hidden') ? 'false' : 'true');
     }
 
-    function filterParams(state = filters) {
-        let p = '';
-        if (state.orientation) p += `&orientation=${state.orientation}`;
-        if (state.compared) p += `&compared=${state.compared}`;
-        if (state.rating) p += `&min_stars=${state.rating}`;
-        if (state.folder) p += `&folder=${encodeURIComponent(state.folder)}`;
-        if (state.flag) p += `&flag=${state.flag}`;
-        if (state.taken) p += `&date_taken=${encodeURIComponent(state.taken)}`;
-        if (state.fileType) p += `&file_type=${encodeURIComponent(state.fileType)}`;
-        if (state.camera) p += `&camera=${encodeURIComponent(state.camera)}`;
-        if (state.lens) p += `&lens=${encodeURIComponent(state.lens)}`;
-        return p;
+    function normalizeFilterState(state = {}) {
+        return {
+            orientation: state.orientation || '',
+            compared: state.compared || '',
+            rating: state.rating || '',
+            folder: state.folder || '',
+            flag: state.flag || '',
+            taken: state.taken || '',
+            fileType: state.fileType || '',
+            camera: state.camera || '',
+            lens: state.lens || '',
+        };
     }
 
     function currentFilterState() {
-        return {
-            orientation: filters.orientation || '',
-            compared: filters.compared || '',
-            rating: filters.rating || '',
-            folder: filters.folder || '',
-            flag: filters.flag || '',
-            taken: filters.taken || '',
-            fileType: filters.fileType || '',
-            camera: filters.camera || '',
-            lens: filters.lens || '',
-        };
+        return normalizeFilterState(filters);
+    }
+
+    function appendFilterParams(params, state = currentFilterState()) {
+        const normalized = normalizeFilterState(state);
+        if (normalized.orientation) params.set('orientation', normalized.orientation);
+        if (normalized.compared) params.set('compared', normalized.compared);
+        if (normalized.rating) params.set('min_stars', normalized.rating);
+        if (normalized.folder) params.set('folder', normalized.folder);
+        if (normalized.flag) params.set('flag', normalized.flag);
+        if (normalized.taken) params.set('date_taken', normalized.taken);
+        if (normalized.fileType) params.set('file_type', normalized.fileType);
+        if (normalized.camera) params.set('camera', normalized.camera);
+        if (normalized.lens) params.set('lens', normalized.lens);
+        return params;
+    }
+
+    function filterParams(state = currentQueryState()) {
+        const filtersOnly = state.filters ? state.filters : state;
+        const params = appendFilterParams(new URLSearchParams(), filtersOnly);
+        const query = params.toString();
+        return query ? `&${query}` : '';
+    }
+
+    function filterQueryString(state = currentQueryState()) {
+        const filtersOnly = state.filters ? state.filters : state;
+        return appendFilterParams(new URLSearchParams(), filtersOnly).toString();
     }
 
     function buildFilterNeighborStates(baseState = currentFilterState()) {
@@ -1180,24 +1446,51 @@ const PhotoArchive = (() => {
         return states;
     }
 
-    function buildRankingsUrl({ sort = rankingsSort, filterState = currentFilterState(), limit = LIBRARY_NEIGHBOR_LIMIT, offset = 0 } = {}) {
-        return `/api/rankings?limit=${limit}&offset=${offset}&sort=${sort}${filterParams(filterState)}`;
+    function buildRankingsUrl({
+        queryState = currentQueryState(),
+        sort = queryState.sort || rankingsSort,
+        filterState = null,
+        limit = LIBRARY_NEIGHBOR_LIMIT,
+        offset = 0,
+    } = {}) {
+        const state = currentQueryState({
+            ...queryState,
+            filters: filterState || queryState.filters,
+            sort,
+        });
+        return `/api/rankings?${rankingQueryString({ queryState: state, sort, limit, offset })}`;
     }
 
     function buildMosaicUrl({
         strategy = mosaicStrategy,
-        filterState = currentFilterState(),
+        queryState = currentQueryState(),
+        filterState = null,
         gridElo = mosaicGridElo(),
         n = MOSAIC_NEIGHBOR_LIMIT,
         exclude = '',
     } = {}) {
-        let url = `/api/mosaic/next?n=${n}&strategy=${strategy}&grid_elo=${gridElo}${filterParams(filterState)}`;
-        if (exclude) url += `&exclude=${exclude}`;
-        return url;
+        const state = currentQueryState({
+            ...queryState,
+            filters: filterState || queryState.filters,
+        });
+        const params = new URLSearchParams();
+        params.set('n', String(n));
+        params.set('strategy', strategy);
+        params.set('grid_elo', String(gridElo));
+        appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) params.set('q', state.searchQuery);
+        if (exclude) params.set('exclude', exclude);
+        return `/api/mosaic/next?${params.toString()}`;
     }
 
-    function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS) {
-        return `/api/compare/next?n=${n}&mode=${mode}${filterParams()}`;
+    function buildCompareUrl(mode, n = COMPARE_NEIGHBOR_PAIRS, queryState = currentQueryState()) {
+        const state = currentQueryState(queryState);
+        const params = new URLSearchParams();
+        params.set('n', String(n));
+        params.set('mode', mode);
+        appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) params.set('q', state.searchQuery);
+        return `/api/compare/next?${params.toString()}`;
     }
 
     function currentLibraryPageSize() {
@@ -1205,21 +1498,45 @@ const PhotoArchive = (() => {
     }
 
     function resetLibraryResults({ clearBatch = false } = {}) {
+        clearWarmups();
         libraryRequestGeneration++;
         rankingsOffset = 0;
         rankingsExhausted = false;
         libraryImages = [];
         lastDateGroup = null;
         rankingsLoading = false;
+        rankingsLoadPromise = null;
         selectedLibraryIndex = -1;
         if (clearBatch) clearBatchSelection();
+    }
+
+    function libraryScrollRoot() {
+        return document.querySelector('.library-container');
+    }
+
+    function scrollLibraryContainerToElement(el, behavior = 'smooth') {
+        const root = libraryScrollRoot();
+        if (!root || !el) {
+            el?.scrollIntoView({ behavior, block: 'start' });
+            return;
+        }
+        const rootRect = root.getBoundingClientRect();
+        const rect = el.getBoundingClientRect();
+        const top = root.scrollTop + rect.top - rootRect.top;
+        root.scrollTo({ top: Math.max(0, top - 4), behavior });
+    }
+
+    function syncDateScrubberVisibility() {
+        const scrubber = document.getElementById('date-scrubber');
+        const active = Boolean(scrubber) && libraryView !== 'map' && isDateScrubberActive();
+        document.body.classList.toggle('date-scrubber-active', active);
+        if (scrubber) scrubber.classList.toggle('hidden', !active);
     }
 
     function scheduleCrossViewWarmup(fromView) {
         if (fromView === 'compare') {
             const libraryUrl = buildRankingsUrl({
                 sort: 'elo',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 limit: INITIAL_RANKINGS_PAGE_SIZE,
                 offset: 0,
             });
@@ -1230,13 +1547,12 @@ const PhotoArchive = (() => {
             }];
             scheduleBackgroundWarm(
                 'crossview-library',
-                (token) => warmRequests('crossview-library', token, requests),
-                200,
+                (token, generation) => warmRequests('crossview-library', token, generation, requests),
+                CROSS_VIEW_WARM_DELAY_MS,
             );
         } else if (fromView === 'library') {
             const compareUrl = buildMosaicUrl({
                 strategy: 'explore',
-                filterState: { orientation: '', compared: '', rating: '', folder: '', flag: '', taken: '', fileType: '', camera: '', lens: '' },
                 gridElo: 0,
                 n: mosaicSize,
             });
@@ -1247,70 +1563,47 @@ const PhotoArchive = (() => {
             }];
             scheduleBackgroundWarm(
                 'crossview-compare',
-                (token) => warmRequests('crossview-compare', token, requests),
-                200,
+                (token, generation) => warmRequests('crossview-compare', token, generation, requests),
+                CROSS_VIEW_WARM_DELAY_MS,
             );
         }
     }
 
     function scheduleLibraryNeighborWarmup() {
-        if (searchQuery) return;
+        if (searchQuery || rankingsExhausted) return;
+        const nextUrl = buildRankingsUrl({
+            queryState: currentQueryState({ sort: rankingsSort }),
+            sort: rankingsSort,
+            limit: RANKINGS_PAGE_SIZE,
+            offset: rankingsOffset,
+        });
+        const requests = [{ url: nextUrl, cacheKey: `library:${nextUrl}`, extract: imageThumbUrls }];
 
-        const requests = [];
-        const seen = new Set();
-        const addRequest = (url) => {
-            if (seen.has(url)) return;
-            seen.add(url);
-            requests.push({ url, cacheKey: `library:${url}`, extract: imageThumbUrls });
-        };
-
-        const sortKey = SORT_KEYS[sortField];
-        if (sortKey) {
-            addRequest(buildRankingsUrl({ sort: sortDesc ? sortKey.asc : sortKey.desc }));
-        }
-
-        addRequest(buildRankingsUrl({ sort: rankingsSort === 'elo' ? 'comparisons' : 'elo' }));
-
-        for (const neighborState of buildFilterNeighborStates().slice(0, 3)) {
-            addRequest(buildRankingsUrl({ filterState: neighborState }));
-        }
-
-        if (!requests.length) return;
-        scheduleBackgroundWarm('library-neighbors', (token) => warmRequests('library-neighbors', token, requests));
+        scheduleBackgroundWarm(
+            'library-next-page',
+            (token, generation) => warmRequests('library-next-page', token, generation, requests),
+        );
     }
 
     function scheduleCompareNeighborWarmup(mode = compareMode) {
+        if (mode === 'mosaic') return;
         const requests = [];
+        requests.push({
+            url: buildCompareUrl(mode, COMPARE_NEIGHBOR_PAIRS),
+            extract: compareThumbUrls,
+        });
 
-        if (mode === 'mosaic') {
-            requests.push({ url: buildCompareUrl('swiss'), extract: compareThumbUrls });
-            requests.push({ url: buildCompareUrl('topn'), extract: compareThumbUrls });
-
-            for (const neighborState of buildFilterNeighborStates().slice(0, 2)) {
-                requests.push({
-                    url: buildMosaicUrl({ filterState: neighborState, gridElo: 0 }),
-                    extract: imageThumbUrls,
-                });
-            }
-        } else {
-            requests.push({
-                url: buildCompareUrl(mode === 'topn' ? 'swiss' : 'topn'),
-                extract: compareThumbUrls,
-            });
-            requests.push({
-                url: buildMosaicUrl({ gridElo: 0 }),
-                extract: imageThumbUrls,
-            });
-        }
-
-        scheduleBackgroundWarm('compare-neighbors', (token) => warmRequests('compare-neighbors', token, requests), 350);
+        scheduleBackgroundWarm(
+            'compare-next-pairs',
+            (token, generation) => warmRequests('compare-next-pairs', token, generation, requests),
+            350,
+        );
     }
 
     const SORT_KEYS = {
         'elo':         { desc: 'elo',           asc: 'elo_asc', defaultDesc: true },
         'comparisons': { desc: 'comparisons',   asc: 'least_compared', defaultDesc: true },
         'date_taken':  { desc: 'date_taken',    asc: 'date_taken_asc', defaultDesc: true },
-        'newest':      { desc: 'newest',        asc: 'oldest', defaultDesc: true },
         'date_modified': { desc: 'date_modified', asc: 'date_modified_asc', defaultDesc: true },
         'file_size':   { desc: 'file_size',     asc: 'file_size_asc', defaultDesc: true },
         'resolution':  { desc: 'resolution',    asc: 'resolution_asc', defaultDesc: true },
@@ -1319,9 +1612,179 @@ const PhotoArchive = (() => {
         'similarity':  { desc: 'similarity',    asc: 'similarity', defaultDesc: true },
     };
 
+    function sortValueForState(field = sortField, desc = sortDesc) {
+        const key = SORT_KEYS[field];
+        return key ? (desc ? key.desc : key.asc) : field;
+    }
+
+    function sortStateFromValue(sort) {
+        for (const [field, key] of Object.entries(SORT_KEYS)) {
+            if (sort === key.desc) return { field, desc: true };
+            if (sort === key.asc) return { field, desc: false };
+        }
+        return null;
+    }
+
+    function hasActiveTextSearch(value = searchQuery) {
+        return Boolean(value && value !== '__similar__');
+    }
+
+    function currentSearchMode() {
+        if (searchQuery === '__similar__') return 'similar';
+        return searchQuery ? 'search' : 'library';
+    }
+
+    function currentQueryState(overrides = {}) {
+        const field = overrides.sortField || sortField;
+        const desc = overrides.sortDesc ?? sortDesc;
+        const mode = overrides.searchMode || currentSearchMode();
+        const query = overrides.searchQuery ?? (mode === 'search' ? searchQuery : '');
+        return {
+            filters: normalizeFilterState(overrides.filters || overrides.filterState || filters),
+            sortField: field,
+            sortDesc: Boolean(desc),
+            sort: overrides.sort || sortValueForState(field, desc),
+            searchMode: mode,
+            searchQuery: query,
+        };
+    }
+
+    function applySortState(field, desc, { persist = true, persistSearch = true } = {}) {
+        if (!SORT_KEYS[field]) return;
+        sortField = field;
+        sortDesc = Boolean(desc);
+        rankingsSort = sortValueForState(sortField, sortDesc);
+        syncSortControls();
+        if (persist && sortField !== 'similarity') saveSortState();
+        if (persistSearch && hasActiveTextSearch()) saveSearchSortState();
+    }
+
+    function saveSortState() {
+        try {
+            sessionStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
+        } catch {}
+    }
+
+    function saveSearchState() {
+        try {
+            if (hasActiveTextSearch()) {
+                sessionStorage.setItem(SEARCH_STORAGE_KEY, searchQuery);
+            } else {
+                sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+            }
+        } catch {}
+    }
+
+    function saveSearchSortState() {
+        try {
+            if (hasActiveTextSearch()) {
+                sessionStorage.setItem(SEARCH_SORT_STORAGE_KEY, JSON.stringify({ field: sortField, desc: sortDesc }));
+            } else {
+                sessionStorage.removeItem(SEARCH_SORT_STORAGE_KEY);
+            }
+        } catch {}
+    }
+
+    function clearPersistedSearchState() {
+        try {
+            sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+            sessionStorage.removeItem(SEARCH_SORT_STORAGE_KEY);
+        } catch {}
+    }
+
+    function restoreSortState() {
+        try {
+            const saved = sessionStorage.getItem(SORT_STORAGE_KEY);
+            if (!saved) return;
+            const parsed = JSON.parse(saved);
+            const field = SORT_KEYS[parsed?.field] && parsed.field !== 'similarity' ? parsed.field : 'elo';
+            applySortState(field, parsed?.desc !== false, { persist: false, persistSearch: false });
+        } catch {}
+    }
+
+    function restoreSearchSortState() {
+        try {
+            const saved = sessionStorage.getItem(SEARCH_SORT_STORAGE_KEY);
+            if (!saved) return null;
+            const parsed = JSON.parse(saved);
+            const field = SORT_KEYS[parsed?.field] ? parsed.field : '';
+            if (!field) return null;
+            return { field, desc: parsed?.desc !== false };
+        } catch {
+            return null;
+        }
+        return null;
+    }
+
+    function restoreSearchState() {
+        try {
+            const saved = (sessionStorage.getItem(SEARCH_STORAGE_KEY) || '').trim();
+            searchQuery = saved;
+        } catch {
+            searchQuery = '';
+        }
+        updateSimilaritySortOption();
+        if (hasActiveTextSearch()) {
+            const restoredSort = restoreSearchSortState() || { field: 'similarity', desc: true };
+            applySortState(restoredSort.field, restoredSort.desc, { persist: false });
+        }
+        updateSearchControls();
+    }
+
+    function updateSearchControls() {
+        const input = document.getElementById('search-input');
+        const clearBtn = document.getElementById('search-clear');
+        if (input && searchQuery !== '__similar__') input.value = searchQuery;
+        if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
+        updateSimilaritySortOption();
+        syncSortControls();
+        updateCompareSearchIndicator();
+        updateSortDirIcon();
+    }
+
+    function updateCompareSearchIndicator() {
+        const chip = document.getElementById('compare-search-active');
+        if (!chip) return;
+        const queryEl = document.getElementById('compare-search-query');
+        const active = hasActiveTextSearch();
+        chip.classList.toggle('hidden', !active);
+        if (queryEl) queryEl.textContent = active ? searchQuery : '';
+        updateBottomBarHeightVar();
+    }
+
+    function syncSortControls() {
+        const select = document.getElementById('sort-field');
+        if (select && select.querySelector(`option[value="${sortField}"]`)) {
+            select.value = sortField;
+        }
+        updateSortDirIcon();
+    }
+
+    function rankingQueryString({
+        queryState = currentQueryState(),
+        limit = LIBRARY_NEIGHBOR_LIMIT,
+        offset = 0,
+        sort = queryState.sort,
+    } = {}) {
+        const state = currentQueryState({ ...queryState, sort });
+        const params = new URLSearchParams();
+        params.set('limit', String(limit));
+        params.set('offset', String(offset));
+        params.set('sort', sort || state.sort);
+        appendFilterParams(params, state.filters);
+        if (state.searchMode === 'search' && state.searchQuery) {
+            params.set('q', state.searchQuery);
+        }
+        return params.toString();
+    }
+
     async function initLibrary() {
+        initBottomBarMeasurement();
         resetLibraryResults();
         restoreFilters();
+        restoreSortState();
+        restoreSearchState();
+        loadUiSettings();
 
         // Fire all init requests in parallel — don't block on rankings
         const rankingsPromise = loadRankings();
@@ -1344,10 +1807,10 @@ const PhotoArchive = (() => {
         sentinel.style.height = '1px';
         document.querySelector('.rankings-grid')?.after(sentinel);
         const scrollObserver = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting && !rankingsLoading && !rankingsExhausted) {
+            if (entries[0].isIntersecting && libraryView === 'grid' && !rankingsLoading && !rankingsExhausted) {
                 loadRankings();
             }
-        }, { rootMargin: '600px' });
+        }, { root: libraryScrollRoot(), rootMargin: '600px 0px' });
         scrollObserver.observe(sentinel);
 
         // Loupe keyboard navigation
@@ -1420,13 +1883,30 @@ const PhotoArchive = (() => {
             input.addEventListener('input', (e) => {
                 clearTimeout(searchDebounce);
                 searchDebounce = setTimeout(() => {
+                    const wasSearching = hasActiveTextSearch();
                     searchQuery = e.target.value.trim();
-                    const clearBtn = document.getElementById('search-clear');
-                    if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
-                    updateSimilaritySortOption();
+                    if (hasActiveTextSearch()) {
+                        saveSearchState();
+                        updateSimilaritySortOption();
+                        if (!wasSearching) {
+                            applySortState('similarity', true, { persist: false });
+                        } else {
+                            saveSearchSortState();
+                        }
+                    } else {
+                        clearPersistedSearchState();
+                        if (sortField === 'similarity') {
+                            restoreSortState();
+                            if (sortField === 'similarity') {
+                                applySortState('elo', true, { persist: false, persistSearch: false });
+                            }
+                        }
+                    }
+                    updateSearchControls();
                     // Search is a filter — reload rankings with the query
                     resetLibraryResults({ clearBatch: true });
                     loadRankings(true);
+                    updateDateScrubber();
                 }, 300);
             });
             input.addEventListener('keydown', (e) => {
@@ -1441,7 +1921,7 @@ const PhotoArchive = (() => {
         const select = document.getElementById('sort-field');
         if (!select) return;
         let opt = select.querySelector('option[value="similarity"]');
-        if (searchQuery) {
+        if (hasActiveTextSearch()) {
             if (!opt) {
                 opt = document.createElement('option');
                 opt.value = 'similarity';
@@ -1450,66 +1930,35 @@ const PhotoArchive = (() => {
             }
         } else {
             if (opt) {
-                // If similarity was selected, switch back to elo
-                if (select.value === 'similarity') {
-                    select.value = 'elo';
-                    setSortField('elo');
-                }
                 opt.remove();
             }
         }
     }
 
     function clearSearch() {
+        const wasSimilaritySort = sortField === 'similarity';
         searchQuery = '';
-        const input = document.getElementById('search-input');
-        const clearBtn = document.getElementById('search-clear');
-        if (input) input.value = '';
-        if (clearBtn) clearBtn.classList.add('hidden');
-        updateSimilaritySortOption();
-        resetLibraryResults({ clearBatch: true });
-        loadRankings(true);
-    }
-
-    async function loadSearchResults() {
-        libraryImages = [];
-        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&limit=100`);
-        const data = await res.json();
-        const grid = document.getElementById('rankings-grid');
-
-        for (let i = 0; i < data.images.length; i++) {
-            const img = data.images[i];
-            const ar = img.aspect_ratio || 1.5;
-            const card = document.createElement('div');
-            card.className = 'rank-card' + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
-            card.dataset.imageId = img.id;
-            card.dataset.ar = ar;
-            card.style.height = thumbHeight + 'px';
-            card.style.flexGrow = ar;
-            card.style.flexBasis = (thumbHeight * ar) + 'px';
-            card.title = imageMetadataTitle(img);
-            card.onclick = () => openLightbox(img);
-
-            const simPct = (img.similarity * 100).toFixed(0);
-
-            card.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
-                ${flagBadge(img.flag)}
-                <div class="rank-card-info">
-                    <span class="rank-elo">${img.elo} Elo</span>
-                    <span class="rank-similarity">${simPct}% match</span>
-                </div>
-            `;
-            grid.appendChild(card);
-            libraryImages.push(img);
+        clearPersistedSearchState();
+        if (wasSimilaritySort) {
+            restoreSortState();
+            if (sortField === 'similarity') {
+                applySortState('elo', true, { persist: false, persistSearch: false });
+            }
         }
-
-        const loadMoreWrap = document.getElementById('load-more-wrap');
-        if (loadMoreWrap) loadMoreWrap.classList.add('hidden');
+        const input = document.getElementById('search-input');
+        if (input) input.value = '';
+        const sortToggles = document.getElementById('sort-toggles');
+        if (sortToggles) sortToggles.style.opacity = '';
+        updateSearchControls();
+        reloadForFilters();
     }
 
-    function setRankingsSort(sort) {
+    function setRankingsSort(sort, { persist = true } = {}) {
         rankingsSort = sort;
+        const state = sortStateFromValue(sort);
+        if (state) {
+            applySortState(state.field, state.desc, { persist });
+        }
         resetLibraryResults({ clearBatch: true });
         dateGroupsData = [];
         loadRankings(true);  // true = clear grid before appending
@@ -1517,21 +1966,22 @@ const PhotoArchive = (() => {
     }
 
     function setSortField(field) {
-        sortField = field;
+        if (!SORT_KEYS[field]) return;
         const key = SORT_KEYS[field];
-        sortDesc = key?.defaultDesc !== false;
-        updateSortDirIcon();
-        setRankingsSort(key ? (sortDesc ? key.desc : key.asc) : field);
+        applySortState(field, key?.defaultDesc !== false, { persist: field !== 'similarity' });
+        resetLibraryResults({ clearBatch: true });
+        dateGroupsData = [];
+        loadRankings(true);
+        updateDateScrubber();
     }
 
     function toggleSortDir() {
-        if (searchQuery) return;
-        sortDesc = !sortDesc;
-        updateSortDirIcon();
-        const key = SORT_KEYS[sortField];
-        if (key) {
-            setRankingsSort(sortDesc ? key.desc : key.asc);
-        }
+        if (sortField === 'similarity') return;
+        applySortState(sortField, !sortDesc);
+        resetLibraryResults({ clearBatch: true });
+        dateGroupsData = [];
+        loadRankings(true);
+        updateDateScrubber();
     }
 
     function updateSortDirIcon() {
@@ -1581,6 +2031,15 @@ const PhotoArchive = (() => {
         return `${width} x ${height} (${megapixels.toFixed(megapixels >= 10 ? 0 : 1)} MP)`;
     }
 
+    function imageAspectRatio(img) {
+        const ar = Number(img?.aspect_ratio || 0);
+        if (ar > 0) return ar;
+        const width = Number(img?.width || 0);
+        const height = Number(img?.height || 0);
+        if (width > 0 && height > 0) return width / height;
+        return 1.5;
+    }
+
     function imageMetadataTitle(img) {
         const parts = [img.filename];
         const camera = cameraLabel(img);
@@ -1606,10 +2065,17 @@ const PhotoArchive = (() => {
         return '';
     }
 
+    function similarityLabel(img) {
+        const similarity = Number(img?.similarity);
+        return Number.isFinite(similarity) ? `${(similarity * 100).toFixed(0)}% match` : 'metadata match';
+    }
+
     function updateImageFlagLocal(imageId, flag) {
         for (const img of libraryImages) {
             if (img.id === imageId) img.flag = flag;
         }
+        if (loupeStandaloneImage?.id === imageId) loupeStandaloneImage.flag = flag;
+        if (loupeCurrentImage?.id === imageId) loupeCurrentImage.flag = flag;
 
         document.querySelectorAll(`.rank-card[data-image-id="${imageId}"]`).forEach((card) => {
             card.classList.remove('flag-picked', 'flag-rejected');
@@ -1627,7 +2093,10 @@ const PhotoArchive = (() => {
             if (cls) thumb.classList.add(cls);
         });
 
-        if (lightboxIndex >= 0 && libraryImages[lightboxIndex]?.id === imageId) {
+        if (
+            (lightboxIndex >= 0 && libraryImages[lightboxIndex]?.id === imageId)
+            || (lightboxIndex < 0 && loupeStandaloneImage?.id === imageId)
+        ) {
             updateLoupeFlagDisplay(flag);
         }
     }
@@ -1654,128 +2123,149 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         const loupeOpen = loupe && !loupe.classList.contains('hidden');
         const img = loupeOpen
-            ? libraryImages[lightboxIndex]
+            ? (libraryImages[lightboxIndex] || loupeStandaloneImage)
             : libraryImages[selectedLibraryIndex];
         if (!img) return;
         setImageFlag(img.id, flag);
     }
 
     async function loadRankings(clearFirst = false) {
-        if (rankingsLoading) return;
+        if (rankingsLoading) return rankingsLoadPromise || 0;
+        const promise = loadRankingsBatch(clearFirst);
+        rankingsLoadPromise = promise;
+        try {
+            return await promise;
+        } finally {
+            if (rankingsLoadPromise === promise) rankingsLoadPromise = null;
+        }
+    }
+
+    async function loadRankingsBatch(clearFirst = false) {
         rankingsLoading = true;
         const requestGeneration = libraryRequestGeneration;
         const requestOffset = rankingsOffset;
         const limit = currentLibraryPageSize();
-        let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
-        if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
-        const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
-        if (!data) {
-            if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
-            return;
-        }
-        if (requestGeneration !== libraryRequestGeneration) {
-            return;
-        }
-        if (requestOffset === 0 && typeof data.total_images === 'number') {
-            compareStats = { ...compareStats, filtered_pool: data.total_images };
-            updateCompareProgress();
-        }
-        const grid = document.getElementById('rankings-grid');
-        if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; lastDateGroup = null; }
-        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
-        const isDateSort = (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc');
-        const rowH = thumbHeight;
-
-        // Batch DOM writes with DocumentFragment to avoid per-card reflows
-        const frag = document.createDocumentFragment();
-        for (let i = 0; i < data.images.length; i++) {
-            const img = data.images[i];
-            const rank = rankingsOffset + i + 1;
-            const ar = img.aspect_ratio || 1.5;
-            const tier = getTierClass(img.elo, img.comparisons);
-            const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
-
-            // Insert date group header when group changes
-            if (isDateSort) {
-                const group = img.date_group || '';
-                if (group !== lastDateGroup) {
-                    lastDateGroup = group;
-                    const header = document.createElement('div');
-                    header.className = 'date-group-header';
-                    header.dataset.dateGroup = group;
-                    header.textContent = group ? formatDateGroup(group) : 'No Date';
-                    frag.appendChild(header);
-                }
+        const url = buildRankingsUrl({
+            queryState: currentQueryState({ sort: rankingsSort }),
+            limit,
+            offset: requestOffset,
+            sort: rankingsSort,
+        });
+        try {
+            const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
+            if (!data) return 0;
+            if (requestGeneration !== libraryRequestGeneration) return 0;
+            if (requestOffset === 0 && typeof data.total_images === 'number') {
+                const visible = Number(data.visible_images ?? data.total_images ?? 0);
+                const total = Number(data.total_images ?? data.total_kept ?? visible);
+                compareStats = {
+                    ...compareStats,
+                    filtered_pool: visible,
+                    filtered_pool_visible: visible,
+                    filtered_pool_total: total,
+                };
+                updateCompareProgress();
             }
+            const grid = document.getElementById('rankings-grid');
+            if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; lastDateGroup = null; }
+            const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
+            const isDateSort = (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc');
+            const rowH = thumbHeight;
 
-            const card = document.createElement('div');
-            card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
-            if (batchMode) card.classList.add('selectable');
-            if (batchSelected.has(img.id)) card.classList.add('selected');
-            card.dataset.imageId = img.id;
-            card.dataset.ar = ar;
-            card.style.height = rowH + 'px';
-            card.style.flexGrow = ar;
-            card.style.flexBasis = (rowH * ar) + 'px';
-            card.title = imageMetadataTitle(img);
-            card.onclick = (e) => handleCardClick(e, img, card, libraryImages.length + i);
+            // Batch DOM writes with DocumentFragment to avoid per-card reflows
+            const frag = document.createDocumentFragment();
+            const baseIndex = libraryImages.length;
+            for (let i = 0; i < data.images.length; i++) {
+                const img = data.images[i];
+                const rank = rankingsOffset + i + 1;
+                const ar = img.aspect_ratio || 1.5;
+                const tier = getTierClass(img.elo, img.comparisons);
+                const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
 
-            const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
-            const infoLine = libraryCardInfoLine(img, rank, showRank);
+                // Insert date group header when group changes
+                if (isDateSort) {
+                    const group = img.date_group || '';
+                    if (group !== lastDateGroup) {
+                        lastDateGroup = group;
+                        const header = document.createElement('div');
+                        header.className = 'date-group-header';
+                        header.dataset.dateGroup = group;
+                        header.textContent = group ? formatDateGroup(group) : 'No Date';
+                        frag.appendChild(header);
+                    }
+                }
 
-            card.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
-                <div class="select-check">✓</div>
-                ${confDot}
-                ${flagBadge(img.flag)}
-                <div class="rank-card-info">${infoLine}</div>
-            `;
-            frag.appendChild(card);
-            libraryImages.push(img);
-        }
-        grid.appendChild(frag);
+                const card = document.createElement('div');
+                card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
+                if (batchMode) card.classList.add('selectable');
+                if (batchSelected.has(img.id)) card.classList.add('selected');
+                card.dataset.imageId = img.id;
+                card.dataset.ar = ar;
+                card.style.height = rowH + 'px';
+                card.style.flexGrow = ar;
+                card.style.flexBasis = (rowH * ar) + 'px';
+                card.title = imageMetadataTitle(img);
+                card.onclick = (e) => handleCardClick(e, img, card, baseIndex + i);
 
-        rankingsOffset += data.images.length;
-        rankingsLoading = false;
-        if (data.images.length < limit) {
-            rankingsExhausted = true;
-        }
-        if (data.images.length > 0) {
-            // Always warm neighbors — not just on first load
-            scheduleLibraryNeighborWarmup();
-            if (requestOffset === 0) scheduleCrossViewWarmup('library');
-            if (isDateSortActive()) setupScrubberScrollObserver();
+                const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
+                const infoLine = libraryCardInfoLine(img, rank, showRank);
+
+                card.innerHTML = `
+                    <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
+                    <div class="select-check">✓</div>
+                    ${confDot}
+                    ${flagBadge(img.flag)}
+                    <div class="rank-card-info">${infoLine}</div>
+                `;
+                frag.appendChild(card);
+                libraryImages.push(img);
+            }
+            grid.appendChild(frag);
+
+            rankingsOffset += data.images.length;
+            if (data.images.length < limit) {
+                rankingsExhausted = true;
+            }
+            if (data.images.length > 0) {
+                // Always warm neighbors — not just on first load
+                scheduleLibraryNeighborWarmup();
+                if (requestOffset === 0) scheduleCrossViewWarmup('library');
+                if (isDateScrubberActive()) setupScrubberScrollObserver();
+            }
+            return data.images.length;
+        } finally {
+            if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
         }
     }
 
     function libraryCardInfoLine(img, rank, showRank) {
         if (showRank) {
-            return `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo}</span>`;
+            return `<span class="rank-number">#${rank}</span><span class="rank-elo">${escapeHtml(img.elo)}</span>`;
         }
         if (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc') {
             const label = formatShortDate(img.date_taken) || 'No date';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'file_size' || rankingsSort === 'file_size_asc') {
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${formatBytes(img.file_size)}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(formatBytes(img.file_size))}</span>`;
         }
         if (rankingsSort === 'date_modified' || rankingsSort === 'date_modified_asc') {
             const label = formatShortDate(img.file_modified_at) || 'No modified date';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'resolution' || rankingsSort === 'resolution_asc') {
             const label = resolutionLabel(img) || 'No size';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'camera' || rankingsSort === 'camera_desc') {
             const label = cameraLabel(img) || 'No camera';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'newest' || rankingsSort === 'oldest') {
             const label = formatShortDate(img.created_at) || 'Added';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
-        return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} signal${Number(img.comparisons || 0) === 1 ? '' : 's'}</span>`;
+        return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(img.comparisons)} signal${Number(img.comparisons || 0) === 1 ? '' : 's'}</span>`;
     }
 
     function formatDateGroup(dateStr) {
@@ -1793,16 +2283,131 @@ const PhotoArchive = (() => {
         return rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc';
     }
 
-    async function updateDateScrubber() {
-        const existing = document.getElementById('date-scrubber');
-        if (!isDateSortActive()) {
-            if (existing) existing.remove();
+    function isDateScrubberActive() {
+        return isDateSortActive() && currentSearchMode() === 'library';
+    }
+
+    function findDateGroupHeader(group) {
+        return Array.from(document.querySelectorAll('.date-group-header'))
+            .find(header => header.dataset.dateGroup === group);
+    }
+
+    function dateGroupOffset(group) {
+        let offset = 0;
+        for (const item of dateGroupsData) {
+            const itemGroup = item.date || '';
+            if (itemGroup === group) return offset;
+            offset += Number(item.count || 0);
+        }
+        return null;
+    }
+
+    function setActiveDateScrubberGroup(group) {
+        const year = group ? group.substring(0, 4) : '';
+        document.querySelectorAll('.scrubber-label, .scrubber-year').forEach(el => {
+            const elGroup = el.dataset.dateGroup || '';
+            const isYear = el.classList.contains('scrubber-year');
+            const active = isYear && year
+                ? elGroup.substring(0, 4) === year
+                : elGroup === group;
+            el.classList.toggle('active', active);
+        });
+    }
+
+    function updateActiveDateScrubberGroup() {
+        const root = libraryScrollRoot();
+        const headers = Array.from(document.querySelectorAll('.date-group-header'));
+        if (!root || !headers.length) return;
+
+        const currentTop = root.scrollTop + 8;
+        let activeHeader = headers[0];
+        for (const header of headers) {
+            if (header.offsetTop <= currentTop) activeHeader = header;
+            else break;
+        }
+        setActiveDateScrubberGroup(activeHeader?.dataset.dateGroup || '');
+    }
+
+    function teardownDateScrubberScrollTracking() {
+        if (dateScrubberScrollRoot && dateScrubberScrollHandler) {
+            dateScrubberScrollRoot.removeEventListener('scroll', dateScrubberScrollHandler);
+        }
+        if (dateScrubberScrollRaf) cancelAnimationFrame(dateScrubberScrollRaf);
+        dateScrubberScrollRoot = null;
+        dateScrubberScrollHandler = null;
+        dateScrubberScrollRaf = null;
+    }
+
+    function setupDateScrubberScrollTracking() {
+        teardownDateScrubberScrollTracking();
+        const root = libraryScrollRoot();
+        const headers = document.querySelectorAll('.date-group-header');
+        if (!root || !headers.length) return;
+
+        dateScrubberScrollRoot = root;
+        dateScrubberScrollHandler = () => {
+            if (dateScrubberScrollRaf) return;
+            dateScrubberScrollRaf = requestAnimationFrame(() => {
+                dateScrubberScrollRaf = null;
+                updateActiveDateScrubberGroup();
+            });
+        };
+        root.addEventListener('scroll', dateScrubberScrollHandler, { passive: true });
+        updateActiveDateScrubberGroup();
+    }
+
+    async function jumpToDateGroup(group) {
+        if (!isDateScrubberActive()) return;
+
+        const existingHeader = findDateGroupHeader(group);
+        if (existingHeader) {
+            setActiveDateScrubberGroup(group);
+            scrollLibraryContainerToElement(existingHeader);
             return;
         }
-        // Fetch date groups for the scrubber
-        const url = `/api/date-groups?${filterParams().replace(/^&/, '')}`;
+
+        const offset = dateGroupOffset(group);
+        if (offset === null) return;
+
+        const gen = ++dateJumpGeneration;
+        libraryRequestGeneration++;
+        rankingsOffset = offset;
+        rankingsExhausted = false;
+        libraryImages = [];
+        lastDateGroup = null;
+        rankingsLoading = false;
+        rankingsLoadPromise = null;
+        selectedLibraryIndex = -1;
+
+        const grid = document.getElementById('rankings-grid');
+        if (grid) grid.innerHTML = '';
+        libraryScrollRoot()?.scrollTo({ top: 0, behavior: 'auto' });
+
+        await loadRankings(true);
+        if (gen !== dateJumpGeneration) return;
+
+        const loadedHeader = findDateGroupHeader(group);
+        if (loadedHeader) {
+            scrollLibraryContainerToElement(loadedHeader, 'auto');
+            setActiveDateScrubberGroup(group);
+        }
+    }
+
+    async function updateDateScrubber() {
+        const existing = document.getElementById('date-scrubber');
+        if (!isDateScrubberActive()) {
+            if (existing) existing.remove();
+            if (window._scrubberObserver) window._scrubberObserver.disconnect();
+            teardownDateScrubberScrollTracking();
+            syncDateScrubberVisibility();
+            return;
+        }
+        const gen = ++dateScrubberGeneration;
+        const query = filterQueryString(currentQueryState());
+        const url = `/api/date-groups${query ? `?${query}` : ''}`;
         try {
             const data = await fetch(url).then(r => r.json());
+            if (gen !== dateScrubberGeneration) return;
             dateGroupsData = data.groups || [];
             if (rankingsSort === 'date_taken_asc') dateGroupsData.reverse();
             renderDateScrubber();
@@ -1815,20 +2420,25 @@ const PhotoArchive = (() => {
         let scrubber = document.getElementById('date-scrubber');
         if (!dateGroupsData.length) {
             if (scrubber) scrubber.remove();
+            teardownDateScrubberScrollTracking();
+            syncDateScrubberVisibility();
             return;
         }
         if (!scrubber) {
             scrubber = document.createElement('div');
             scrubber.id = 'date-scrubber';
             scrubber.className = 'date-scrubber';
-            document.body.appendChild(scrubber);
         }
+        const host = document.querySelector('body.library-shell main') || document.body;
+        if (scrubber.parentElement !== host) host.appendChild(scrubber);
+        syncDateScrubberVisibility();
+
         // Build scrubber labels — show years prominently, months smaller
         let currentYear = '';
         let html = '';
         for (const group of dateGroupsData) {
             if (!group.date) {
-                html += `<div class="scrubber-label" data-date-group="">No Date</div>`;
+                html += '<div class="scrubber-label" data-date-group="">No Date</div>';
                 continue;
             }
             const year = group.date.substring(0, 4);
@@ -1836,20 +2446,16 @@ const PhotoArchive = (() => {
             const monthName = new Date(parseInt(year), parseInt(month) - 1).toLocaleDateString(undefined, { month: 'short' });
             if (year !== currentYear) {
                 currentYear = year;
-                html += `<div class="scrubber-year" data-date-group="${group.date}">${year}</div>`;
+                html += `<div class="scrubber-year" data-date-group="${escapeHtml(group.date)}">${escapeHtml(year)}</div>`;
             }
-            html += `<div class="scrubber-label" data-date-group="${group.date}" title="${group.label} (${group.count})">${monthName}</div>`;
+            html += `<div class="scrubber-label" data-date-group="${escapeHtml(group.date)}" title="${escapeHtml(group.label)} (${escapeHtml(group.count)})">${escapeHtml(monthName)}</div>`;
         }
         scrubber.innerHTML = html;
 
         // Click to jump
         scrubber.querySelectorAll('[data-date-group]').forEach(label => {
             label.onclick = () => {
-                const group = label.dataset.dateGroup;
-                const header = document.querySelector(`.date-group-header[data-date-group="${group}"]`);
-                if (header) {
-                    header.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
+                jumpToDateGroup(label.dataset.dateGroup || '');
             };
         });
 
@@ -1858,29 +2464,8 @@ const PhotoArchive = (() => {
     }
 
     function setupScrubberScrollObserver() {
-        const headers = document.querySelectorAll('.date-group-header');
-        if (!headers.length) return;
-
         if (window._scrubberObserver) window._scrubberObserver.disconnect();
-        window._scrubberObserver = new IntersectionObserver((entries) => {
-            // Find the topmost visible header
-            let topHeader = null;
-            let topY = Infinity;
-            entries.forEach(entry => {
-                if (entry.isIntersecting && entry.boundingClientRect.top < topY) {
-                    topY = entry.boundingClientRect.top;
-                    topHeader = entry.target;
-                }
-            });
-            if (topHeader) {
-                const group = topHeader.dataset.dateGroup;
-                document.querySelectorAll('.scrubber-label, .scrubber-year').forEach(el => {
-                    el.classList.toggle('active', el.dataset.dateGroup === group);
-                });
-            }
-        }, { rootMargin: '0px 0px -80% 0px' });
-
-        headers.forEach(h => window._scrubberObserver.observe(h));
+        setupDateScrubberScrollTracking();
     }
 
     function selectLibraryCard(index, cards) {
@@ -1894,10 +2479,18 @@ const PhotoArchive = (() => {
 
     function scrollCardFullyVisible(el) {
         const rect = el.getBoundingClientRect();
-        const barHeight = document.querySelector('.bottom-bar')?.offsetHeight || 48;
-        const viewBottom = window.innerHeight - barHeight;
-        if (rect.bottom > viewBottom) {
-            window.scrollBy({ top: rect.bottom - viewBottom + 8, behavior: 'smooth' });
+        const root = libraryScrollRoot();
+        if (root) {
+            const rootRect = root.getBoundingClientRect();
+            if (rect.bottom > rootRect.bottom) {
+                root.scrollBy({ top: rect.bottom - rootRect.bottom + 8, behavior: 'smooth' });
+            } else if (rect.top < rootRect.top) {
+                root.scrollBy({ top: rect.top - rootRect.top - 8, behavior: 'smooth' });
+            }
+            return;
+        }
+        if (rect.bottom > window.innerHeight) {
+            window.scrollBy({ top: rect.bottom - window.innerHeight + 8, behavior: 'smooth' });
         } else if (rect.top < 0) {
             window.scrollBy({ top: rect.top - 8, behavior: 'smooth' });
         }
@@ -1916,20 +2509,40 @@ const PhotoArchive = (() => {
     function openLightbox(img) {
         lightboxIndex = libraryImages.findIndex(i => i.id === img.id);
         if (lightboxIndex < 0) {
-            libraryImages.push(img);
-            lightboxIndex = libraryImages.length - 1;
+            openStandaloneLightbox(img);
+            return;
         }
+        loupeStandaloneImage = null;
         buildFilmstrip();
         showLoupeImage(libraryImages[lightboxIndex], 0);
+    }
+
+    function openStandaloneLightbox(img) {
+        loupeStandaloneImage = img;
+        lightboxIndex = -1;
+        clearFilmstrip();
+        showLoupeImage(img, 0);
     }
 
     let _filmstripBuiltFor = null;  // track which image set the filmstrip was built for
     let _filmstripWindowStart = 0;
     let _filmstripWindowEnd = 0;
 
+    function clearFilmstrip() {
+        const scroll = document.getElementById('filmstrip-scroll');
+        if (scroll) scroll.innerHTML = '';
+        _filmstripBuiltFor = null;
+        _filmstripWindowStart = 0;
+        _filmstripWindowEnd = 0;
+    }
+
     function buildFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        if (lightboxIndex < 0) {
+            clearFilmstrip();
+            return;
+        }
         const start = Math.max(0, lightboxIndex - FILMSTRIP_WINDOW_RADIUS);
         const end = Math.min(libraryImages.length, lightboxIndex + FILMSTRIP_WINDOW_RADIUS + 1);
         const windowStillUseful = (
@@ -1955,12 +2568,18 @@ const PhotoArchive = (() => {
             thumb.className = 'filmstrip-thumb' + (i === lightboxIndex ? ' active' : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
             thumb.dataset.idx = i;
             thumb.dataset.imageId = img.id;
+            thumb.style.aspectRatio = String(imageAspectRatio(img));
+            thumb.title = imageMetadataTitle(img);
             thumb.onclick = () => {
                 const direction = Math.sign(i - lightboxIndex);
                 lightboxIndex = i;
                 showLoupeImage(libraryImages[i], direction);
             };
-            thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
+            const thumbImg = document.createElement('img');
+            thumbImg.src = img.thumb_url || '';
+            thumbImg.alt = img.filename || '';
+            thumbImg.loading = 'lazy';
+            thumb.appendChild(thumbImg);
             scroll.appendChild(thumb);
         }
         // rAF needed: DOM just rebuilt, need reflow before reading offsetLeft
@@ -1970,6 +2589,7 @@ const PhotoArchive = (() => {
     function updateFilmstripActive() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        if (lightboxIndex < 0) return;
         if (lightboxIndex < _filmstripWindowStart || lightboxIndex >= _filmstripWindowEnd) {
             buildFilmstrip();
             return;
@@ -2007,6 +2627,8 @@ const PhotoArchive = (() => {
     let loupeCurrentImage = null;
     let loupeFullLoadTimer = null;
     let loupeFullLoadToken = 0;
+    let loupeHideTimer = null;
+    let loupeCurrentMediaStatus = null;
     const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
@@ -2019,7 +2641,8 @@ const PhotoArchive = (() => {
             probe.img.onerror = null;
             probe.img.src = '';
             loupeTierProbes.delete(probe);
-            probe.resolve(false);
+            probe.done = true;
+            probe.resolveOnce(false);
         }
     }
 
@@ -2027,10 +2650,15 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         const loupeImg = document.getElementById('loupe-img');
         if (!loupe || !loupeImg) return;
+        if (loupeHideTimer) {
+            clearTimeout(loupeHideTimer);
+            loupeHideTimer = null;
+        }
 
         // Pre-calculate fit dimensions from aspect ratio so all progressive
         // loads (sm/md/lg) display at the same screen size — no size jumps
         const token = ++loupeImageToken;
+        clearWarmups();
         loupeCurrentImage = img;
         loupeFullLoadToken = 0;
         cancelLoupeProbes();
@@ -2039,9 +2667,14 @@ const PhotoArchive = (() => {
             loupeFullLoadTimer = null;
         }
         loupeDisplayedTierRank = -1;
+        loupeCurrentMediaStatus = null;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
-        const ar = img.aspect_ratio || 1.5;
+        loupeImg.onload = null;
+        loupeImg.onerror = null;
+        loupeImg.style.opacity = '0';
+        loupeImg.src = LOUPE_BLANK_SRC;
+        const ar = imageAspectRatio(img);
         loupeNatW = ar >= 1 ? loupeRefLong : Math.round(loupeRefLong * ar);
         loupeNatH = ar >= 1 ? Math.round(loupeRefLong / ar) : loupeRefLong;
         loupeImg.style.transition = 'opacity 0.15s';
@@ -2058,8 +2691,6 @@ const PhotoArchive = (() => {
         // so the next tier still gets a chance, while late arrivals can still
         // upgrade the image if they are sharper than the current display.
         loupeImg.alt = img.filename || '';
-        loupeImg.src = img.thumb_url;
-        loupeDisplayedTierRank = 0;
         runLoupeProgressiveLoad(img, token);
 
         // Populate metadata overlay
@@ -2069,13 +2700,13 @@ const PhotoArchive = (() => {
         const tierEl = document.getElementById('loupe-overlay-tier');
 
         if (filenameEl) filenameEl.textContent = img.filename;
-        if (exifEl) exifEl.textContent = '';
-        if (tierEl) tierEl.textContent = LOUPE_TIER_LABELS[0];
+        renderLoupeMetadata(img, exifEl);
+        if (tierEl) tierEl.textContent = '';
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
         if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} ranking signals`;
-        updateLoupeFlagDisplay(img.flag || 'unflagged');
+        renderLoupeStatusLine(img.flag || 'unflagged');
 
         updateFilmstripActive();
 
@@ -2084,36 +2715,50 @@ const PhotoArchive = (() => {
 
         // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
-            if (!data.exif || libraryImages[lightboxIndex]?.id !== img.id) return;
-            const e = data.exif;
-            const parts = [];
-            const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
-            if (camera) parts.push(camera);
-            if (e.date_taken || e.date) parts.push('Taken ' + formatDateTime(e.date_taken || e.date));
-            const settings = [];
-            if (e.focal_length) settings.push(e.focal_length);
-            if (e.focal_length_35mm) settings.push(`${e.focal_length_35mm} equiv`);
-            if (e.aperture) settings.push(e.aperture);
-            if (e.shutter_speed) settings.push(e.shutter_speed + 's');
-            if (e.iso) settings.push('ISO ' + e.iso);
-            if (settings.length) parts.push(settings.join('  '));
-            if (e.lens) parts.push(e.lens);
-            const exposure = [e.exposure_program, e.exposure_bias, e.metering_mode, e.white_balance, e.flash].filter(Boolean);
-            if (exposure.length) parts.push(exposure.join('  '));
-            const fileBits = [];
-            if (e.dimensions) fileBits.push(e.dimensions);
-            if (e.filesize) fileBits.push(e.filesize);
-            else if (e.file_size) fileBits.push(formatBytes(e.file_size));
-            if (e.file_ext) fileBits.push(e.file_ext.replace('.', '').toUpperCase());
-            if (fileBits.length) parts.push(fileBits.join('  '));
-            if (e.file_modified) parts.push('Modified ' + formatDateTime(e.file_modified));
-            if (e.filepath) parts.push(e.filepath);
-            if (exifEl) exifEl.textContent = parts.join('\n');
+            if (!data.exif || !isCurrentLoupeImage(img, token)) return;
+            renderLoupeMetadata({ ...img, ...data.exif }, exifEl);
         }).catch(() => {});
     }
 
+    function loupeMetadataParts(e = {}) {
+        const parts = [];
+        const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
+        if (camera) parts.push(camera);
+        if (e.date_taken || e.date) parts.push('Taken ' + formatDateTime(e.date_taken || e.date));
+        const settings = [];
+        if (e.focal_length) settings.push(e.focal_length);
+        if (e.focal_length_35mm) settings.push(`${e.focal_length_35mm} equiv`);
+        if (e.aperture) settings.push(e.aperture);
+        if (e.shutter_speed) settings.push(e.shutter_speed + 's');
+        if (e.iso) settings.push('ISO ' + e.iso);
+        if (settings.length) parts.push(settings.join('  '));
+        if (e.lens) parts.push(e.lens);
+        const exposure = [e.exposure_program, e.exposure_bias, e.metering_mode, e.white_balance, e.flash].filter(Boolean);
+        if (exposure.length) parts.push(exposure.join('  '));
+        const fileBits = [];
+        if (e.dimensions) fileBits.push(e.dimensions);
+        else {
+            const resolution = resolutionLabel(e);
+            if (resolution) fileBits.push(resolution);
+        }
+        if (e.filesize) fileBits.push(e.filesize);
+        else if (e.file_size) fileBits.push(formatBytes(e.file_size));
+        if (e.file_ext) fileBits.push(String(e.file_ext).replace('.', '').toUpperCase());
+        if (fileBits.length) parts.push(fileBits.join('  '));
+        if (e.file_modified) parts.push('Modified ' + formatDateTime(e.file_modified));
+        else if (e.file_modified_at) parts.push('Modified ' + formatDateTime(e.file_modified_at));
+        if (e.filepath) parts.push(e.filepath);
+        return parts;
+    }
+
+    function renderLoupeMetadata(metadata, exifEl = document.getElementById('loupe-overlay-exif')) {
+        if (!exifEl) return;
+        exifEl.textContent = loupeMetadataParts(metadata).join('\n');
+    }
+
     function isCurrentLoupeImage(img, token) {
-        return token === loupeImageToken && libraryImages[lightboxIndex]?.id === img.id;
+        const current = lightboxIndex >= 0 ? libraryImages[lightboxIndex] : loupeStandaloneImage;
+        return token === loupeImageToken && current?.id === img.id;
     }
 
     async function getMediaStatus(imageId, { force = false } = {}) {
@@ -2121,15 +2766,25 @@ const PhotoArchive = (() => {
         if (!force && cached && Date.now() - cached.time < MEDIA_STATUS_MAX_AGE_MS) {
             return cached.data;
         }
-        try {
-            const res = await fetch(`/api/image/${imageId}/media-status`);
-            if (!res.ok) return null;
-            const data = await res.json();
-            mediaStatusCache.set(imageId, { time: Date.now(), data });
-            return data;
-        } catch {
-            return null;
+        if (!force && mediaStatusInflight.has(imageId)) {
+            return mediaStatusInflight.get(imageId);
         }
+        let request;
+        request = (async () => {
+            try {
+                const res = await fetch(`/api/image/${imageId}/media-status`);
+                if (!res.ok) return null;
+                const data = await res.json();
+                mediaStatusCache.set(imageId, { time: Date.now(), data });
+                return data;
+            } catch {
+                return null;
+            } finally {
+                if (mediaStatusInflight.get(imageId) === request) mediaStatusInflight.delete(imageId);
+            }
+        })();
+        mediaStatusInflight.set(imageId, request);
+        return request;
     }
 
     function loupeTierUrl(tier, imageId, cachedOnly = false) {
@@ -2140,11 +2795,54 @@ const PhotoArchive = (() => {
     }
 
     function updateLoupeFlagDisplay(flag) {
+        renderLoupeStatusLine(flag);
+    }
+
+    function loupeCacheMark(status, tier) {
+        const tierStatus = status?.tiers?.[tier];
+        if (!tierStatus) return 'x';
+        return tierStatus.cached ? '✓' : 'x';
+    }
+
+    function loupeViewingTierName() {
+        return LOUPE_TIER_NAMES[loupeDisplayedTierRank] || 'none';
+    }
+
+    function loupeCacheStatusText(status = loupeCurrentMediaStatus) {
+        return [
+            'ssd:',
+            `sm ${loupeCacheMark(status, 'sm')}`,
+            `md ${loupeCacheMark(status, 'md')}`,
+            `lg ${loupeCacheMark(status, 'lg')}`,
+            `original ${loupeCacheMark(status, 'full')}`,
+            `· viewing ${loupeViewingTierName()}`,
+        ].join(' ');
+    }
+
+    function renderLoupeStatusLine(flag = loupeCurrentImage?.flag || 'unflagged') {
         const tierEl = document.getElementById('loupe-overlay-tier');
         if (!tierEl) return;
         const tier = LOUPE_TIER_LABELS[loupeDisplayedTierRank] || 'Image';
         const label = flag === 'picked' ? 'Picked' : flag === 'rejected' ? 'Rejected' : 'Unflagged';
-        tierEl.textContent = `${tier} · ${label}`;
+        if (uiSettings.show_loupe_cache_status) {
+            tierEl.textContent = `${loupeCacheStatusText()} · ${label}`;
+        } else {
+            tierEl.textContent = `${tier} · ${label}`;
+        }
+    }
+
+    function applyLoupeMediaStatus(status, img = loupeCurrentImage, token = loupeImageToken) {
+        if (!status || !img || !isCurrentLoupeImage(img, token)) return false;
+        loupeCurrentMediaStatus = status;
+        renderLoupeStatusLine(img.flag || 'unflagged');
+        return true;
+    }
+
+    async function refreshLoupeMediaStatus(img = loupeCurrentImage, token = loupeImageToken, { force = true } = {}) {
+        if (!img || !isCurrentLoupeImage(img, token)) return null;
+        const status = await getMediaStatus(img.id, { force });
+        applyLoupeMediaStatus(status, img, token);
+        return status;
     }
 
     function loupeApplyImageSize() {
@@ -2155,8 +2853,16 @@ const PhotoArchive = (() => {
     }
 
     async function runLoupeProgressiveLoad(img, token) {
-        const status = await getMediaStatus(img.id);
+        const smUrl = img.thumb_url || loupeTierUrl('sm', img.id);
+        loadLoupeTier(img, smUrl, LOUPE_TIER_RANKS.sm, token, {
+            timeoutMs: LOUPE_TIER_TIMEOUTS.md,
+        });
+
+        const statusRequest = getMediaStatus(img.id, { force: true });
+        statusRequest.then((latest) => applyLoupeMediaStatus(latest, img, token)).catch(() => {});
+        const status = await withTimeout(statusRequest, 500, null);
         if (!isCurrentLoupeImage(img, token)) return;
+        applyLoupeMediaStatus(status, img, token);
 
         const cachedBest = status?.best_cached;
         if (cachedBest && cachedBest !== 'sm') {
@@ -2177,10 +2883,13 @@ const PhotoArchive = (() => {
             const rank = LOUPE_TIER_RANKS[tier.name];
             if (rank <= loupeDisplayedTierRank) continue;
             if (tier.name === 'full') loupeFullLoadToken = token;
-            await loadLoupeTier(img, loupeTierUrl(tier.name, img.id), rank, token, {
+            const loaded = await loadLoupeTier(img, loupeTierUrl(tier.name, img.id), rank, token, {
                 adoptDimensions: tier.adoptDimensions,
                 timeoutMs: LOUPE_TIER_TIMEOUTS[tier.name],
             });
+            if (tier.name === 'full' && !loaded && isCurrentLoupeImage(img, token) && loupeDisplayedTierRank < rank) {
+                loupeFullLoadToken = 0;
+            }
             if (!isCurrentLoupeImage(img, token)) return;
         }
     }
@@ -2192,18 +2901,27 @@ const PhotoArchive = (() => {
             const probe = {
                 img: probeImg,
                 timer: null,
-                resolve,
-                settled: false,
+                resolved: false,
+                resolveOnce(value) {
+                    if (probe.resolved) return;
+                    probe.resolved = true;
+                    resolve(value);
+                },
+                done: false,
                 cancelled: false,
             };
             loupeTierProbes.add(probe);
 
-            const finish = (loaded) => {
-                if (probe.settled) return;
-                probe.settled = true;
+            const cleanup = () => {
+                if (probe.done) return;
+                probe.done = true;
                 if (probe.timer) clearTimeout(probe.timer);
                 loupeTierProbes.delete(probe);
-                resolve(loaded);
+            };
+
+            const finish = (loaded) => {
+                cleanup();
+                probe.resolveOnce(loaded);
             };
 
             probeImg.decoding = 'async';
@@ -2217,7 +2935,8 @@ const PhotoArchive = (() => {
                     finish(false);
                     return;
                 }
-                if (isCurrentLoupeImage(img, token) && rank > loupeDisplayedTierRank) {
+                const isCurrent = isCurrentLoupeImage(img, token);
+                if (isCurrent && rank > loupeDisplayedTierRank) {
                     if (adoptDimensions && probeImg.naturalWidth > 0 && probeImg.naturalHeight > 0) {
                         loupeAdoptSourceDimensions(probeImg.naturalWidth, probeImg.naturalHeight);
                     }
@@ -2225,19 +2944,37 @@ const PhotoArchive = (() => {
                     const loupeImg = document.getElementById('loupe-img');
                     if (loupeImg) {
                         loupeDisplayedTierRank = rank;
+                        if (rank === LOUPE_TIER_RANKS.full) loupeFullLoadToken = token;
                         loupeImg.src = probeImg.src;
-                        updateLoupeFlagDisplay(img.flag || 'unflagged');
+                        loupeImg.style.opacity = '1';
+                        renderLoupeStatusLine(img.flag || 'unflagged');
                     }
                 }
+                if (isCurrent) refreshLoupeMediaStatus(img, token);
                 finish(true);
             };
             probeImg.onerror = () => {
                 finish(false);
             };
             if (timeoutMs > 0) {
-                probe.timer = setTimeout(() => finish(false), timeoutMs);
+                probe.timer = setTimeout(() => {
+                    probe.timer = null;
+                    probe.resolveOnce(false);
+                }, timeoutMs);
             }
             probeImg.src = url;
+        });
+    }
+
+    function withTimeout(promise, timeoutMs, fallback) {
+        let timer = null;
+        return Promise.race([
+            Promise.resolve(promise),
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve(fallback), timeoutMs);
+            }),
+        ]).finally(() => {
+            if (timer) clearTimeout(timer);
         });
     }
 
@@ -2251,6 +2988,10 @@ const PhotoArchive = (() => {
         loadLoupeTier(img, loupeTierUrl('full', img.id), 3, token, {
             adoptDimensions: true,
             timeoutMs: LOUPE_TIER_TIMEOUTS.full,
+        }).then((loaded) => {
+            if (!loaded && isCurrentLoupeImage(img, token) && loupeDisplayedTierRank < LOUPE_TIER_RANKS.full) {
+                loupeFullLoadToken = 0;
+            }
         });
     }
 
@@ -2308,11 +3049,18 @@ const PhotoArchive = (() => {
     }
 
     function preloadLoupeNeighbors(direction = 0) {
+        if (lightboxIndex < 0) return;
+        const token = loupeImageToken;
+        const generation = warmupGeneration;
         for (const offset of loupeNeighborOffsets(LOUPE_PRELOAD_RADIUS, direction)) {
             const ni = lightboxIndex + offset;
             if (ni < 0 || ni >= libraryImages.length) continue;
             const neighbor = libraryImages[ni];
-            preloadLoupeNeighbor(neighbor, Math.abs(offset));
+            const distance = Math.abs(offset);
+            enqueueWarmup(async () => {
+                if (!loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
+                await preloadLoupeNeighbor(neighbor, distance, token, generation);
+            }, { generation });
         }
     }
 
@@ -2337,20 +3085,26 @@ const PhotoArchive = (() => {
         warmImageTiers({ md, lg, full });
     }
 
-    async function preloadLoupeNeighbor(img, distance = 1) {
+    async function preloadLoupeNeighbor(img, distance = 1, token = loupeImageToken, generation = warmupGeneration) {
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         await preloadImageWithTimeout(img.thumb_url, 'low', 1200);
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         const status = await getMediaStatus(img.id);
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         const tiers = status?.tiers || {};
         if (tiers.md?.cached) {
             await preloadImageWithTimeout(tiers.md.cached_url, 'low', LOUPE_TIER_TIMEOUTS.md);
         }
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         if (tiers.lg?.cached) {
             await preloadImageWithTimeout(tiers.lg.cached_url, 'low', LOUPE_TIER_TIMEOUTS.lg);
         }
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         if (distance === 1) {
             if (!tiers.md?.cached) {
                 await preloadImageWithTimeout(loupeTierUrl('md', img.id), 'low', LOUPE_TIER_TIMEOUTS.md);
             }
+            if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
             if (!tiers.lg?.cached) {
                 await preloadImageWithTimeout(loupeTierUrl('lg', img.id), 'low', LOUPE_TIER_TIMEOUTS.lg);
             }
@@ -2522,10 +3276,31 @@ const PhotoArchive = (() => {
         });
     }
 
+    async function ensureLibraryImageIndex(index) {
+        if (index < libraryImages.length) return true;
+        if (searchQuery === '__similar__') return false;
+        while (index >= libraryImages.length && !rankingsExhausted) {
+            const before = libraryImages.length;
+            const loaded = await loadRankings(false);
+            if (libraryImages.length <= before && !loaded) break;
+        }
+        return index < libraryImages.length;
+    }
+
     function lightboxNext() {
-        if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length - 1) return;
-        lightboxIndex++;
-        showLoupeImage(libraryImages[lightboxIndex], 1);
+        if (lightboxIndex < 0) return;
+        const nextIndex = lightboxIndex + 1;
+        if (nextIndex < libraryImages.length) {
+            lightboxIndex = nextIndex;
+            showLoupeImage(libraryImages[lightboxIndex], 1);
+            return;
+        }
+        const fromIndex = lightboxIndex;
+        ensureLibraryImageIndex(nextIndex).then((ok) => {
+            if (!ok || lightboxIndex !== fromIndex) return;
+            lightboxIndex = nextIndex;
+            showLoupeImage(libraryImages[lightboxIndex], 1);
+        });
     }
 
     function lightboxPrev() {
@@ -2538,17 +3313,24 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         if (loupe) {
             loupe.classList.remove('loupe-visible');
-            setTimeout(() => loupe.classList.add('hidden'), 150);
+            if (loupeHideTimer) clearTimeout(loupeHideTimer);
+            loupeHideTimer = setTimeout(() => {
+                if (!document.body.classList.contains('loupe-open')) loupe.classList.add('hidden');
+                loupeHideTimer = null;
+            }, 150);
         }
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
+        clearWarmups();
         cancelLoupeProbes();
         if (loupeFullLoadTimer) {
             clearTimeout(loupeFullLoadTimer);
             loupeFullLoadTimer = null;
         }
         loupeCurrentImage = null;
+        loupeStandaloneImage = null;
         loupeFullLoadToken = 0;
+        loupeCurrentMediaStatus = null;
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
@@ -2567,6 +3349,7 @@ const PhotoArchive = (() => {
             const t = (thumbHeight - 120) / (400 - 120); // 0..1
             const newSize = Math.round(24 - t * 20);     // 24 down to 4
             if (newSize !== mosaicSize) {
+                clearWarmups();
                 mosaicSize = newSize;
                 loadMosaicBatch();
             }
@@ -2587,6 +3370,7 @@ const PhotoArchive = (() => {
     }
 
     function reloadForFilters() {
+        clearWarmups();
         // Reload the appropriate view based on which page we're on
         const grid = document.getElementById('rankings-grid');
         if (grid) {
@@ -2595,8 +3379,14 @@ const PhotoArchive = (() => {
             if (isDateSortActive()) updateDateScrubber();
             if (libraryView === 'map') loadMap();
         } else {
-            // Compare page — reload mosaic
-            loadMosaicBatch();
+            // Compare page — reload the active compare surface with the same filters
+            if (compareMode === 'mosaic') {
+                loadMosaicBatch();
+            } else {
+                comparePairs = [];
+                compareIndex = 0;
+                fetchComparePairs().then(() => showComparePair());
+            }
         }
     }
 
@@ -2761,19 +3551,24 @@ const PhotoArchive = (() => {
         if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length) return;
         const img = libraryImages[lightboxIndex];
         closeLightbox();
+        clearWarmups();
 
         // Clear grid and show similar images
         searchQuery = '__similar__';
+        clearPersistedSearchState();
         const input = document.getElementById('search-input');
         if (input) input.value = `Similar to: ${img.filename}`;
         const clearBtn = document.getElementById('search-clear');
         if (clearBtn) clearBtn.classList.remove('hidden');
         const sortToggles = document.getElementById('sort-toggles');
         if (sortToggles) sortToggles.style.opacity = '0.3';
+        updateDateScrubber();
 
         libraryRequestGeneration++;
         clearBatchSelection();
         libraryImages = [];
+        rankingsOffset = 0;
+        rankingsExhausted = true;
         const grid = document.getElementById('rankings-grid');
         grid.innerHTML = '';
 
@@ -2781,11 +3576,18 @@ const PhotoArchive = (() => {
         const res = await fetch(`/api/similar/${img.id}?limit=100`);
         const data = await res.json();
         if (requestGeneration !== libraryRequestGeneration) return;
+        compareStats = {
+            ...compareStats,
+            filtered_pool: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_visible: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_total: Number(data.total_images ?? data.images?.length ?? 0),
+        };
+        updateCompareProgress();
 
         for (let i = 0; i < data.images.length; i++) {
             const simg = data.images[i];
             const ar = simg.aspect_ratio || 1.5;
-            const simPct = (simg.similarity * 100).toFixed(0);
+            const simLabel = similarityLabel(simg);
 
             const card = document.createElement('div');
             card.className = 'rank-card' + (flagClass(simg.flag) ? ' ' + flagClass(simg.flag) : '');
@@ -2797,16 +3599,17 @@ const PhotoArchive = (() => {
             card.onclick = () => openLightbox(simg);
 
             card.innerHTML = `
-                <img src="${simg.thumb_url}" alt="${simg.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <img src="${escapeHtml(simg.thumb_url)}" alt="${escapeHtml(simg.filename)}" loading="lazy" onload="this.classList.add('loaded')">
                 ${flagBadge(simg.flag)}
                 <div class="rank-card-info">
-                    <span class="rank-elo">${simg.elo} Elo</span>
-                    <span class="rank-similarity">${simPct}% match</span>
+                    <span class="rank-elo">${escapeHtml(simg.elo)} Elo</span>
+                    <span class="rank-similarity">${escapeHtml(simLabel)}</span>
                 </div>
             `;
             grid.appendChild(card);
             libraryImages.push(simg);
         }
+        rankingsOffset = libraryImages.length;
     }
 
     // ==================== BATCH SELECTION ====================
@@ -2958,33 +3761,45 @@ const PhotoArchive = (() => {
     let mapCenter = [20, 0];
     let mapZoom = 2;
     let libraryView = 'grid';
+    let libraryScrollBeforeMap = 0;
     let leafletLoaded = false;
     let leafletLoadPromise = null;
     let mapRequestGeneration = 0;
 
     function setLibraryView(mode) {
+        clearWarmups();
         libraryView = mode;
         const grid = document.getElementById('rankings-grid');
         const mapEl = document.getElementById('map-container');
         const gridBtn = document.getElementById('view-grid-btn');
         const mapBtn = document.getElementById('view-map-btn');
+        const scrollRoot = libraryScrollRoot();
 
         if (mode === 'map') {
             clearBatchSelection();
-            grid.classList.add('hidden');
-            mapEl.classList.remove('hidden');
-            gridBtn.classList.remove('active');
-            mapBtn.classList.add('active');
+            libraryScrollBeforeMap = scrollRoot?.scrollTop || 0;
+            scrollRoot?.classList.add('map-active');
+            scrollRoot?.scrollTo({ top: 0, behavior: 'auto' });
+            grid?.classList.add('hidden');
+            mapEl?.classList.remove('hidden');
+            gridBtn?.classList.remove('active');
+            mapBtn?.classList.add('active');
+            syncDateScrubberVisibility();
             loadMap();
         } else {
             if (mapInstance) {
                 mapCenter = [mapInstance.getCenter().lat, mapInstance.getCenter().lng];
                 mapZoom = mapInstance.getZoom();
             }
-            grid.classList.remove('hidden');
-            mapEl.classList.add('hidden');
-            gridBtn.classList.add('active');
-            mapBtn.classList.remove('active');
+            scrollRoot?.classList.remove('map-active');
+            grid?.classList.remove('hidden');
+            mapEl?.classList.add('hidden');
+            gridBtn?.classList.add('active');
+            mapBtn?.classList.remove('active');
+            syncDateScrubberVisibility();
+            requestAnimationFrame(() => {
+                if (scrollRoot) scrollRoot.scrollTop = libraryScrollBeforeMap;
+            });
         }
     }
 
@@ -3096,7 +3911,8 @@ const PhotoArchive = (() => {
         }
 
         // Fetch markers
-        const url = `/api/map/markers?${filterParams().replace(/^&/, '')}`;
+        const query = filterQueryString(currentQueryState());
+        const url = `/api/map/markers${query ? `?${query}` : ''}`;
         try {
             const data = await fetch(url).then(r => r.json());
             if (requestGeneration !== mapRequestGeneration) return;
@@ -3121,7 +3937,10 @@ const PhotoArchive = (() => {
                 container.appendChild(info);
             }
             const infoEl = document.getElementById('map-info');
-            infoEl.textContent = `${data.gps_count.toLocaleString()} of ${data.total_count.toLocaleString()} photos have location data`;
+            const gpsVisible = Number(data.gps_count ?? data.markers?.length ?? 0);
+            const gpsTotal = Number(data.gps_total_count ?? gpsVisible);
+            const catalogTotal = Number(data.total_count ?? gpsTotal);
+            infoEl.textContent = `${visibleTotalLabel(gpsVisible, gpsTotal)} located photos shown · ${catalogTotal.toLocaleString()} photos in pool`;
 
             // Fit bounds if markers exist and map hasn't been manually positioned
             if (data.markers.length > 0 && mapZoom === 2) {
@@ -3138,10 +3957,10 @@ const PhotoArchive = (() => {
         if (img) {
             openLightbox(img);
         } else {
-            // Image not in library list — fetch minimal info
+            // Image is outside the active ordered list, so open it without mutating that list.
             fetch(`/api/image/${id}/exif`).then(r => r.json()).then(data => {
                 const exif = data.exif || {};
-                openLightbox({
+                openStandaloneLightbox({
                     id,
                     filename: exif.filename || `Image ${id}`,
                     thumb_url: `/api/thumb/sm/${id}`,
@@ -3170,7 +3989,9 @@ const PhotoArchive = (() => {
         'ssd_cache_dir',
         'ssd_cache_gb',
         'pregenerate_on_idle',
+        'embed_batch_size',
         'search_similarity_threshold',
+        'show_loupe_cache_status',
     ];
     const THUMB_OUTPUT_FIELDS = ['thumb_size_sm', 'thumb_size_md', 'thumb_size_lg', 'thumb_quality'];
     let settingsPoller = null;
@@ -3654,18 +4475,33 @@ const PhotoArchive = (() => {
         const embedAvailable = ai.worker_state !== 'unavailable';
         const embedComplete = embedRemaining <= 0 && embedTotal > 0;
 
-        // Thumbnail progress — aggregate across tiers
+        // Preview cache progress stays separate from original SSD warming.
         const diskTiers = disk.tiers || {};
-        const tierNames = ['sm', 'md', 'lg', 'full'];
-        let thumbDone = 0, thumbTotal = 0;
-        for (const name of tierNames) {
-            const t = diskTiers[name] || {};
-            thumbDone += Number(t.progress_count ?? t.count ?? 0);
-            thumbTotal += Number(t.progress_total || 0);
+        const previewTierNames = ['sm', 'md', 'lg'];
+        const previewSummary = pregen.preview || {};
+        let previewDone = Number(previewSummary.count || 0);
+        let previewTotal = Number(previewSummary.total || 0);
+        if (previewTotal <= 0) {
+            for (const name of previewTierNames) {
+                const t = diskTiers[name] || {};
+                previewDone += Number(t.progress_count ?? t.count ?? 0);
+                previewTotal += Number(t.progress_total || 0);
+            }
         }
-        const thumbPct = thumbTotal > 0 ? Math.min(100, thumbDone / thumbTotal * 100) : 0;
+        const previewPct = previewTotal > 0 ? Math.min(100, previewDone / previewTotal * 100) : 0;
         const thumbPaused = Boolean(pregen.manual_pause);
-        const thumbComplete = thumbPct >= 95;
+        const previewComplete = previewPct >= 95;
+
+        const fullTier = diskTiers.full || {};
+        const originals = pregen.originals || {};
+        const originalDone = Number(originals.count ?? fullTier.progress_count ?? fullTier.count ?? 0);
+        const originalTotal = Number(originals.total ?? fullTier.progress_total ?? 0);
+        const originalBudget = Number(originals.budget_bytes ?? fullTier.budget_bytes ?? 0);
+        const originalPct = originalTotal > 0
+            ? Math.min(100, originalDone / originalTotal * 100)
+            : Math.min(100, Number(originals.utilization_pct ?? fullTier.utilization_pct ?? 0));
+        const originalEnabled = originalBudget > 0 || originalTotal > 0 || originalDone > 0;
+        const originalComplete = !originalEnabled || originalPct >= 95 || Number(originals.remaining || 0) <= 0;
 
         // ETAs
         let embedEta = '';
@@ -3673,17 +4509,22 @@ const PhotoArchive = (() => {
         else if (ai.eta_seconds) embedEta = formatEta(ai.eta_seconds);
         else if (ai.worker_state === 'embedding') embedEta = 'Measuring\u2026';
 
-        let thumbEta = '';
-        if (thumbComplete) thumbEta = 'Done';
-        else if (pregen.eta_seconds) thumbEta = formatEta(pregen.eta_seconds);
-        else if (pregen.state === 'running') thumbEta = 'Measuring\u2026';
+        let previewEta = '';
+        if (previewComplete) previewEta = 'Done';
+        else if (pregen.eta_seconds) previewEta = formatEta(pregen.eta_seconds);
+        else if (pregen.state === 'running') previewEta = 'Measuring\u2026';
+
+        let originalEta = '';
+        if (originalComplete) originalEta = 'Done';
+        else if (pregen.original_eta_seconds) originalEta = formatEta(pregen.original_eta_seconds);
+        else if (pregen.state === 'running' && pregen.active_phase === 'full') originalEta = 'Measuring\u2026';
 
         // Speeds
         const embedSpeed = Number(ai.recent_images_per_min || ai.overall_images_per_min || 0);
         const thumbSpeed = Number(pregen.recent_images_per_min || pregen.overall_images_per_min || 0);
 
         // Build HTML
-        const allDone = embedComplete && thumbComplete;
+        const allDone = embedComplete && previewComplete && originalComplete;
         const pauseAllLabel = (embedPaused && thumbPaused) ? 'Resume All' : 'Pause All';
         const pauseAllAction = (embedPaused && thumbPaused) ? 'resumeAllWork' : 'pauseAllWork';
 
@@ -3708,13 +4549,24 @@ const PhotoArchive = (() => {
                 </div>
                 <div class="work-row thumb">
                     <div class="work-row-head">
-                        <span class="work-row-label">Thumbnail Cache</span>
-                        <span class="work-row-stat">${thumbDone.toLocaleString()} / ${thumbTotal.toLocaleString()}</span>
+                        <span class="work-row-label">Preview Cache</span>
+                        <span class="work-row-stat">${previewDone.toLocaleString()} / ${previewTotal.toLocaleString()}</span>
                     </div>
-                    <div class="work-row-bar"><div class="work-row-fill" style="width:${thumbPct}%"></div></div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${previewPct}%"></div></div>
                     <div class="work-row-detail">
-                        <span>${thumbSpeed > 0 ? formatRatePerMinute(thumbSpeed) : (thumbComplete ? 'Complete' : thumbPaused ? 'Paused' : 'Waiting')}</span>
-                        <span class="work-row-eta">${thumbEta}</span>
+                        <span>${thumbSpeed > 0 ? formatRatePerMinute(thumbSpeed) : (previewComplete ? 'Complete' : thumbPaused ? 'Paused' : 'Waiting')}</span>
+                        <span class="work-row-eta">${previewEta}</span>
+                    </div>
+                </div>
+                <div class="work-row thumb">
+                    <div class="work-row-head">
+                        <span class="work-row-label">Original SSD Cache</span>
+                        <span class="work-row-stat">${originalDone.toLocaleString()} / ${originalTotal.toLocaleString()}</span>
+                    </div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${originalPct}%"></div></div>
+                    <div class="work-row-detail">
+                        <span>${originalComplete ? 'Complete' : thumbPaused ? 'Paused' : pregen.active_phase === 'full' ? 'Warming' : 'Waiting'}</span>
+                        <span class="work-row-eta">${originalEta}</span>
                     </div>
                 </div>
             </div>
@@ -3746,6 +4598,7 @@ const PhotoArchive = (() => {
         const warmed = (name) => Number(diskTiers[name]?.progress_pct || 0);
         const smWarm = warmed('sm');
         const mdWarm = warmed('md');
+        const originalsRemaining = Number(cs.pregen?.originals?.remaining || 0);
         const estimateIsEarly = (name) => {
             const plan = rec.tiers[name] || {};
             const tier = diskTiers[name] || {};
@@ -3756,13 +4609,13 @@ const PhotoArchive = (() => {
             return total > 0 && count / total < 0.05;
         };
         const headline = mdWarm >= 95
-            ? 'Fast browsing cache is fully warmed'
+            ? (originalsRemaining > 0 ? 'Fast browsing cache is warm; originals are warming' : 'Fast browsing cache is fully warmed')
             : smWarm >= 95
                 ? 'Grid browsing is warmed; loupe previews are still building'
                 : 'photoArchive is building the fast cache';
 
         if (titleEl) {
-            const building = mdWarm < 95;
+            const building = mdWarm < 95 || originalsRemaining > 0;
             titleEl.innerHTML = headline + (building ? ' <span class="cache-building-dot"></span>' : '');
         }
         if (subtitleEl) {
@@ -3795,13 +4648,18 @@ const PhotoArchive = (() => {
                 state = 'Refreshing';
                 cls = 'selective';
             }
-            const remaining = Number(cs.pregen?.phases?.[name]?.remaining || 0);
-            const etaText = remaining > 0 && cs.pregen?.eta_seconds
-                ? `<div class="cache-card-meta"><span>${remaining.toLocaleString()} remaining</span><span>ETA ${formatEta(cs.pregen.eta_seconds)}</span></div>`
+            const remaining = name === 'full'
+                ? Number(cs.pregen?.originals?.remaining || 0)
+                : Number(cs.pregen?.phases?.[name]?.remaining || 0);
+            const etaSeconds = name === 'full' ? cs.pregen?.original_eta_seconds : cs.pregen?.eta_seconds;
+            const etaText = remaining > 0 && etaSeconds
+                ? `<div class="cache-card-meta"><span>${remaining.toLocaleString()} remaining</span><span>ETA ${formatEta(etaSeconds)}</span></div>`
                 : '';
             const availabilityText = actual.replacement_mode && staleCount > 0
                 ? `${cached} refreshed · ${staleCount.toLocaleString()} older usable`
-                : `${cached} of ${total} generated`;
+                : name === 'full'
+                    ? `${cached} of ${total} cached`
+                    : `${cached} of ${total} generated`;
             return `
                 <div class="cache-friendly-card tier-${name} ${cls}">
                     <div class="cache-card-meta"><strong>${title}</strong><span>${state}</span></div>
@@ -3815,7 +4673,7 @@ const PhotoArchive = (() => {
             card('sm', 'Grid scrolling'),
             card('md', 'Loupe previews'),
             card('lg', 'High-res previews'),
-            card('full', 'Original files'),
+            card('full', 'Original SSD cache'),
         ].join('');
 
         if (adviceEl) {
@@ -4062,6 +4920,7 @@ const PhotoArchive = (() => {
     }
 
     async function initSettings() {
+        initBottomBarMeasurement();
         const form = document.getElementById('settings-form');
         if (form) {
             form.addEventListener('submit', (e) => {

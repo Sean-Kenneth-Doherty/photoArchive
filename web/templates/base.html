@@ -6,7 +6,7 @@
     <title>{% block title %}photoArchive{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
     {% block navbar %}
     <nav class="navbar">
         <a href="/" class="nav-brand">photoArchive</a>

@@ -100,6 +100,57 @@ def _find_similar_batch(image_ids_to_find, image_ids, matrix, id_to_idx, thresho
     return results_by_id
 
 
+async def _apply_propagation_deltas(
+    conn,
+    neighbors: dict[int, dict],
+    deltas: dict[int, float],
+    *,
+    action_id: str | None,
+) -> int:
+    updates = []
+    history_rows = []
+    for neighbor_id, delta in deltas.items():
+        neighbor = neighbors.get(neighbor_id)
+        if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
+            continue
+        before_elo = float(neighbor["elo"])
+        before_count = int(neighbor.get("propagated_updates") or 0)
+        after_elo = before_elo + float(delta)
+        updates.append((after_elo, neighbor_id))
+        if action_id:
+            history_rows.append((
+                action_id,
+                neighbor_id,
+                before_elo,
+                before_count,
+                after_elo,
+                float(delta),
+            ))
+
+    if not updates:
+        return 0
+
+    if action_id:
+        cursor = await conn.execute(
+            "SELECT 1 FROM comparisons WHERE action_id = ? LIMIT 1",
+            (action_id,),
+        )
+        if await cursor.fetchone() is None:
+            return 0
+        await conn.executemany(
+            "INSERT INTO propagation_updates "
+            "(action_id, image_id, elo_before, propagated_updates_before, elo_after, delta) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            history_rows,
+        )
+
+    await conn.executemany(
+        "UPDATE images SET elo = ?, propagated_updates = COALESCE(propagated_updates, 0) + 1 WHERE id = ?",
+        updates,
+    )
+    return len(updates)
+
+
 async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
     """Precompute how many images would be affected if each grid image were the winner.
     Returns {image_id: predicted_count} for each image in grid_ids."""
@@ -131,7 +182,7 @@ async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
             for nid, _ in nlist:
                 if nid not in grid_set:
                     all_neighbor_ids.add(nid)
-        neighbor_data = await db.get_images_by_ids(list(all_neighbor_ids)) if all_neighbor_ids else {}
+        neighbor_data = await db.get_active_images_by_ids(list(all_neighbor_ids)) if all_neighbor_ids else {}
 
         result = {}
         for winner_id in grid_ids:
@@ -162,7 +213,7 @@ async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
         return {gid: 0 for gid in grid_ids}
 
 
-async def propagate_comparison(winner_id: int, loser_id: int, k: float):
+async def propagate_comparison(winner_id: int, loser_id: int, k: float, action_id: str | None = None):
     """
     After a direct comparison, propagate scaled Elo changes to similar images.
     Called as a fire-and-forget background task.
@@ -182,7 +233,7 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
 
         # Collect all neighbor IDs to fetch their current state
         all_neighbor_ids = list({nid for nid, _ in winner_neighbors + loser_neighbors})
-        neighbors = await db.get_images_by_ids(all_neighbor_ids)
+        neighbors = await db.get_active_images_by_ids(all_neighbor_ids)
 
         conn = await db.get_db()
         try:
@@ -204,23 +255,18 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
                 penalty = k * weight * PROPAGATION_DECAY
                 deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
 
-            updates = []
-            for neighbor_id, delta in deltas.items():
-                neighbor = neighbors.get(neighbor_id)
-                if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
-                    continue
-                updates.append((neighbor["elo"] + delta, neighbor_id))
-
             global last_propagation_count
-            if updates:
-                await conn.executemany(
-                    "UPDATE images SET elo = ?, propagated_updates = COALESCE(propagated_updates, 0) + 1 WHERE id = ?",
-                    updates,
-                )
+            updated = await _apply_propagation_deltas(
+                conn,
+                neighbors,
+                deltas,
+                action_id=action_id,
+            )
+            if updated:
                 await conn.commit()
                 db.invalidate_stats_cache()
-                last_propagation_count = len(updates)
-                log.debug(f"Propagated Elo to {len(updates)} neighbors "
+                last_propagation_count = updated
+                log.debug(f"Propagated Elo to {updated} neighbors "
                          f"(winner={winner_id}, loser={loser_id})")
             else:
                 last_propagation_count = 0
@@ -231,7 +277,7 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
         log.warning(f"Elo propagation error: {e}")
 
 
-async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
+async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float, action_id: str | None = None):
     """
     Propagate after a mosaic pick. Boost images similar to the winner,
     and penalize images similar to the losers. This makes each mosaic
@@ -263,7 +309,7 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
         if not all_neighbor_ids:
             return
 
-        neighbors = await db.get_images_by_ids(list(all_neighbor_ids))
+        neighbors = await db.get_active_images_by_ids(list(all_neighbor_ids))
 
         conn = await db.get_db()
         try:
@@ -288,23 +334,18 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
                     penalty = k * weight * PROPAGATION_DECAY * loser_scale
                     deltas[neighbor_id] = deltas.get(neighbor_id, 0.0) - penalty
 
-            updates = []
-            for neighbor_id, delta in deltas.items():
-                neighbor = neighbors.get(neighbor_id)
-                if not neighbor or neighbor["comparisons"] >= MAX_DIRECT_COMPARISONS:
-                    continue
-                updates.append((neighbor["elo"] + delta, neighbor_id))
-
             global last_propagation_count
-            if updates:
-                await conn.executemany(
-                    "UPDATE images SET elo = ?, propagated_updates = COALESCE(propagated_updates, 0) + 1 WHERE id = ?",
-                    updates,
-                )
+            updated = await _apply_propagation_deltas(
+                conn,
+                neighbors,
+                deltas,
+                action_id=action_id,
+            )
+            if updated:
                 await conn.commit()
                 db.invalidate_stats_cache()
-                last_propagation_count = len(updates)
-                log.debug(f"Propagated mosaic to {len(updates)} neighbors "
+                last_propagation_count = updated
+                log.debug(f"Propagated mosaic to {updated} neighbors "
                          f"(winner={winner_id}, {len(loser_ids)} losers)")
             else:
                 last_propagation_count = 0
