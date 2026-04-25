@@ -51,6 +51,25 @@
     --z-lightbox: 1000;
     --z-toast: 2000;
     --z-modal: 3000;
+
+    /* Spacing scale */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 12px;
+    --space-lg: 16px;
+    --space-xl: 24px;
+    --space-2xl: 32px;
+
+    /* Shadows */
+    --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.3);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,0.38);
+    --shadow-xl: 0 18px 50px rgba(0,0,0,0.45);
+
+    /* Status colors */
+    --status-warning: #c9a84c;
+    --status-error: #c77474;
+    --status-success: #4a9;
 }
 
 * {
