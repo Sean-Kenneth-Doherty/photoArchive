@@ -875,22 +875,47 @@ const PhotoArchive = (() => {
     }
 
     function findMosaicCellInDirection(cells, currentIdx, direction) {
-        const current = cells[currentIdx];
+        return findElementInAdjacentVisualRow(cells, currentIdx, direction);
+    }
+
+    function findElementInAdjacentVisualRow(elements, currentIdx, direction) {
+        const current = elements[currentIdx];
         if (!current) return currentIdx;
-        const rect = current.getBoundingClientRect();
-        const centerX = rect.left + rect.width / 2;
+
+        const boxes = Array.from(elements, (el, index) => {
+            const rect = el.getBoundingClientRect();
+            return {
+                index,
+                centerX: rect.left + rect.width / 2,
+                centerY: rect.top + rect.height / 2,
+                height: rect.height,
+            };
+        });
+        const currentBox = boxes[currentIdx];
+        const sameRowTolerance = Math.max(2, Math.min(12, currentBox.height * 0.08));
+        const targetRowTolerance = Math.max(4, Math.min(32, currentBox.height * 0.25));
+        let targetRowDelta = Infinity;
+
+        for (const box of boxes) {
+            if (box.index === currentIdx) continue;
+            const rowDelta = (box.centerY - currentBox.centerY) * direction;
+            if (rowDelta <= sameRowTolerance) continue;
+            targetRowDelta = Math.min(targetRowDelta, rowDelta);
+        }
+
+        if (!Number.isFinite(targetRowDelta)) return currentIdx;
+
         let best = currentIdx;
         let bestDist = Infinity;
-
-        for (let i = 0; i < cells.length; i++) {
-            if (i === currentIdx) continue;
-            const r = cells[i].getBoundingClientRect();
-            const isTarget = direction > 0 ? r.top > rect.bottom - 5 : r.bottom < rect.top + 5;
-            if (!isTarget) continue;
-            const dx = (r.left + r.width / 2) - centerX;
-            const dy = (r.top + r.height / 2) - (rect.top + rect.height / 2);
-            const dist = Math.abs(dx) + Math.abs(dy) * 0.1;
-            if (dist < bestDist) { bestDist = dist; best = i; }
+        for (const box of boxes) {
+            if (box.index === currentIdx) continue;
+            const rowDelta = (box.centerY - currentBox.centerY) * direction;
+            if (Math.abs(rowDelta - targetRowDelta) > targetRowTolerance) continue;
+            const dist = Math.abs(box.centerX - currentBox.centerX);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = box.index;
+            }
         }
         return best;
     }
@@ -1859,24 +1884,7 @@ const PhotoArchive = (() => {
     }
 
     function findCardInDirection(cards, currentIdx, direction) {
-        const current = cards[currentIdx];
-        if (!current) return currentIdx;
-        const rect = current.getBoundingClientRect();
-        const centerX = rect.left + rect.width / 2;
-        let best = currentIdx;
-        let bestDist = Infinity;
-
-        for (let i = 0; i < cards.length; i++) {
-            if (i === currentIdx) continue;
-            const r = cards[i].getBoundingClientRect();
-            const isBelow = direction > 0 ? r.top > rect.bottom - 5 : r.bottom < rect.top + 5;
-            if (!isBelow) continue;
-            const dx = (r.left + r.width / 2) - centerX;
-            const dy = (r.top + r.height / 2) - (rect.top + rect.height / 2);
-            const dist = Math.abs(dx) + Math.abs(dy) * 0.1;
-            if (dist < bestDist) { bestDist = dist; best = i; }
-        }
-        return best;
+        return findElementInAdjacentVisualRow(cards, currentIdx, direction);
     }
 
     function openLightbox(img) {
