@@ -9,6 +9,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 import app as app_module  # noqa: E402
 import db  # noqa: E402
+import embedding_worker  # noqa: E402
 import elo_propagation  # noqa: E402
 
 
@@ -27,6 +28,8 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.old_schedule_pairing_propagation = app_module._schedule_pairing_propagation
         self.old_get_matrix = elo_propagation.embed_cache.get_matrix
         self.old_get_index = elo_propagation.embed_cache.get_index
+        self.old_get_vector = elo_propagation.embed_cache.get_vector
+        self.old_encode_text = embedding_worker.encode_text
         self.old_prefetch_images = app_module.thumbnails.prefetch_images
         self.old_schedule_full_image_cache = app_module.thumbnails.schedule_full_image_cache
         self.old_has_cached_fast = app_module.thumbnails.has_cached_fast
@@ -41,12 +44,18 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         def close_scheduled(coro):
             coro.close()
 
+        async def noop_prefetch(*_args, **_kwargs):
+            return 0
+
         app_module._schedule_pairing_propagation = close_scheduled
+        app_module.thumbnails.prefetch_images = noop_prefetch
 
     async def asyncTearDown(self):
         app_module._schedule_pairing_propagation = self.old_schedule_pairing_propagation
         elo_propagation.embed_cache.get_matrix = self.old_get_matrix
         elo_propagation.embed_cache.get_index = self.old_get_index
+        elo_propagation.embed_cache.get_vector = self.old_get_vector
+        embedding_worker.encode_text = self.old_encode_text
         app_module.thumbnails.prefetch_images = self.old_prefetch_images
         app_module.thumbnails.schedule_full_image_cache = self.old_schedule_full_image_cache
         app_module.thumbnails.has_cached_fast = self.old_has_cached_fast
@@ -99,6 +108,29 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         try:
             cursor = await conn.execute("SELECT * FROM images WHERE id = ?", (image_id,))
             return dict(await cursor.fetchone())
+        finally:
+            await conn.close()
+
+    async def _cache_entry(self, image_id, size="sm"):
+        conn = await db.get_db()
+        try:
+            now = 12345.0 + int(image_id)
+            await conn.execute(
+                "INSERT OR REPLACE INTO cache_entries "
+                "(cache_root, size, image_id, path, source_signature, size_bytes, last_accessed, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    app_module.thumbnails.SSD_CACHE_DIR,
+                    size,
+                    image_id,
+                    os.path.join(self.tempdir.name, f"{size}-{image_id}.jpg"),
+                    f"sig-{size}-{image_id}",
+                    123,
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
         finally:
             await conn.close()
 
@@ -211,6 +243,142 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["propagated_update_count"], 1)
         self.assertEqual(stats["ranking_signal_count"], 8)
         self.assertEqual(stats["total_comparisons"], 8)
+
+    async def test_rankings_returns_only_sm_cached_images_with_visible_total_counts(self):
+        source = await self._source()
+        visible_high = await self._image(source["id"], "visible-high.jpg", elo=1500)
+        hidden = await self._image(source["id"], "hidden.jpg", elo=1400)
+        visible_low = await self._image(source["id"], "visible-low.jpg", elo=1300)
+        await self._cache_entry(visible_high, "sm")
+        await self._cache_entry(visible_low, "sm")
+
+        result = await app_module.api_rankings(limit=10, sort="elo")
+
+        self.assertEqual([img["id"] for img in result["images"]], [visible_high, visible_low])
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 3)
+        self.assertEqual(result["hidden_pending_thumbnails"], 1)
+        self.assertNotIn(hidden, [img["id"] for img in result["images"]])
+
+    async def test_mosaic_excludes_images_without_sm_but_reports_filtered_total(self):
+        source = await self._source()
+        first = await self._image(source["id"], "first.jpg", elo=1500)
+        hidden = await self._image(source["id"], "hidden.jpg", elo=1400)
+        second = await self._image(source["id"], "second.jpg", elo=1300)
+        await self._cache_entry(first, "sm")
+        await self._cache_entry(second, "sm")
+
+        result = await app_module.mosaic_next(n=3, strategy="diverse")
+        ids = [img["id"] for img in result["images"]]
+
+        self.assertEqual(ids, [first, second])
+        self.assertNotIn(hidden, ids)
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 3)
+        self.assertEqual(result["hidden_pending_thumbnails"], 1)
+        self.assertEqual(result["stats"]["filtered_pool_visible"], 2)
+        self.assertEqual(result["stats"]["filtered_pool_total"], 3)
+
+    async def test_compare_next_excludes_images_without_md_thumbnails(self):
+        source = await self._source()
+        visible_a = await self._image(source["id"], "visible-a.jpg", elo=1500)
+        hidden_a = await self._image(source["id"], "hidden-a.jpg", elo=1450)
+        visible_b = await self._image(source["id"], "visible-b.jpg", elo=1400)
+        hidden_b = await self._image(source["id"], "hidden-b.jpg", elo=1350)
+        await self._cache_entry(visible_a, "md")
+        await self._cache_entry(visible_b, "md")
+
+        result = await app_module.compare_next(n=2, mode="swiss")
+        pair_ids = {
+            image["id"]
+            for pair in result["pairs"]
+            for image in (pair["left"], pair["right"])
+        }
+
+        self.assertEqual(pair_ids, {visible_a, visible_b})
+        self.assertNotIn(hidden_a, pair_ids)
+        self.assertNotIn(hidden_b, pair_ids)
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 4)
+        self.assertEqual(result["hidden_pending_thumbnails"], 2)
+
+    async def test_search_skips_uncached_sm_results_and_fills_later_visible_matches(self):
+        source = await self._source()
+        hidden_best = await self._image(source["id"], "hidden-best.jpg")
+        visible_first = await self._image(source["id"], "visible-first.jpg")
+        hidden_next = await self._image(source["id"], "hidden-next.jpg")
+        visible_second = await self._image(source["id"], "visible-second.jpg")
+        await self._cache_entry(visible_first, "sm")
+        await self._cache_entry(visible_second, "sm")
+
+        image_ids = [hidden_best, visible_first, hidden_next, visible_second]
+        matrix = np.array(
+            [
+                [0.99, 0.01],
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.70, 0.30],
+            ],
+            dtype=np.float32,
+        )
+
+        async def fake_get_matrix():
+            return image_ids, matrix
+
+        def fake_encode_text(_query):
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+        elo_propagation.embed_cache.get_matrix = fake_get_matrix
+        embedding_worker.encode_text = fake_encode_text
+
+        result = await app_module.api_search(q="sunset", limit=2)
+
+        self.assertEqual([img["id"] for img in result["images"]], [visible_first, visible_second])
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 4)
+        self.assertEqual(result["hidden_pending_thumbnails"], 2)
+
+    async def test_similar_skips_uncached_sm_results_and_fills_later_visible_matches(self):
+        source = await self._source()
+        source_image = await self._image(source["id"], "source.jpg")
+        hidden_best = await self._image(source["id"], "hidden-best.jpg")
+        visible_first = await self._image(source["id"], "visible-first.jpg")
+        hidden_next = await self._image(source["id"], "hidden-next.jpg")
+        visible_second = await self._image(source["id"], "visible-second.jpg")
+        await self._cache_entry(visible_first, "sm")
+        await self._cache_entry(visible_second, "sm")
+
+        image_ids = [source_image, hidden_best, visible_first, hidden_next, visible_second]
+        matrix = np.array(
+            [
+                [1.00, 0.00],
+                [0.99, 0.01],
+                [0.90, 0.10],
+                [0.80, 0.20],
+                [0.70, 0.30],
+            ],
+            dtype=np.float32,
+        )
+
+        async def fake_get_matrix():
+            return image_ids, matrix
+
+        def fake_get_index():
+            return {image_id: idx for idx, image_id in enumerate(image_ids)}
+
+        def fake_get_vector(image_id):
+            return matrix[fake_get_index()[image_id]]
+
+        elo_propagation.embed_cache.get_matrix = fake_get_matrix
+        elo_propagation.embed_cache.get_index = fake_get_index
+        elo_propagation.embed_cache.get_vector = fake_get_vector
+
+        result = await app_module.api_similar(source_image, limit=2)
+
+        self.assertEqual([img["id"] for img in result["images"]], [visible_first, visible_second])
+        self.assertEqual(result["visible_images"], 2)
+        self.assertEqual(result["total_images"], 4)
+        self.assertEqual(result["hidden_pending_thumbnails"], 2)
 
     async def test_warm_images_deduplicates_ids_and_ignores_invalid_values(self):
         source = await self._source()
