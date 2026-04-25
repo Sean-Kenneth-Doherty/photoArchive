@@ -2457,6 +2457,17 @@ body.library-shell.date-scrubber-active .rankings-grid {
     border-top: 1px solid var(--bg-surface);
     flex-shrink: 0;
     overflow: hidden;
+    position: relative;
+}
+
+.filmstrip-counter {
+    position: absolute;
+    top: var(--space-sm);
+    right: var(--space-lg);
+    font-size: 11px;
+    color: var(--text-muted);
+    z-index: 2;
+    pointer-events: none;
 }
 
 .filmstrip-scroll {

@@ -2524,6 +2524,7 @@ const PhotoArchive = (() => {
             return;
         }
         loupeStandaloneImage = null;
+        updateFilmstripCounter();
         buildFilmstrip();
         showLoupeImage(libraryImages[lightboxIndex], 0);
     }
@@ -2542,14 +2543,24 @@ const PhotoArchive = (() => {
     function clearFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (scroll) scroll.innerHTML = '';
+        updateFilmstripCounter();
         _filmstripBuiltFor = null;
         _filmstripWindowStart = 0;
         _filmstripWindowEnd = 0;
     }
 
+    function updateFilmstripCounter() {
+        const counter = document.getElementById('filmstrip-counter');
+        if (!counter) return;
+        counter.textContent = lightboxIndex >= 0 && libraryImages.length
+            ? `${lightboxIndex + 1} / ${libraryImages.length}`
+            : '';
+    }
+
     function buildFilmstrip() {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
+        updateFilmstripCounter();
         if (lightboxIndex < 0) {
             clearFilmstrip();
             return;
@@ -2584,6 +2595,7 @@ const PhotoArchive = (() => {
             thumb.onclick = () => {
                 const direction = Math.sign(i - lightboxIndex);
                 lightboxIndex = i;
+                updateFilmstripCounter();
                 showLoupeImage(libraryImages[i], direction);
             };
             const thumbImg = document.createElement('img');
@@ -2601,6 +2613,7 @@ const PhotoArchive = (() => {
         const scroll = document.getElementById('filmstrip-scroll');
         if (!scroll) return;
         if (lightboxIndex < 0) return;
+        updateFilmstripCounter();
         if (lightboxIndex < _filmstripWindowStart || lightboxIndex >= _filmstripWindowEnd) {
             buildFilmstrip();
             return;
@@ -3303,6 +3316,7 @@ const PhotoArchive = (() => {
         const nextIndex = lightboxIndex + 1;
         if (nextIndex < libraryImages.length) {
             lightboxIndex = nextIndex;
+            updateFilmstripCounter();
             showLoupeImage(libraryImages[lightboxIndex], 1);
             return;
         }
@@ -3310,6 +3324,7 @@ const PhotoArchive = (() => {
         ensureLibraryImageIndex(nextIndex).then((ok) => {
             if (!ok || lightboxIndex !== fromIndex) return;
             lightboxIndex = nextIndex;
+            updateFilmstripCounter();
             showLoupeImage(libraryImages[lightboxIndex], 1);
         });
     }
@@ -3317,6 +3332,7 @@ const PhotoArchive = (() => {
     function lightboxPrev() {
         if (lightboxIndex <= 0) return;
         lightboxIndex--;
+        updateFilmstripCounter();
         showLoupeImage(libraryImages[lightboxIndex], -1);
     }
 
