@@ -856,7 +856,7 @@ async def warm_images(request: Request):
         return {"scheduled": {}, "images": 0}
 
     try:
-        rows_by_id = await db.get_images_by_ids(list(all_ids))
+        rows_by_id = await db.get_active_images_by_ids(list(all_ids))
     except (sqlite3.OperationalError, OSError) as exc:
         print(f"Warm image lookup skipped: {exc}")
         return {"scheduled": {tier: 0 for tier in requested}, "images": len(all_ids)}
@@ -977,7 +977,7 @@ async def build_cache_status(ahead: int = 100):
             cursor = await conn.execute(
                 "SELECT i.id, i.filepath FROM images i "
                 "JOIN catalog_sources s ON s.id = i.source_id "
-                "WHERE s.included = 1 AND s.online = 1 "
+                "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL "
                 "ORDER BY i.id LIMIT ?",
                 (ahead,),
             )
@@ -1364,7 +1364,11 @@ async def _count_visible_ranked_ids(ranked_ids: list[int], size: str = "sm") -> 
         seen.add(normalized)
         unique_ids.append(normalized)
     for chunk in _chunks(unique_ids):
-        visible += len(await _cached_image_ids(chunk, size))
+        cached_ids = await _cached_image_ids(chunk, size)
+        if not cached_ids:
+            continue
+        active_rows = await db.get_active_images_by_ids([image_id for image_id in chunk if image_id in cached_ids])
+        visible += len(active_rows)
     return visible
 
 
@@ -2401,7 +2405,7 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
 
     # Fetch image details
     all_ids = list({p[0] for p in pairs} | {p[1] for p in pairs})
-    images = await db.get_images_by_ids(all_ids) if all_ids else {}
+    images = await db.get_active_images_by_ids(all_ids) if all_ids else {}
 
     result = []
     for id_a, id_b, sim in pairs[:limit]:
@@ -2533,7 +2537,7 @@ async def api_collections(n_clusters: int = 20):
             member_ids.insert(0, rep_id)
         collection_drafts.append((c, int(cluster_indices.size), rep_id, member_ids))
 
-    images_data = await db.get_images_by_ids(representative_ids)
+    images_data = await db.get_active_images_by_ids(representative_ids)
     collections = []
     for c, count, rep_id, member_ids in collection_drafts:
         rep_img = images_data.get(rep_id, {})
@@ -2575,7 +2579,7 @@ async def api_folders():
         cursor = await conn.execute(
             "SELECT i.filepath FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         rows = await cursor.fetchall()
     finally:

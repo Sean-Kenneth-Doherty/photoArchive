@@ -372,8 +372,8 @@ def _cache_archive_estimates() -> dict:
             conn = _db_connect()
             row = conn.execute(
                 "SELECT "
-                "SUM(CASE WHEN s.included = 1 AND s.online = 1 THEN 1 ELSE 0 END) AS active_images, "
-                "SUM(CASE WHEN s.included = 1 AND s.online = 1 THEN 1 ELSE 0 END) AS total_images "
+                "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND i.missing_at IS NULL THEN 1 ELSE 0 END) AS active_images, "
+                "SUM(CASE WHEN s.included = 1 AND s.online = 1 AND i.missing_at IS NULL THEN 1 ELSE 0 END) AS total_images "
                 "FROM images i LEFT JOIN catalog_sources s ON s.id = i.source_id"
             ).fetchone()
             active_images = int(row["active_images"] or 0)
@@ -1971,7 +1971,7 @@ async def _cache_target_total() -> int:
         cursor = await conn.execute(
             "SELECT COUNT(*) AS c FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1"
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
         )
         row = await cursor.fetchone()
         return int(row["c"] if row else 0)
@@ -1993,6 +1993,7 @@ async def _pregen_bulk_candidate_batch(limit: int):
             "FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             "WHERE s.included = 1 AND s.online = 1 "
+            "AND i.missing_at IS NULL "
             "AND ("
             "  i.source_id > ? "
             "  OR (i.source_id = ? AND (i.filepath > ? OR (i.filepath = ? AND i.id > ?)))"

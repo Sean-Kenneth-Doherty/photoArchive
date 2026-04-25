@@ -11,6 +11,7 @@ import app as app_module  # noqa: E402
 import db  # noqa: E402
 import embedding_worker  # noqa: E402
 import elo_propagation  # noqa: E402
+import scanner  # noqa: E402
 
 
 class JsonRequest:
@@ -97,15 +98,16 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         elo=1200.0,
         comparisons=0,
         propagated_updates=0,
+        missing_at=None,
     ):
         filepath = os.path.join(self.tempdir.name, f"{source_id}-{filename}")
         conn = await db.get_db()
         try:
             cursor = await conn.execute(
                 "INSERT INTO images "
-                "(source_id, filename, filepath, elo, comparisons, propagated_updates, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'kept')",
-                (source_id, filename, filepath, elo, comparisons, propagated_updates),
+                "(source_id, filename, filepath, elo, comparisons, propagated_updates, status, missing_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'kept', ?)",
+                (source_id, filename, filepath, elo, comparisons, propagated_updates, missing_at),
             )
             await conn.commit()
             image_id = cursor.lastrowid
@@ -380,6 +382,81 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total_images"], 3)
         self.assertEqual(result["hidden_pending_thumbnails"], 1)
         self.assertNotIn(hidden, [img["id"] for img in result["images"]])
+
+    async def test_rescan_marks_missing_files_and_restores_seen_files(self):
+        source = await self._source("scan-source")
+        first_path = os.path.join(source["path"], "first.jpg")
+        second_path = os.path.join(source["path"], "second.jpg")
+        for path in (first_path, second_path):
+            with open(path, "wb") as f:
+                f.write(b"not-a-real-jpeg")
+
+        await scanner.scan_folder(source["path"], source_id=source["id"])
+        stats = await db.get_stats()
+        self.assertEqual(stats["total_images"], 2)
+
+        os.remove(second_path)
+        await scanner.scan_folder(source["path"], source_id=source["id"])
+
+        rows = await db.get_rankings(limit=10)
+        self.assertEqual([row["filename"] for row in rows], ["first.jpg"])
+        conn = await db.get_db()
+        try:
+            cursor = await conn.execute(
+                "SELECT missing_at FROM images WHERE filepath = ?",
+                (second_path,),
+            )
+            missing = await cursor.fetchone()
+        finally:
+            await conn.close()
+        self.assertIsNotNone(missing["missing_at"])
+        stats = await db.get_stats()
+        self.assertEqual(stats["total_images"], 1)
+        self.assertEqual(stats["total_catalog_images"], 2)
+
+        with open(second_path, "wb") as f:
+            f.write(b"back")
+        await scanner.scan_folder(source["path"], source_id=source["id"])
+
+        rows = await db.get_rankings(limit=10, sort="filename")
+        self.assertEqual([row["filename"] for row in rows], ["first.jpg", "second.jpg"])
+        restored = await self._image_row(rows[1]["id"])
+        self.assertIsNone(restored["missing_at"])
+
+    async def test_missing_images_are_excluded_from_active_views_and_workers(self):
+        source = await self._source()
+        active_a = await self._image(source["id"], "active-a.jpg", elo=1500)
+        missing = await self._image(source["id"], "missing.jpg", elo=1400, missing_at=12345.0)
+        active_b = await self._image(source["id"], "active-b.jpg", elo=1300)
+        await self._cache_entry(active_a, "sm")
+        await self._cache_entry(missing, "sm")
+        await self._cache_entry(active_b, "sm")
+        await self._cache_entry(active_a, "md")
+        await self._cache_entry(missing, "md")
+        await self._cache_entry(active_b, "md")
+
+        rankings = await app_module.api_rankings(limit=10, sort="elo")
+        self.assertEqual([img["id"] for img in rankings["images"]], [active_a, active_b])
+        self.assertEqual(rankings["visible_images"], 2)
+        self.assertEqual(rankings["total_images"], 2)
+
+        mosaic = await app_module.mosaic_next(n=3, strategy="diverse")
+        self.assertNotIn(missing, [img["id"] for img in mosaic["images"]])
+        self.assertEqual(mosaic["total_images"], 2)
+
+        compare = await app_module.compare_next(n=2, mode="swiss")
+        pair_ids = {
+            image["id"]
+            for pair in compare["pairs"]
+            for image in (pair["left"], pair["right"])
+        }
+        self.assertEqual(pair_ids, {active_a, active_b})
+
+        self.assertNotIn(missing, await db.get_active_images_by_ids([active_a, missing, active_b]))
+        self.assertEqual(len(await db.get_unembedded_images(limit=10)), 2)
+        stats = await db.get_stats()
+        self.assertEqual(stats["total_images"], 2)
+        self.assertEqual(stats["total_catalog_images"], 3)
 
     async def test_mosaic_excludes_images_without_sm_but_reports_filtered_total(self):
         source = await self._source()

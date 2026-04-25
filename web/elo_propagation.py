@@ -182,7 +182,7 @@ async def predict_propagation(grid_ids: list[int]) -> dict[int, int]:
             for nid, _ in nlist:
                 if nid not in grid_set:
                     all_neighbor_ids.add(nid)
-        neighbor_data = await db.get_images_by_ids(list(all_neighbor_ids)) if all_neighbor_ids else {}
+        neighbor_data = await db.get_active_images_by_ids(list(all_neighbor_ids)) if all_neighbor_ids else {}
 
         result = {}
         for winner_id in grid_ids:
@@ -233,7 +233,7 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float, action_i
 
         # Collect all neighbor IDs to fetch their current state
         all_neighbor_ids = list({nid for nid, _ in winner_neighbors + loser_neighbors})
-        neighbors = await db.get_images_by_ids(all_neighbor_ids)
+        neighbors = await db.get_active_images_by_ids(all_neighbor_ids)
 
         conn = await db.get_db()
         try:
@@ -309,7 +309,7 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float, actio
         if not all_neighbor_ids:
             return
 
-        neighbors = await db.get_images_by_ids(list(all_neighbor_ids))
+        neighbors = await db.get_active_images_by_ids(list(all_neighbor_ids))
 
         conn = await db.get_db()
         try:
