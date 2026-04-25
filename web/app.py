@@ -1367,6 +1367,12 @@ async def _resolve_text_search(q: str) -> dict:
             embedding_worker.encode_text,
             normalized_query,
         )
+        if text_vec is None and await embedding_worker.ensure_model_loaded_for_search():
+            text_vec = await asyncio.get_event_loop().run_in_executor(
+                None,
+                embedding_worker.encode_text,
+                normalized_query,
+            )
         if text_vec is not None:
             image_ids, matrix = await embed_cache.get_matrix()
             if image_ids is not None:
@@ -2196,6 +2202,8 @@ async def api_search(q: str = "", limit: int = 50):
         return await metadata_fallback("embeddings_unavailable")
 
     text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, query)
+    if text_vec is None and await embedding_worker.ensure_model_loaded_for_search():
+        text_vec = await asyncio.get_event_loop().run_in_executor(None, embedding_worker.encode_text, query)
     if text_vec is None:
         return await metadata_fallback("model_loading")
 

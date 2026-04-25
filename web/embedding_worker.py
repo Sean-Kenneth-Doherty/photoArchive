@@ -45,6 +45,7 @@ _model = None
 _loaded_model_dir = None
 _loaded_model_id = None
 _loaded_model_revision = None
+_model_load_lock = None
 _worker_status = {
     "state": "idle",
     "message": "",
@@ -322,6 +323,59 @@ def _load_model(model_dir: str, model_id: str):
     )
     log.info(f"{model_id} loaded from {model_dir} (int4, {EMBEDDING_DIM}-dim)")
     return model
+
+
+def _model_is_current(model_dir: str, model_id: str, model_revision: str) -> bool:
+    return (
+        _model is not None
+        and _loaded_model_dir == model_dir
+        and _loaded_model_id == model_id
+        and _loaded_model_revision == model_revision
+    )
+
+
+def _get_model_load_lock():
+    global _model_load_lock
+    if _model_load_lock is None:
+        _model_load_lock = asyncio.Lock()
+    return _model_load_lock
+
+
+async def ensure_model_loaded_for_search() -> bool:
+    """Load the embedding model for an explicit user search request."""
+    global _model, _loaded_model_dir, _loaded_model_id, _loaded_model_revision
+
+    config = settings.get_settings()
+    model_id = config["embed_model_id"]
+    model_revision = config["embed_model_revision"]
+    model_dir = config["embed_model_dir"]
+
+    if _model_is_current(model_dir, model_id, model_revision):
+        return True
+    if not ai_models.model_files_present(model_dir):
+        return False
+
+    async with _get_model_load_lock():
+        if _model_is_current(model_dir, model_id, model_revision):
+            return True
+
+        loop = asyncio.get_running_loop()
+        _set_worker_status("loading_model", f"Loading {model_id} for search…", ready=False)
+        try:
+            _model = await loop.run_in_executor(_embed_executor, _load_model, model_dir, model_id)
+            _loaded_model_dir = model_dir
+            _loaded_model_id = model_id
+            _loaded_model_revision = model_revision
+            _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
+            return True
+        except Exception as exc:
+            _model = None
+            _loaded_model_dir = None
+            _loaded_model_id = None
+            _loaded_model_revision = None
+            _set_worker_status("error", str(exc), ready=False, last_error=str(exc))
+            log.error(f"Search model load error: {exc}", exc_info=True)
+            return False
 
 
 def _load_image_for_embedding(image_id: int, path: str):
@@ -659,10 +713,7 @@ async def run_embedding_worker():
                 continue
 
             needs_model_load = (
-                _model is None
-                or _loaded_model_dir != model_dir
-                or _loaded_model_id != model_id
-                or _loaded_model_revision != model_revision
+                not _model_is_current(model_dir, model_id, model_revision)
             )
             if needs_model_load and not decision.can_start_heavy_work:
                 _set_worker_status(
@@ -674,12 +725,14 @@ async def run_embedding_worker():
                 continue
 
             if needs_model_load:
-                _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
-                _model = await loop.run_in_executor(_embed_executor, _load_model, model_dir, model_id)
-                _loaded_model_dir = model_dir
-                _loaded_model_id = model_id
-                _loaded_model_revision = model_revision
-                _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
+                async with _get_model_load_lock():
+                    if not _model_is_current(model_dir, model_id, model_revision):
+                        _set_worker_status("loading_model", f"Loading {model_id} from disk…", ready=False)
+                        _model = await loop.run_in_executor(_embed_executor, _load_model, model_dir, model_id)
+                        _loaded_model_dir = model_dir
+                        _loaded_model_id = model_id
+                        _loaded_model_revision = model_revision
+                        _set_worker_status("ready", f"{model_id} loaded locally.", ready=True)
 
             # Phase 1: Embed unembedded images with pipelined CPU/GPU
             active_batch_size, _target_batch_size = _refresh_batch_status(config)

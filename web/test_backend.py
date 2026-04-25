@@ -36,6 +36,7 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.old_get_index = elo_propagation.embed_cache.get_index
         self.old_get_vector = elo_propagation.embed_cache.get_vector
         self.old_encode_text = embedding_worker.encode_text
+        self.old_ensure_model_loaded_for_search = embedding_worker.ensure_model_loaded_for_search
         self.old_prefetch_images = app_module.thumbnails.prefetch_images
         self.old_schedule_full_image_cache = app_module.thumbnails.schedule_full_image_cache
         self.old_has_cached_fast = app_module.thumbnails.has_cached_fast
@@ -58,8 +59,12 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         async def noop_prefetch(*_args, **_kwargs):
             return 0
 
+        async def no_model_load_for_search():
+            return False
+
         app_module._schedule_pairing_propagation = close_scheduled
         app_module.thumbnails.prefetch_images = noop_prefetch
+        embedding_worker.ensure_model_loaded_for_search = no_model_load_for_search
 
     async def asyncTearDown(self):
         app_module._schedule_pairing_propagation = self.old_schedule_pairing_propagation
@@ -67,6 +72,7 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         elo_propagation.embed_cache.get_index = self.old_get_index
         elo_propagation.embed_cache.get_vector = self.old_get_vector
         embedding_worker.encode_text = self.old_encode_text
+        embedding_worker.ensure_model_loaded_for_search = self.old_ensure_model_loaded_for_search
         app_module.thumbnails.prefetch_images = self.old_prefetch_images
         app_module.thumbnails.schedule_full_image_cache = self.old_schedule_full_image_cache
         app_module.thumbnails.has_cached_fast = self.old_has_cached_fast
@@ -665,6 +671,41 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(similarity["total_images"], 2)
         self.assertEqual(elo_sorted["total_images"], 2)
         self.assertNotIn(miss, [img["id"] for img in elo_sorted["images"]])
+
+    async def test_rankings_search_loads_model_on_demand_when_worker_is_deferred(self):
+        source = await self._source()
+        match = await self._image(source["id"], "semantic-match.jpg")
+        miss = await self._image(source["id"], "semantic-miss.jpg")
+        for image_id in (match, miss):
+            await self._cache_entry(image_id, "sm")
+
+        image_ids = [match, miss]
+        matrix = np.array([[0.90, 0.10], [0.10, 0.90]], dtype=np.float32)
+        calls = {"encode": 0, "ensure": 0}
+
+        async def fake_get_matrix():
+            return image_ids, matrix
+
+        def fake_encode_text(_query):
+            calls["encode"] += 1
+            if calls["encode"] == 1:
+                return None
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+        async def fake_ensure_model_loaded_for_search():
+            calls["ensure"] += 1
+            return True
+
+        elo_propagation.embed_cache.get_matrix = fake_get_matrix
+        embedding_worker.encode_text = fake_encode_text
+        embedding_worker.ensure_model_loaded_for_search = fake_ensure_model_loaded_for_search
+
+        result = await app_module.api_rankings(q="dog", sort="similarity", limit=10)
+
+        self.assertEqual([img["id"] for img in result["images"]], [match])
+        self.assertEqual(calls, {"encode": 2, "ensure": 1})
+        self.assertEqual(result["search_mode"], "embedding")
+        self.assertFalse(result["ai_unavailable"])
 
     async def test_mosaic_next_search_filters_candidates_and_counts_visibility(self):
         source = await self._source()
