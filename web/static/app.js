@@ -2039,6 +2039,7 @@ const PhotoArchive = (() => {
                 else if (e.key.toLowerCase() === 'x') { e.preventDefault(); setCurrentLibraryFlag('rejected'); }
                 else if (e.key.toLowerCase() === 'u') { e.preventDefault(); setCurrentLibraryFlag('unflagged'); }
                 else if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); closeLightbox(); }
+                else if (e.key === 'Tab') { trapLoupeFocus(e); }
                 return;
             }
 
@@ -2872,6 +2873,7 @@ const PhotoArchive = (() => {
     let loupeHideTimer = null;
     let loupeCurrentMediaStatus = null;
     let loupeLoadingTierRank = -1;
+    let loupePreviousFocus = null;
     const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
@@ -2888,6 +2890,39 @@ const PhotoArchive = (() => {
             probe.resolveOnce(false);
         }
         clearLoupeTierLoading();
+    }
+
+    function focusLoupe() {
+        const wrap = document.getElementById('loupe-image-wrap');
+        if (wrap) wrap.focus({ preventScroll: true });
+    }
+
+    function loupeFocusableElements(loupe) {
+        return Array.from(loupe.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'))
+            .filter((el) => !el.disabled && !el.closest('.hidden'));
+    }
+
+    function trapLoupeFocus(e) {
+        const loupe = document.getElementById('loupe');
+        if (!loupe || loupe.classList.contains('hidden')) return;
+        const focusable = loupeFocusableElements(loupe);
+        if (!focusable.length) {
+            e.preventDefault();
+            focusLoupe();
+            return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (!loupe.contains(document.activeElement)) {
+            e.preventDefault();
+            first.focus({ preventScroll: true });
+        } else if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus({ preventScroll: true });
+        } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus({ preventScroll: true });
+        }
     }
 
     function showLoupeImage(img, direction = 0) {
@@ -2926,9 +2961,16 @@ const PhotoArchive = (() => {
         loupeApplyImageSize();
 
         document.body.classList.add('loupe-open');
-        if (loupe.classList.contains('hidden')) {
+        const loupeWasHidden = loupe.classList.contains('hidden');
+        if (loupeWasHidden) {
+            loupePreviousFocus = document.activeElement;
             loupe.classList.remove('hidden');
-            requestAnimationFrame(() => loupe.classList.add('loupe-visible'));
+            requestAnimationFrame(() => {
+                loupe.classList.add('loupe-visible');
+                focusLoupe();
+            });
+        } else if (!loupe.contains(document.activeElement)) {
+            focusLoupe();
         }
         loupeCenterFit({ animate: false });
 
@@ -3606,6 +3648,8 @@ const PhotoArchive = (() => {
 
     function closeLightbox() {
         const loupe = document.getElementById('loupe');
+        const previousFocus = loupePreviousFocus;
+        loupePreviousFocus = null;
         if (loupe) {
             loupe.classList.remove('loupe-visible');
             if (loupeHideTimer) clearTimeout(loupeHideTimer);
@@ -3633,6 +3677,9 @@ const PhotoArchive = (() => {
         loupeNatH = 0;
         updateZoomIndicator();
         lightboxIndex = -1;
+        if (previousFocus && document.contains(previousFocus) && typeof previousFocus.focus === 'function') {
+            previousFocus.focus({ preventScroll: true });
+        }
     }
 
     function setThumbSize(value) {

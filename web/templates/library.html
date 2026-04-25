@@ -13,9 +13,9 @@
     <div class="map-container hidden" id="map-container"></div>
 
     <!-- Loupe view (full screen + filmstrip) -->
-    <div class="loupe hidden" id="loupe">
+    <div class="loupe hidden" id="loupe" role="dialog" aria-modal="true" aria-label="Image viewer">
         <div class="loupe-main">
-            <div class="loupe-image-wrap" id="loupe-image-wrap">
+            <div class="loupe-image-wrap" id="loupe-image-wrap" tabindex="-1">
                 <img id="loupe-img" src="" alt="" draggable="false">
             </div>
             <div class="loupe-meta-overlay" id="loupe-meta-overlay">
