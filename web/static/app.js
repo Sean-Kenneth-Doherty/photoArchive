@@ -640,6 +640,19 @@ const PhotoArchive = (() => {
         setTimeout(() => toast.classList.remove('visible'), 3000);
     }
 
+    function showConfirmModal(title, text, onConfirm) {
+        const modal = document.getElementById('confirm-modal');
+        document.getElementById('confirm-modal-title').textContent = title;
+        document.getElementById('confirm-modal-text').textContent = text;
+        const btn = document.getElementById('confirm-modal-confirm');
+        btn.onclick = () => { hideConfirmModal(); onConfirm(); };
+        modal.classList.remove('hidden');
+    }
+
+    function hideConfirmModal() {
+        document.getElementById('confirm-modal').classList.add('hidden');
+    }
+
     function setMosaicStrategy(strategy) {
         clearWarmups();
         mosaicStrategy = strategy;
@@ -5099,42 +5112,46 @@ const PhotoArchive = (() => {
         }
     }
 
-    async function resetSettings() {
-        setSettingsStatus('Resetting to defaults…', 'muted');
-        try {
-            const res = await fetch('/api/settings/reset', { method: 'POST' });
-            const data = await res.json();
-            if (!res.ok || !data.ok) {
-                throw new Error(data.error || 'Reset failed');
+    function resetSettings() {
+        showConfirmModal('Reset to defaults?', 'All settings will be restored to their default values.', async () => {
+            setSettingsStatus('Resetting to defaults…', 'muted');
+            try {
+                const res = await fetch('/api/settings/reset', { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    throw new Error(data.error || 'Reset failed');
+                }
+                populateSettingsForm(data.settings || {});
+                rememberThumbnailOutput(data.settings || {});
+                updateThumbnailChangeNotice();
+                renderSettingsMeta(data);
+                setSettingsStatus('Defaults restored. Runtime settings were updated.', 'success');
+            } catch (err) {
+                setSettingsStatus(`Reset failed: ${err.message}`, 'error');
+                showToast('Reset failed');
             }
-            populateSettingsForm(data.settings || {});
-            rememberThumbnailOutput(data.settings || {});
-            updateThumbnailChangeNotice();
-            renderSettingsMeta(data);
-            setSettingsStatus('Defaults restored. Runtime settings were updated.', 'success');
-        } catch (err) {
-            setSettingsStatus(`Reset failed: ${err.message}`, 'error');
-            showToast('Reset failed');
-        }
+        });
     }
 
-    async function clearThumbnailCache() {
-        setSettingsStatus('Clearing in-memory and disk thumbnail cache…', 'muted');
-        try {
-            const res = await fetch('/api/cache/clear', { method: 'POST' });
-            const data = await res.json();
-            if (!res.ok || !data.ok) {
-                throw new Error(data.error || 'Cache clear failed');
+    function clearThumbnailCache() {
+        showConfirmModal('Clear thumbnail cache?', 'This will delete all cached thumbnails. Regeneration may take hours for large archives.', async () => {
+            setSettingsStatus('Clearing in-memory and disk thumbnail cache…', 'muted');
+            try {
+                const res = await fetch('/api/cache/clear', { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    throw new Error(data.error || 'Cache clear failed');
+                }
+                renderSettingsMeta(data);
+                setSettingsStatus(
+                    `Cleared ${data.memory_entries_cleared || 0} RAM entries (${formatBytes(data.memory_bytes_cleared || 0)}) and ${data.disk_files_removed || 0} disk files.`,
+                    'success'
+                );
+            } catch (err) {
+                setSettingsStatus(`Cache clear failed: ${err.message}`, 'error');
+                showToast('Cache clear failed');
             }
-            renderSettingsMeta(data);
-            setSettingsStatus(
-                `Cleared ${data.memory_entries_cleared || 0} RAM entries (${formatBytes(data.memory_bytes_cleared || 0)}) and ${data.disk_files_removed || 0} disk files.`,
-                'success'
-            );
-        } catch (err) {
-            setSettingsStatus(`Cache clear failed: ${err.message}`, 'error');
-            showToast('Cache clear failed');
-        }
+        });
     }
 
     async function startCachePregeneration() {
@@ -5312,6 +5329,8 @@ const PhotoArchive = (() => {
         initSettings,
         showShortcuts,
         hideShortcuts,
+        showConfirmModal,
+        hideConfirmModal,
         scrollToTop,
         clearSearch,
         setCompareMode,

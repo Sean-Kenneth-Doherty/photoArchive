@@ -56,6 +56,16 @@
             </div>
         </div>
     </div>
+    <div class="confirm-modal hidden" id="confirm-modal">
+        <div class="confirm-modal-card">
+            <h3 class="confirm-modal-title" id="confirm-modal-title"></h3>
+            <p class="confirm-modal-text" id="confirm-modal-text"></p>
+            <div class="confirm-modal-actions">
+                <button type="button" class="btn-secondary" onclick="PhotoArchive.hideConfirmModal()">Cancel</button>
+                <button type="button" class="btn-danger" id="confirm-modal-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
     <script src="/static/app.js"></script>
     {% block scripts %}{% endblock %}
 </body>
