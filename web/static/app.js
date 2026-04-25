@@ -16,6 +16,8 @@ const PhotoArchive = (() => {
     const INITIAL_RANKINGS_PAGE_SIZE = 48;
     const RANKINGS_PAGE_SIZE = 100;
     const BACKGROUND_WARM_DELAY_MS = 250;
+    const CROSS_VIEW_WARM_DELAY_MS = 1000;
+    const WARMUP_QUEUE_CONCURRENCY = 1;
     const LIBRARY_NEIGHBOR_LIMIT = 24;
     const MOSAIC_NEIGHBOR_LIMIT = 8;
     const COMPARE_NEIGHBOR_PAIRS = 4;
@@ -34,6 +36,9 @@ const PhotoArchive = (() => {
     let selectedMosaicIndex = -1;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
+    const warmupQueue = [];
+    let warmupActive = 0;
+    let warmupGeneration = 0;
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
     const WARM_CACHE_MAX_AGE_MS = 30000;
     const WARM_TIER_DEDUPE_MS = 8000;
@@ -66,28 +71,62 @@ const PhotoArchive = (() => {
         }
     }
 
+    function clearWarmups() {
+        warmupGeneration++;
+        for (const timer of backgroundWarmTimers.values()) clearTimeout(timer);
+        backgroundWarmTimers.clear();
+        for (const item of warmupQueue.splice(0)) {
+            if (item.onDrop) item.onDrop();
+        }
+    }
+
+    function enqueueWarmup(task, { generation = warmupGeneration, onDrop = null } = {}) {
+        warmupQueue.push({ task, generation, onDrop });
+        pumpWarmupQueue();
+    }
+
+    async function pumpWarmupQueue() {
+        if (warmupActive >= WARMUP_QUEUE_CONCURRENCY) return;
+        const item = warmupQueue.shift();
+        if (!item) return;
+        if (item.generation !== warmupGeneration) {
+            if (item.onDrop) item.onDrop();
+            pumpWarmupQueue();
+            return;
+        }
+
+        warmupActive++;
+        try {
+            await item.task();
+        } catch {
+            // Warmups are opportunistic.
+        } finally {
+            warmupActive = Math.max(0, warmupActive - 1);
+            pumpWarmupQueue();
+        }
+    }
+
     function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
         const token = (backgroundWarmTokens.get(key) || 0) + 1;
         backgroundWarmTokens.set(key, token);
+        const generation = warmupGeneration;
 
         const existingTimer = backgroundWarmTimers.get(key);
         if (existingTimer) clearTimeout(existingTimer);
 
         const timer = setTimeout(() => {
             backgroundWarmTimers.delete(key);
-            const run = () => Promise.resolve(task(token)).catch(() => {});
-            if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-                window.requestIdleCallback(run, { timeout: 1500 });
-            } else {
-                run();
-            }
+            enqueueWarmup(
+                () => task(token, generation),
+                { generation },
+            );
         }, delay);
 
         backgroundWarmTimers.set(key, timer);
     }
 
-    function isWarmTokenCurrent(key, token) {
-        return backgroundWarmTokens.get(key) === token;
+    function isWarmTokenCurrent(key, token, generation = warmupGeneration) {
+        return backgroundWarmTokens.get(key) === token && generation === warmupGeneration;
     }
 
     async function fetchWarmJson(url) {
@@ -130,9 +169,10 @@ const PhotoArchive = (() => {
         }
     }
 
-    function warmImageUrls(urls) {
+    async function warmImageUrls(urls, generation = warmupGeneration) {
         for (const url of urls || []) {
-            preloadImage(url, 'low');
+            if (generation !== warmupGeneration) return;
+            await preloadImageWithTimeout(url, 'low', 1200);
         }
     }
 
@@ -200,13 +240,13 @@ const PhotoArchive = (() => {
         return uiSettingsPromise;
     }
 
-    async function warmRequests(key, token, requests) {
+    async function warmRequests(key, token, generation, requests) {
         for (const request of requests) {
-            if (!isWarmTokenCurrent(key, token)) return;
+            if (!isWarmTokenCurrent(key, token, generation)) return;
             const data = await fetchWarmJson(request.url);
-            if (!data || !isWarmTokenCurrent(key, token)) return;
+            if (!data || !isWarmTokenCurrent(key, token, generation)) return;
             if (request.cacheKey) saveWarmCache(request.cacheKey, data);
-            warmImageUrls(request.extract(data));
+            await warmImageUrls(request.extract(data), generation);
         }
     }
 
@@ -410,33 +450,46 @@ const PhotoArchive = (() => {
     let mosaicReplacements = [];
     let mosaicFilling = false;
 
-    async function mosaicFillReplacements() {
+    function mosaicFillReplacements() {
         if (mosaicFilling || mosaicReplacements.length >= 10) return;
         mosaicFilling = true;
-        try {
-            const excludeIds = [
-                ...mosaicImages.map(img => img.id),
-                ...mosaicReplacements.map(img => img.id),
-            ].join(',');
-            const res = await fetch(buildMosaicUrl({ n: 10, exclude: excludeIds }));
-            const data = await res.json();
-            if (data.stats) {
-                compareStats = data.stats;
-                updateCompareProgress();
-            }
-            // Deduplicate against current grid and existing replacements
-            const onGrid = new Set(mosaicImages.map(img => img.id));
-            const inBuffer = new Set(mosaicReplacements.map(img => img.id));
-            for (const img of data.images) {
-                if (!onGrid.has(img.id) && !inBuffer.has(img.id)) {
-                    mosaicReplacements.push(img);
-                    inBuffer.add(img.id);
-                    preloadImage(img.thumb_url);
+        const generation = warmupGeneration;
+        const renderToken = mosaicRenderToken;
+        enqueueWarmup(async () => {
+            try {
+                if (generation !== warmupGeneration || renderToken !== mosaicRenderToken) return;
+                const excludeIds = [
+                    ...mosaicImages.map(img => img.id),
+                    ...mosaicReplacements.map(img => img.id),
+                ].join(',');
+                const res = await fetch(buildMosaicUrl({ n: 10, exclude: excludeIds }));
+                const data = await res.json();
+                if (generation !== warmupGeneration || renderToken !== mosaicRenderToken) return;
+                if (data.stats) {
+                    compareStats = data.stats;
+                    updateCompareProgress();
                 }
+                // Deduplicate against current grid and existing replacements
+                const onGrid = new Set(mosaicImages.map(img => img.id));
+                const inBuffer = new Set(mosaicReplacements.map(img => img.id));
+                const replacementUrls = [];
+                for (const img of data.images) {
+                    if (!onGrid.has(img.id) && !inBuffer.has(img.id)) {
+                        mosaicReplacements.push(img);
+                        inBuffer.add(img.id);
+                        if (img.thumb_url) replacementUrls.push(img.thumb_url);
+                    }
+                }
+                await warmImageUrls(replacementUrls, generation);
+            } catch {} finally {
+                mosaicFilling = false;
             }
-        } catch {} finally {
-            mosaicFilling = false;
-        }
+        }, {
+            generation,
+            onDrop: () => {
+                mosaicFilling = false;
+            },
+        });
     }
 
     let mosaicBusy = false;
@@ -585,6 +638,7 @@ const PhotoArchive = (() => {
     }
 
     function setMosaicStrategy(strategy) {
+        clearWarmups();
         mosaicStrategy = strategy;
         const btn = document.getElementById('strategy-' + strategy);
         if (btn) {
@@ -1114,6 +1168,7 @@ const PhotoArchive = (() => {
     }
 
     function setCompareMode(mode) {
+        clearWarmups();
         compareMode = mode;
         const btn = document.getElementById('mode-' + mode);
         if (btn) {
@@ -1427,6 +1482,7 @@ const PhotoArchive = (() => {
     }
 
     function resetLibraryResults({ clearBatch = false } = {}) {
+        clearWarmups();
         libraryRequestGeneration++;
         rankingsOffset = 0;
         rankingsExhausted = false;
@@ -1475,8 +1531,8 @@ const PhotoArchive = (() => {
             }];
             scheduleBackgroundWarm(
                 'crossview-library',
-                (token) => warmRequests('crossview-library', token, requests),
-                200,
+                (token, generation) => warmRequests('crossview-library', token, generation, requests),
+                CROSS_VIEW_WARM_DELAY_MS,
             );
         } else if (fromView === 'library') {
             const compareUrl = buildMosaicUrl({
@@ -1491,63 +1547,41 @@ const PhotoArchive = (() => {
             }];
             scheduleBackgroundWarm(
                 'crossview-compare',
-                (token) => warmRequests('crossview-compare', token, requests),
-                200,
+                (token, generation) => warmRequests('crossview-compare', token, generation, requests),
+                CROSS_VIEW_WARM_DELAY_MS,
             );
         }
     }
 
     function scheduleLibraryNeighborWarmup() {
-        if (searchQuery) return;
+        if (searchQuery || rankingsExhausted) return;
+        const nextUrl = buildRankingsUrl({
+            queryState: currentQueryState({ sort: rankingsSort }),
+            sort: rankingsSort,
+            limit: RANKINGS_PAGE_SIZE,
+            offset: rankingsOffset,
+        });
+        const requests = [{ url: nextUrl, cacheKey: `library:${nextUrl}`, extract: imageThumbUrls }];
 
-        const requests = [];
-        const seen = new Set();
-        const addRequest = (url) => {
-            if (seen.has(url)) return;
-            seen.add(url);
-            requests.push({ url, cacheKey: `library:${url}`, extract: imageThumbUrls });
-        };
-
-        const sortKey = SORT_KEYS[sortField];
-        if (sortKey) {
-            addRequest(buildRankingsUrl({ sort: sortDesc ? sortKey.asc : sortKey.desc }));
-        }
-
-        addRequest(buildRankingsUrl({ sort: rankingsSort === 'elo' ? 'comparisons' : 'elo' }));
-
-        for (const neighborState of buildFilterNeighborStates().slice(0, 3)) {
-            addRequest(buildRankingsUrl({ filterState: neighborState }));
-        }
-
-        if (!requests.length) return;
-        scheduleBackgroundWarm('library-neighbors', (token) => warmRequests('library-neighbors', token, requests));
+        scheduleBackgroundWarm(
+            'library-next-page',
+            (token, generation) => warmRequests('library-next-page', token, generation, requests),
+        );
     }
 
     function scheduleCompareNeighborWarmup(mode = compareMode) {
+        if (mode === 'mosaic') return;
         const requests = [];
+        requests.push({
+            url: buildCompareUrl(mode, COMPARE_NEIGHBOR_PAIRS),
+            extract: compareThumbUrls,
+        });
 
-        if (mode === 'mosaic') {
-            requests.push({ url: buildCompareUrl('swiss'), extract: compareThumbUrls });
-            requests.push({ url: buildCompareUrl('topn'), extract: compareThumbUrls });
-
-            for (const neighborState of buildFilterNeighborStates().slice(0, 2)) {
-                requests.push({
-                    url: buildMosaicUrl({ filterState: neighborState, gridElo: 0 }),
-                    extract: imageThumbUrls,
-                });
-            }
-        } else {
-            requests.push({
-                url: buildCompareUrl(mode === 'topn' ? 'swiss' : 'topn'),
-                extract: compareThumbUrls,
-            });
-            requests.push({
-                url: buildMosaicUrl({ gridElo: 0 }),
-                extract: imageThumbUrls,
-            });
-        }
-
-        scheduleBackgroundWarm('compare-neighbors', (token) => warmRequests('compare-neighbors', token, requests), 350);
+        scheduleBackgroundWarm(
+            'compare-next-pairs',
+            (token, generation) => warmRequests('compare-next-pairs', token, generation, requests),
+            350,
+        );
     }
 
     const SORT_KEYS = {
@@ -2552,6 +2586,7 @@ const PhotoArchive = (() => {
         // Pre-calculate fit dimensions from aspect ratio so all progressive
         // loads (sm/md/lg) display at the same screen size — no size jumps
         const token = ++loupeImageToken;
+        clearWarmups();
         loupeCurrentImage = img;
         loupeFullLoadToken = 0;
         cancelLoupeProbes();
@@ -2943,11 +2978,17 @@ const PhotoArchive = (() => {
 
     function preloadLoupeNeighbors(direction = 0) {
         if (lightboxIndex < 0) return;
+        const token = loupeImageToken;
+        const generation = warmupGeneration;
         for (const offset of loupeNeighborOffsets(LOUPE_PRELOAD_RADIUS, direction)) {
             const ni = lightboxIndex + offset;
             if (ni < 0 || ni >= libraryImages.length) continue;
             const neighbor = libraryImages[ni];
-            preloadLoupeNeighbor(neighbor, Math.abs(offset));
+            const distance = Math.abs(offset);
+            enqueueWarmup(async () => {
+                if (!loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
+                await preloadLoupeNeighbor(neighbor, distance, token, generation);
+            }, { generation });
         }
     }
 
@@ -2972,20 +3013,26 @@ const PhotoArchive = (() => {
         warmImageTiers({ md, lg, full });
     }
 
-    async function preloadLoupeNeighbor(img, distance = 1) {
+    async function preloadLoupeNeighbor(img, distance = 1, token = loupeImageToken, generation = warmupGeneration) {
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         await preloadImageWithTimeout(img.thumb_url, 'low', 1200);
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         const status = await getMediaStatus(img.id);
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         const tiers = status?.tiers || {};
         if (tiers.md?.cached) {
             await preloadImageWithTimeout(tiers.md.cached_url, 'low', LOUPE_TIER_TIMEOUTS.md);
         }
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         if (tiers.lg?.cached) {
             await preloadImageWithTimeout(tiers.lg.cached_url, 'low', LOUPE_TIER_TIMEOUTS.lg);
         }
+        if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
         if (distance === 1) {
             if (!tiers.md?.cached) {
                 await preloadImageWithTimeout(loupeTierUrl('md', img.id), 'low', LOUPE_TIER_TIMEOUTS.md);
             }
+            if (generation !== warmupGeneration || !loupeCurrentImage || !isCurrentLoupeImage(loupeCurrentImage, token)) return;
             if (!tiers.lg?.cached) {
                 await preloadImageWithTimeout(loupeTierUrl('lg', img.id), 'low', LOUPE_TIER_TIMEOUTS.lg);
             }
@@ -3202,6 +3249,7 @@ const PhotoArchive = (() => {
         }
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
+        clearWarmups();
         cancelLoupeProbes();
         if (loupeFullLoadTimer) {
             clearTimeout(loupeFullLoadTimer);
@@ -3229,6 +3277,7 @@ const PhotoArchive = (() => {
             const t = (thumbHeight - 120) / (400 - 120); // 0..1
             const newSize = Math.round(24 - t * 20);     // 24 down to 4
             if (newSize !== mosaicSize) {
+                clearWarmups();
                 mosaicSize = newSize;
                 loadMosaicBatch();
             }
@@ -3249,6 +3298,7 @@ const PhotoArchive = (() => {
     }
 
     function reloadForFilters() {
+        clearWarmups();
         // Reload the appropriate view based on which page we're on
         const grid = document.getElementById('rankings-grid');
         if (grid) {
@@ -3429,6 +3479,7 @@ const PhotoArchive = (() => {
         if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length) return;
         const img = libraryImages[lightboxIndex];
         closeLightbox();
+        clearWarmups();
 
         // Clear grid and show similar images
         searchQuery = '__similar__';
@@ -3643,6 +3694,7 @@ const PhotoArchive = (() => {
     let mapRequestGeneration = 0;
 
     function setLibraryView(mode) {
+        clearWarmups();
         libraryView = mode;
         const grid = document.getElementById('rankings-grid');
         const mapEl = document.getElementById('map-container');
