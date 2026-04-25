@@ -23,6 +23,7 @@ const PhotoArchive = (() => {
     const LOUPE_TIER_LABELS = ['Thumbnail (sm)', 'Medium (md)', 'Large (lg)', 'Original'];
     const LOUPE_TIER_TIMEOUTS = { md: 1800, lg: 2600, full: 5000 };
     const LOUPE_TIER_RANKS = { sm: 0, md: 1, lg: 2, full: 3 };
+    const LOUPE_BLANK_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
     const MEDIA_STATUS_MAX_AGE_MS = 15000;
     const mediaStatusCache = new Map();
     const mediaStatusInflight = new Map();
@@ -1652,6 +1653,15 @@ const PhotoArchive = (() => {
         return `${width} x ${height} (${megapixels.toFixed(megapixels >= 10 ? 0 : 1)} MP)`;
     }
 
+    function imageAspectRatio(img) {
+        const ar = Number(img?.aspect_ratio || 0);
+        if (ar > 0) return ar;
+        const width = Number(img?.width || 0);
+        const height = Number(img?.height || 0);
+        if (width > 0 && height > 0) return width / height;
+        return 1.5;
+    }
+
     function imageMetadataTitle(img) {
         const parts = [img.filename];
         const camera = cameraLabel(img);
@@ -2044,6 +2054,8 @@ const PhotoArchive = (() => {
             thumb.className = 'filmstrip-thumb' + (i === lightboxIndex ? ' active' : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
             thumb.dataset.idx = i;
             thumb.dataset.imageId = img.id;
+            thumb.style.aspectRatio = String(imageAspectRatio(img));
+            thumb.title = imageMetadataTitle(img);
             thumb.onclick = () => {
                 const direction = Math.sign(i - lightboxIndex);
                 lightboxIndex = i;
@@ -2140,7 +2152,11 @@ const PhotoArchive = (() => {
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
-        const ar = img.aspect_ratio || 1.5;
+        loupeImg.onload = null;
+        loupeImg.onerror = null;
+        loupeImg.style.opacity = '0';
+        loupeImg.src = LOUPE_BLANK_SRC;
+        const ar = imageAspectRatio(img);
         loupeNatW = ar >= 1 ? loupeRefLong : Math.round(loupeRefLong * ar);
         loupeNatH = ar >= 1 ? Math.round(loupeRefLong / ar) : loupeRefLong;
         loupeImg.style.transition = 'opacity 0.15s';
@@ -2157,8 +2173,6 @@ const PhotoArchive = (() => {
         // so the next tier still gets a chance, while late arrivals can still
         // upgrade the image if they are sharper than the current display.
         loupeImg.alt = img.filename || '';
-        loupeImg.src = img.thumb_url;
-        loupeDisplayedTierRank = 0;
         runLoupeProgressiveLoad(img, token);
 
         // Populate metadata overlay
@@ -2168,8 +2182,8 @@ const PhotoArchive = (() => {
         const tierEl = document.getElementById('loupe-overlay-tier');
 
         if (filenameEl) filenameEl.textContent = img.filename;
-        if (exifEl) exifEl.textContent = '';
-        if (tierEl) tierEl.textContent = LOUPE_TIER_LABELS[0];
+        renderLoupeMetadata(img, exifEl);
+        if (tierEl) tierEl.textContent = '';
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
@@ -2184,31 +2198,44 @@ const PhotoArchive = (() => {
         // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
             if (!data.exif || !isCurrentLoupeImage(img, token)) return;
-            const e = data.exif;
-            const parts = [];
-            const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
-            if (camera) parts.push(camera);
-            if (e.date_taken || e.date) parts.push('Taken ' + formatDateTime(e.date_taken || e.date));
-            const settings = [];
-            if (e.focal_length) settings.push(e.focal_length);
-            if (e.focal_length_35mm) settings.push(`${e.focal_length_35mm} equiv`);
-            if (e.aperture) settings.push(e.aperture);
-            if (e.shutter_speed) settings.push(e.shutter_speed + 's');
-            if (e.iso) settings.push('ISO ' + e.iso);
-            if (settings.length) parts.push(settings.join('  '));
-            if (e.lens) parts.push(e.lens);
-            const exposure = [e.exposure_program, e.exposure_bias, e.metering_mode, e.white_balance, e.flash].filter(Boolean);
-            if (exposure.length) parts.push(exposure.join('  '));
-            const fileBits = [];
-            if (e.dimensions) fileBits.push(e.dimensions);
-            if (e.filesize) fileBits.push(e.filesize);
-            else if (e.file_size) fileBits.push(formatBytes(e.file_size));
-            if (e.file_ext) fileBits.push(e.file_ext.replace('.', '').toUpperCase());
-            if (fileBits.length) parts.push(fileBits.join('  '));
-            if (e.file_modified) parts.push('Modified ' + formatDateTime(e.file_modified));
-            if (e.filepath) parts.push(e.filepath);
-            if (exifEl) exifEl.textContent = parts.join('\n');
+            renderLoupeMetadata({ ...img, ...data.exif }, exifEl);
         }).catch(() => {});
+    }
+
+    function loupeMetadataParts(e = {}) {
+        const parts = [];
+        const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
+        if (camera) parts.push(camera);
+        if (e.date_taken || e.date) parts.push('Taken ' + formatDateTime(e.date_taken || e.date));
+        const settings = [];
+        if (e.focal_length) settings.push(e.focal_length);
+        if (e.focal_length_35mm) settings.push(`${e.focal_length_35mm} equiv`);
+        if (e.aperture) settings.push(e.aperture);
+        if (e.shutter_speed) settings.push(e.shutter_speed + 's');
+        if (e.iso) settings.push('ISO ' + e.iso);
+        if (settings.length) parts.push(settings.join('  '));
+        if (e.lens) parts.push(e.lens);
+        const exposure = [e.exposure_program, e.exposure_bias, e.metering_mode, e.white_balance, e.flash].filter(Boolean);
+        if (exposure.length) parts.push(exposure.join('  '));
+        const fileBits = [];
+        if (e.dimensions) fileBits.push(e.dimensions);
+        else {
+            const resolution = resolutionLabel(e);
+            if (resolution) fileBits.push(resolution);
+        }
+        if (e.filesize) fileBits.push(e.filesize);
+        else if (e.file_size) fileBits.push(formatBytes(e.file_size));
+        if (e.file_ext) fileBits.push(String(e.file_ext).replace('.', '').toUpperCase());
+        if (fileBits.length) parts.push(fileBits.join('  '));
+        if (e.file_modified) parts.push('Modified ' + formatDateTime(e.file_modified));
+        else if (e.file_modified_at) parts.push('Modified ' + formatDateTime(e.file_modified_at));
+        if (e.filepath) parts.push(e.filepath);
+        return parts;
+    }
+
+    function renderLoupeMetadata(metadata, exifEl = document.getElementById('loupe-overlay-exif')) {
+        if (!exifEl) return;
+        exifEl.textContent = loupeMetadataParts(metadata).join('\n');
     }
 
     function isCurrentLoupeImage(img, token) {
@@ -2264,7 +2291,12 @@ const PhotoArchive = (() => {
     }
 
     async function runLoupeProgressiveLoad(img, token) {
-        const status = await getMediaStatus(img.id);
+        const smUrl = img.thumb_url || loupeTierUrl('sm', img.id);
+        loadLoupeTier(img, smUrl, LOUPE_TIER_RANKS.sm, token, {
+            timeoutMs: LOUPE_TIER_TIMEOUTS.md,
+        });
+
+        const status = await withTimeout(getMediaStatus(img.id, { force: true }), 500, null);
         if (!isCurrentLoupeImage(img, token)) return;
 
         const cachedBest = status?.best_cached;
@@ -2338,6 +2370,7 @@ const PhotoArchive = (() => {
                     if (loupeImg) {
                         loupeDisplayedTierRank = rank;
                         loupeImg.src = probeImg.src;
+                        loupeImg.style.opacity = '1';
                         updateLoupeFlagDisplay(img.flag || 'unflagged');
                     }
                 }
@@ -2350,6 +2383,18 @@ const PhotoArchive = (() => {
                 probe.timer = setTimeout(() => finish(false), timeoutMs);
             }
             probeImg.src = url;
+        });
+    }
+
+    function withTimeout(promise, timeoutMs, fallback) {
+        let timer = null;
+        return Promise.race([
+            Promise.resolve(promise),
+            new Promise((resolve) => {
+                timer = setTimeout(() => resolve(fallback), timeoutMs);
+            }),
+        ]).finally(() => {
+            if (timer) clearTimeout(timer);
         });
     }
 
