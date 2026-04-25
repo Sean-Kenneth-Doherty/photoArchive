@@ -2563,7 +2563,8 @@ body.library-shell.date-scrubber-active .rankings-grid {
     margin-top: 2px;
 }
 
-#loupe-overlay-tier {
+#loupe-overlay-tier,
+#loupe-overlay-zoom {
     color: rgba(255,255,255,0.35);
     font-size: 11px;
     margin-top: 4px;

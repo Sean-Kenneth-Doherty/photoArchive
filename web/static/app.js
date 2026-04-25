@@ -2811,6 +2811,7 @@ const PhotoArchive = (() => {
             tierEl.classList.remove('loupe-tier-loading');
             tierEl.textContent = '';
         }
+        updateZoomIndicator();
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
@@ -3167,6 +3168,7 @@ const PhotoArchive = (() => {
         }
 
         loupeApplyTransform();
+        updateZoomIndicator();
         wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
     }
 
@@ -3264,6 +3266,22 @@ const PhotoArchive = (() => {
         img.style.transform = `translate(${loupePanX}px, ${loupePanY}px) scale(${loupeScale})`;
     }
 
+    function updateZoomIndicator() {
+        const zoomEl = document.getElementById('loupe-overlay-zoom');
+        if (!zoomEl) return;
+        if (!loupeCurrentImage || !loupeNatW || !loupeNatH) {
+            zoomEl.textContent = '';
+            return;
+        }
+        if (loupeZoomMode === 'fit') {
+            zoomEl.textContent = 'Fit';
+        } else if (loupeZoomMode === 'one-to-one') {
+            zoomEl.textContent = '100%';
+        } else {
+            zoomEl.textContent = `${Math.round(loupeScale * 100)}%`;
+        }
+    }
+
     function loupeCenterFit({ animate = true } = {}) {
         const wrap = document.getElementById('loupe-image-wrap');
         const img = document.getElementById('loupe-img');
@@ -3277,6 +3295,7 @@ const PhotoArchive = (() => {
         loupeZoomMode = 'fit';
         if (animate) img.style.transition = 'transform 0.2s ease-out, opacity 0.15s';
         loupeApplyTransform();
+        updateZoomIndicator();
         wrap.style.cursor = 'zoom-in';
         if (animate) setTimeout(() => { if (img) img.style.transition = 'opacity 0.15s'; }, 200);
     }
@@ -3300,6 +3319,7 @@ const PhotoArchive = (() => {
         loupeZoomMode = loupeIsFit ? 'fit' : mode;
         loupeClampPan();
         loupeApplyTransform();
+        updateZoomIndicator();
         wrap.style.cursor = loupeIsFit ? 'zoom-in' : 'grab';
     }
 
@@ -3404,6 +3424,7 @@ const PhotoArchive = (() => {
             } else {
                 loupeClampPan();
                 loupeApplyTransform();
+                updateZoomIndicator();
             }
         });
     }
@@ -3471,6 +3492,7 @@ const PhotoArchive = (() => {
         loupeZoomMode = 'fit';
         loupeNatW = 0;
         loupeNatH = 0;
+        updateZoomIndicator();
         lightboxIndex = -1;
     }
 
