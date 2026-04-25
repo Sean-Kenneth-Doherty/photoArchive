@@ -3509,9 +3509,104 @@ const PhotoArchive = (() => {
         renderAutoTuningStatus(data.settings);
         renderModelStatus(data.model_status);
         renderAISettingsStatus(data.ai_status);
+        renderWorkBanner(data.ai_status, data.cache_stats);
         renderCacheTierGuide(data.cache_stats, data.settings);
         if (data.catalog) renderCatalogSources(data.catalog);
         updateCacheProfileHint();
+    }
+
+    function renderWorkBanner(aiStatus, cacheStatus) {
+        const el = document.getElementById('work-banner');
+        if (!el) return;
+
+        const ai = aiStatus || {};
+        const pregen = cacheStatus?.pregen || {};
+        const disk = cacheStatus?.disk || {};
+
+        // Embedding progress
+        const embedTotal = Number(ai.total_images ?? ai.total_kept ?? 0);
+        const embedDone = Number(ai.embedded || 0);
+        const embedRemaining = Number(ai.remaining || 0);
+        const embedPct = Number(ai.progress_pct || 0);
+        const embedPaused = Boolean(ai.embedding_manual_pause);
+        const embedAvailable = ai.worker_state !== 'unavailable';
+        const embedComplete = embedRemaining <= 0 && embedTotal > 0;
+
+        // Thumbnail progress — aggregate across tiers
+        const diskTiers = disk.tiers || {};
+        const tierNames = ['sm', 'md', 'lg', 'full'];
+        let thumbDone = 0, thumbTotal = 0;
+        for (const name of tierNames) {
+            const t = diskTiers[name] || {};
+            thumbDone += Number(t.progress_count ?? t.count ?? 0);
+            thumbTotal += Number(t.progress_total || 0);
+        }
+        const thumbPct = thumbTotal > 0 ? Math.min(100, thumbDone / thumbTotal * 100) : 0;
+        const thumbPaused = Boolean(pregen.manual_pause);
+        const thumbComplete = thumbPct >= 95;
+
+        // ETAs
+        let embedEta = '';
+        if (embedComplete) embedEta = 'Done';
+        else if (ai.eta_seconds) embedEta = formatEta(ai.eta_seconds);
+        else if (ai.worker_state === 'embedding') embedEta = 'Measuring\u2026';
+
+        let thumbEta = '';
+        if (thumbComplete) thumbEta = 'Done';
+        else if (pregen.eta_seconds) thumbEta = formatEta(pregen.eta_seconds);
+        else if (pregen.state === 'running') thumbEta = 'Measuring\u2026';
+
+        // Speeds
+        const embedSpeed = Number(ai.recent_images_per_min || ai.overall_images_per_min || 0);
+        const thumbSpeed = Number(pregen.recent_images_per_min || pregen.overall_images_per_min || 0);
+
+        // Build HTML
+        const allDone = embedComplete && thumbComplete;
+        const pauseAllLabel = (embedPaused && thumbPaused) ? 'Resume All' : 'Pause All';
+        const pauseAllAction = (embedPaused && thumbPaused) ? 'resumeAllWork' : 'pauseAllWork';
+
+        el.innerHTML = `
+            <div class="work-banner-head">
+                <span class="work-banner-title">Background Work</span>
+                ${!allDone ? `<div class="work-banner-actions">
+                    <button class="bar-btn" type="button" onclick="PhotoArchive.${pauseAllAction}()">${pauseAllLabel}</button>
+                </div>` : ''}
+            </div>
+            <div class="work-banner-rows">
+                <div class="work-row embed">
+                    <div class="work-row-head">
+                        <span class="work-row-label">AI Embeddings</span>
+                        <span class="work-row-stat">${embedDone.toLocaleString()} / ${embedTotal.toLocaleString()}</span>
+                    </div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${embedPct}%"></div></div>
+                    <div class="work-row-detail">
+                        <span>${embedSpeed > 0 ? formatRatePerMinute(embedSpeed) : (embedComplete ? 'Complete' : embedPaused ? 'Paused' : 'Waiting')}</span>
+                        <span class="work-row-eta">${embedEta}</span>
+                    </div>
+                </div>
+                <div class="work-row thumb">
+                    <div class="work-row-head">
+                        <span class="work-row-label">Thumbnail Cache</span>
+                        <span class="work-row-stat">${thumbDone.toLocaleString()} / ${thumbTotal.toLocaleString()}</span>
+                    </div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${thumbPct}%"></div></div>
+                    <div class="work-row-detail">
+                        <span>${thumbSpeed > 0 ? formatRatePerMinute(thumbSpeed) : (thumbComplete ? 'Complete' : thumbPaused ? 'Paused' : 'Waiting')}</span>
+                        <span class="work-row-eta">${thumbEta}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    function pauseAllWork() {
+        pauseEmbeddings();
+        stopCachePregeneration();
+    }
+
+    function resumeAllWork() {
+        resumeEmbeddings();
+        startCachePregeneration();
     }
 
     function renderCacheTierGuide(cs, settings = {}) {
@@ -3741,55 +3836,9 @@ const PhotoArchive = (() => {
     }
 
     function renderAISettingsStatus(aiStatus) {
-        const progressEl = document.getElementById('ai-settings-embed-progress');
-        const remainingEl = document.getElementById('ai-settings-embed-remaining');
-        const speedEl = document.getElementById('ai-settings-embed-speed');
-        const etaEl = document.getElementById('ai-settings-embed-eta');
-        const predictionsEl = document.getElementById('ai-settings-predictions');
-        const workerEl = document.getElementById('ai-settings-worker-message');
-        const pauseBtn = document.getElementById('embedding-pause-btn');
-        const resumeBtn = document.getElementById('embedding-resume-btn');
-        if (!progressEl || !remainingEl || !speedEl || !etaEl || !predictionsEl || !workerEl || !aiStatus) return;
-
-        const embedded = Number(aiStatus.embedded || 0);
-        const total = Number(aiStatus.total_images ?? aiStatus.total_kept ?? 0);
-        const remaining = Number(aiStatus.remaining || 0);
-        const progressPct = Number(aiStatus.progress_pct || 0);
-        const recentRate = Number(aiStatus.recent_images_per_min || 0);
-        const overallRate = Number(aiStatus.overall_images_per_min || 0);
-
-        progressEl.textContent = `${embedded.toLocaleString()} / ${total.toLocaleString()} (${progressPct.toFixed(1)}%)`;
-        remainingEl.textContent = remaining.toLocaleString();
-
-        if (recentRate > 0 && overallRate > 0) {
-            speedEl.textContent = `${formatRatePerMinute(recentRate)} recent · ${formatRatePerMinute(overallRate)} avg`;
-        } else if (recentRate > 0) {
-            speedEl.textContent = `${formatRatePerMinute(recentRate)} recent`;
-        } else if (overallRate > 0) {
-            speedEl.textContent = `${formatRatePerMinute(overallRate)} avg`;
-        } else if (embedded >= total && total > 0) {
-            speedEl.textContent = 'Complete';
-        } else {
-            speedEl.textContent = 'Waiting for embedding activity';
-        }
-
-        if (remaining <= 0 && total > 0) {
-            etaEl.textContent = 'Done';
-        } else if (aiStatus.eta_seconds) {
-            etaEl.textContent = formatEta(aiStatus.eta_seconds);
-        } else if (aiStatus.worker_state === 'embedding') {
-            etaEl.textContent = 'Measuring…';
-        } else {
-            etaEl.textContent = 'Waiting for speed data';
-        }
-
-        predictionsEl.textContent = `${Number(aiStatus.predicted || 0).toLocaleString()} predicted · ${Number(aiStatus.compared || 0).toLocaleString()} compared`;
-        workerEl.textContent = aiStatus.worker_message || 'Waiting for worker activity';
-
-        const paused = Boolean(aiStatus.embedding_manual_pause);
-        const available = aiStatus.worker_state !== 'unavailable';
-        if (pauseBtn) pauseBtn.disabled = !available || paused;
-        if (resumeBtn) resumeBtn.disabled = !available || !paused;
+        // Embedding progress display moved to the work banner.
+        // This function now only exists for any remaining per-element updates.
+        if (!aiStatus) return;
     }
 
     function populateSettingsForm(settings) {
@@ -4175,6 +4224,8 @@ const PhotoArchive = (() => {
         useBrowsedDirectory,
         pauseEmbeddings,
         resumeEmbeddings,
+        pauseAllWork,
+        resumeAllWork,
         setLibraryView,
         openLightboxById,
     };

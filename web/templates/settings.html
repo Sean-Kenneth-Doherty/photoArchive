@@ -10,6 +10,8 @@
         <div class="settings-status" id="settings-status">Loading current settings…</div>
     </div>
 
+    <div class="work-banner" id="work-banner"></div>
+
     <form class="settings-grid" id="settings-form">
         <section class="settings-card">
             <h2>Catalog Sources</h2>
@@ -59,39 +61,33 @@
             <div class="settings-metric-list">
                 <div>Install status: <strong id="model-install-status">—</strong></div>
                 <div id="model-install-message">—</div>
-                <div>Embeddings: <strong id="ai-settings-embed-progress">—</strong></div>
-                <div>Remaining: <strong id="ai-settings-embed-remaining">—</strong></div>
-                <div>Speed: <strong id="ai-settings-embed-speed">—</strong></div>
-                <div>ETA: <strong id="ai-settings-embed-eta">—</strong></div>
-                <div>Predictions: <strong id="ai-settings-predictions">—</strong></div>
-                <div>Worker: <span id="ai-settings-worker-message">—</span></div>
             </div>
             <div class="settings-actions">
                 <button class="bar-btn" type="button" id="install-model-btn" onclick="PhotoArchive.installAIModel()">Save + Install Model</button>
-                <button class="bar-btn" type="button" id="embedding-pause-btn" onclick="PhotoArchive.pauseEmbeddings()">Pause Embeddings</button>
-                <button class="bar-btn" type="button" id="embedding-resume-btn" onclick="PhotoArchive.resumeEmbeddings()">Resume Embeddings</button>
             </div>
         </section>
 
         <section class="settings-card">
             <h2>Thumbnail Output</h2>
             <p class="settings-card-copy">Larger sizes improve fidelity but cost more CPU, disk, and bandwidth.</p>
-            <label class="settings-field">
-                <span>Small long side</span>
-                <input id="thumb_size_sm" type="number" min="64" max="4096" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Medium long side</span>
-                <input id="thumb_size_md" type="number" min="128" max="8192" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Large long side</span>
-                <input id="thumb_size_lg" type="number" min="128" max="8192" step="1">
-            </label>
-            <label class="settings-field">
-                <span>Thumbnail JPEG quality</span>
-                <input id="thumb_quality" type="number" min="40" max="100" step="1">
-            </label>
+            <div class="settings-split-grid">
+                <label class="settings-field">
+                    <span>Small long side</span>
+                    <input id="thumb_size_sm" type="number" min="64" max="4096" step="1">
+                </label>
+                <label class="settings-field">
+                    <span>Medium long side</span>
+                    <input id="thumb_size_md" type="number" min="128" max="8192" step="1">
+                </label>
+                <label class="settings-field">
+                    <span>Large long side</span>
+                    <input id="thumb_size_lg" type="number" min="128" max="8192" step="1">
+                </label>
+                <label class="settings-field">
+                    <span>JPEG quality</span>
+                    <input id="thumb_quality" type="number" min="40" max="100" step="1">
+                </label>
+            </div>
             <div class="thumbnail-change-notice hidden" id="thumbnail-change-notice">
                 <strong>Changing thumbnail output</strong>
                 <span id="thumbnail-change-copy">Existing previews can be kept or replaced.</span>
@@ -145,10 +141,6 @@
                 <input id="pregenerate_on_idle" type="checkbox">
                 <span>Warm image cache while the computer is idle</span>
             </label>
-            <div class="settings-actions">
-                <button class="bar-btn" type="button" id="thumb-pause-btn" onclick="PhotoArchive.stopCachePregeneration()">Pause Thumbnail Generation</button>
-                <button class="bar-btn" type="button" id="thumb-resume-btn" onclick="PhotoArchive.startCachePregeneration()">Resume Thumbnail Generation</button>
-            </div>
             <details class="settings-advanced" id="cache-advanced">
                 <summary>Technical details</summary>
                 <label class="settings-field">

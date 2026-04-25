@@ -870,6 +870,104 @@ button:disabled {
     background: rgba(199, 116, 116, 0.08);
 }
 
+/* Work banner — unified progress for embeddings + thumbnails */
+.work-banner {
+    background: #1b1b1b;
+    border: 1px solid #303030;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 18px;
+    display: grid;
+    gap: 14px;
+}
+
+.work-banner:empty {
+    display: none;
+}
+
+.work-banner-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.work-banner-title {
+    color: #f1f1f1;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.work-banner-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.work-banner-rows {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+}
+
+.work-row {
+    display: grid;
+    gap: 6px;
+}
+
+.work-row-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.work-row-label {
+    color: #cdd3da;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.work-row-stat {
+    color: #8e949b;
+    font-size: 12px;
+}
+
+.work-row-bar {
+    height: 12px;
+    background: #151515;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.work-row-fill {
+    height: 100%;
+    border-radius: inherit;
+    transition: width .6s ease;
+}
+
+.work-row.embed .work-row-fill { background: #5fc49c; }
+.work-row.thumb .work-row-fill { background: #6cb4ee; }
+
+.work-row-detail {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    color: #8e949b;
+    font-size: 12px;
+}
+
+.work-row-eta {
+    color: #cdd3da;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.work-banner-done {
+    color: #5fc49c;
+    font-size: 13px;
+}
+
 .settings-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
