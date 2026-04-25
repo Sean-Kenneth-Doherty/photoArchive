@@ -1828,7 +1828,7 @@ body.library-shell .library-container::-webkit-scrollbar-thumb:hover {
 
 .bar-search-input:focus {
     border-color: var(--accent);
-    width: 220px;
+    width: 300px;
 }
 
 .bar-search-input::placeholder {
