@@ -518,13 +518,14 @@ button:disabled {
     border: 1px solid #333;
     border-radius: 8px;
     padding: 24px;
-    transition: border-color 0.15s, transform 0.15s;
+    transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
     color: #e0e0e0;
 }
 
 .workflow-card:hover {
     border-color: #555;
     transform: translateY(-2px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
     color: #e0e0e0;
 }
 
