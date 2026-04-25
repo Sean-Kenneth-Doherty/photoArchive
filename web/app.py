@@ -1115,6 +1115,8 @@ async def api_reset_settings():
 @app.post("/api/cache/clear")
 async def api_clear_thumbnail_cache():
     result = thumbnails.clear_cache()
+    if result.get("refused"):
+        return JSONResponse({"ok": False, **result}, status_code=400)
     return {
         "ok": True,
         **result,

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 import sys
@@ -20,8 +21,12 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         self.old_load_source_image = thumbnails._load_source_image
         self.old_memory_bytes = thumbnails.MEMORY_CACHE_BYTES
         self.old_db_connect = thumbnails._db_connect
+        self.old_db_path = thumbnails.db.DB_PATH
+        self.old_persistent_conn = thumbnails._persistent_conn
 
         thumbnails.SSD_CACHE_DIR = self.tempdir.name
+        thumbnails.db.DB_PATH = os.path.join(self.tempdir.name, "thumbnail-cache-test.db")
+        thumbnails._persistent_conn = None
         thumbnails._disk_allocations.update({
             "sm": 64 * 1024 * 1024,
             "md": 64 * 1024 * 1024,
@@ -47,6 +52,10 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         thumbnails._get_source_bits = self.old_get_source_bits
         thumbnails._load_source_image = self.old_load_source_image
         thumbnails._db_connect = self.old_db_connect
+        if thumbnails._persistent_conn is not None:
+            thumbnails._persistent_conn.close()
+        thumbnails._persistent_conn = self.old_persistent_conn
+        thumbnails.db.DB_PATH = self.old_db_path
         thumbnails.MEMORY_CACHE_BYTES = self.old_memory_bytes
         thumbnails._clear_memory_cache()
         thumbnails._clear_disk_index()
@@ -233,6 +242,47 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         self.assertFalse(thumbnails._flush_write_queue())
         with thumbnails._write_queue_lock:
             self.assertEqual(len(thumbnails._write_queue), 1)
+
+    def test_get_thumbnail_returns_generated_bytes_when_caches_are_disabled(self):
+        path = self._make_image()
+        thumbnails._disk_allocations.update({tier: 0 for tier in thumbnails.ALL_TIERS})
+        thumbnails.MEMORY_CACHE_BYTES = 0
+
+        data = asyncio.run(thumbnails.get_thumbnail(path, "md", 7))
+
+        self.assertGreater(len(data), 100)
+        self.assertFalse(os.path.exists(thumbnails._thumbnail_disk_path("md", 7)))
+        self.assertIsNone(
+            thumbnails._memory_get("md", 7, thumbnails._build_source_signature(path, "md", 7))
+        )
+
+    def test_clear_cache_refuses_unmarked_directory_with_non_cache_files(self):
+        user_file = os.path.join(self.tempdir.name, "keep.txt")
+        with open(user_file, "w", encoding="utf-8") as f:
+            f.write("not cache data")
+        marker = thumbnails._cache_marker_path()
+        if os.path.exists(marker):
+            os.remove(marker)
+
+        result = thumbnails.clear_cache()
+
+        self.assertTrue(result["refused"])
+        self.assertTrue(os.path.exists(user_file))
+
+    def test_clear_cache_allows_legacy_cache_layout_and_writes_marker(self):
+        marker = thumbnails._cache_marker_path()
+        if os.path.exists(marker):
+            os.remove(marker)
+        path = os.path.join(self.tempdir.name, "sm", "1.jpg")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"cache")
+
+        result = thumbnails.clear_cache()
+
+        self.assertNotIn("refused", result)
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.exists(marker))
 
 
 if __name__ == "__main__":

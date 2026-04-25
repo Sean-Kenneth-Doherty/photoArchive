@@ -26,6 +26,7 @@ SIZES = {
 }
 THUMB_QUALITY = 92
 CACHE_VERSION = "v3"
+CACHE_MARKER = ".photoarchive-cache"
 CACHE_PROFILE = "original_heavy"
 SSD_CACHE_DIR = os.getenv(
     "PHOTOARCHIVE_THUMB_CACHE_DIR",
@@ -142,6 +143,23 @@ def _db_connect() -> sqlite3.Connection:
             "replace_stale_thumbnails INTEGER NOT NULL DEFAULT 0"
             ")"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cache_entries ("
+            "cache_root TEXT NOT NULL, "
+            "size TEXT NOT NULL, "
+            "image_id INTEGER NOT NULL, "
+            "path TEXT NOT NULL, "
+            "source_signature TEXT NOT NULL, "
+            "size_bytes INTEGER NOT NULL, "
+            "last_accessed REAL NOT NULL, "
+            "created_at REAL NOT NULL, "
+            "PRIMARY KEY (cache_root, size, image_id)"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cache_entries_root_size_access "
+            "ON cache_entries(cache_root, size, last_accessed)"
+        )
         try:
             conn.execute(
                 "ALTER TABLE cache_metadata "
@@ -194,6 +212,63 @@ def _cache_access_time(*, hot: bool) -> float:
     return now if hot else now - COLD_CACHE_ACCESS_OFFSET_SECONDS
 
 
+def _cache_marker_path() -> str:
+    return os.path.join(SSD_CACHE_DIR, CACHE_MARKER)
+
+
+def _cache_dir_has_marker() -> bool:
+    return bool(SSD_CACHE_DIR and os.path.isfile(_cache_marker_path()))
+
+
+def _cache_dir_is_legacy_cache_layout() -> bool:
+    """True for empty or old unmarked cache roots containing only cache tiers."""
+    if not SSD_CACHE_DIR or not os.path.isdir(SSD_CACHE_DIR):
+        return True
+    allowed = set(ALL_TIERS) | {CACHE_MARKER}
+    try:
+        entries = os.listdir(SSD_CACHE_DIR)
+    except OSError:
+        return False
+    for entry in entries:
+        if entry not in allowed:
+            return False
+        path = os.path.join(SSD_CACHE_DIR, entry)
+        if entry == CACHE_MARKER:
+            if not os.path.isfile(path):
+                return False
+        elif not os.path.isdir(path):
+            return False
+    return True
+
+
+def _write_cache_marker():
+    if not SSD_CACHE_DIR:
+        return
+    try:
+        with open(_cache_marker_path(), "w", encoding="utf-8") as marker:
+            marker.write("photoArchive thumbnail cache\n")
+    except OSError as exc:
+        print(f"Could not write cache marker for {SSD_CACHE_DIR}: {exc}")
+
+
+def _cache_dir_safe_to_clear() -> tuple[bool, str]:
+    if not SSD_CACHE_DIR:
+        return True, ""
+    if not os.path.exists(SSD_CACHE_DIR):
+        return True, ""
+    if not os.path.isdir(SSD_CACHE_DIR):
+        return False, f"Cache path is not a directory: {SSD_CACHE_DIR}"
+    if _cache_dir_has_marker():
+        return True, ""
+    if _cache_dir_is_legacy_cache_layout():
+        _write_cache_marker()
+        return True, ""
+    return (
+        False,
+        "Refusing to clear an unmarked cache directory that contains non-cache files",
+    )
+
+
 def note_user_activity():
     global _last_user_activity
     _last_user_activity = time.monotonic()
@@ -206,10 +281,13 @@ def get_idle_seconds() -> float:
 def _ensure_disk_cache_dirs():
     if not SSD_CACHE_DIR:
         return
+    should_mark = not os.path.exists(SSD_CACHE_DIR) or _cache_dir_has_marker() or _cache_dir_is_legacy_cache_layout()
     os.makedirs(SSD_CACHE_DIR, exist_ok=True)
     for size in THUMB_TIERS:
         os.makedirs(os.path.join(SSD_CACHE_DIR, size), exist_ok=True)
     os.makedirs(os.path.join(SSD_CACHE_DIR, FULL_TIER), exist_ok=True)
+    if should_mark:
+        _write_cache_marker()
 
 
 SSD_REMAINDER_PROFILES = {
@@ -1354,10 +1432,11 @@ def _generate_missing_thumbnails_sync(
         allow_stale_fallback=allow_stale_fallback,
     )
     if not needed_sizes:
-        return
+        return None
 
     img = None
     current = None
+    requested_data = None
 
     try:
         max_target = max(SIZES[size] for size in needed_sizes)
@@ -1389,6 +1468,8 @@ def _generate_missing_thumbnails_sync(
             _memory_put(size, image_id, source_signature, data)
             _write_thumbnail_to_disk(size, image_id, source_signature, data, hot=hot)
             _thumbnail_retry_after.pop((size, image_id, source_signature), None)
+            if size == requested_size:
+                requested_data = data
 
             if current is not img:
                 current.close()
@@ -1399,6 +1480,7 @@ def _generate_missing_thumbnails_sync(
             source_signature = _build_source_signature(filepath, size, image_id)
             _thumbnail_retry_after[(size, image_id, source_signature)] = retry_until
         print(f"Thumbnail error for {filepath}: {e}")
+        return None
     finally:
         if current is not None and current is not img:
             try:
@@ -1410,6 +1492,7 @@ def _generate_missing_thumbnails_sync(
                 img.close()
             except Exception:
                 pass
+    return requested_data
 
 
 def _generate_thumbnail_set_sync(
@@ -1524,7 +1607,7 @@ async def _run_thumbnail_job(
     allow_stale_fallback: bool,
 ):
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
+    return await loop.run_in_executor(
         executor,
         partial(
             _generate_missing_thumbnails_sync,
@@ -1588,10 +1671,12 @@ async def _ensure_thumbnail_with_executor(
         _inflight[inflight_key] = task
 
     try:
-        await task
+        generated = await task
     finally:
         if _inflight.get(inflight_key) is task and task.done():
             _inflight.pop(inflight_key, None)
+    if generated:
+        return generated
 
     cached = _memory_get(size, image_id, source_signature)
     if cached is not None:
@@ -2336,13 +2421,21 @@ def purge_image_cache(image_ids: list[int]) -> dict:
 
 def clear_cache() -> dict:
     global _replace_stale_thumbnails
+    safe_to_clear, unsafe_reason = _cache_dir_safe_to_clear()
+    if not safe_to_clear:
+        return {
+            "refused": True,
+            "error": unsafe_reason,
+            "ssd_cache_dir": SSD_CACHE_DIR,
+        }
+
     memory = _clear_memory_cache()
     _flush_write_queue()
 
     disk_removed = 0
     if SSD_CACHE_DIR and os.path.isdir(SSD_CACHE_DIR):
         for _root, _dirs, files in os.walk(SSD_CACHE_DIR):
-            disk_removed += len(files)
+            disk_removed += sum(1 for filename in files if filename != CACHE_MARKER)
         shutil.rmtree(SSD_CACHE_DIR, ignore_errors=True)
     _ensure_disk_cache_dirs()
     _clear_disk_index()
@@ -2351,13 +2444,25 @@ def clear_cache() -> dict:
     _reset_pregen_bulk_cursor()
 
     with _meta_lock:
-        conn = _db_connect()
-        conn.execute("DELETE FROM cache_entries WHERE cache_root = ?", (SSD_CACHE_DIR,))
-        conn.execute(
-            "UPDATE cache_metadata SET replace_stale_thumbnails = 0 WHERE cache_root = ?",
-            (SSD_CACHE_DIR,),
-        )
-        conn.commit()
+        conn = None
+        try:
+            conn = _db_connect()
+            conn.execute("DELETE FROM cache_entries WHERE cache_root = ?", (SSD_CACHE_DIR,))
+            conn.execute(
+                "UPDATE cache_metadata SET replace_stale_thumbnails = 0 WHERE cache_root = ?",
+                (SSD_CACHE_DIR,),
+            )
+            conn.commit()
+            _clear_cache_metadata_lock_backoff()
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_locked(exc):
+                _note_cache_metadata_lock()
+                print(f"Cache metadata clear skipped: {exc}")
+            else:
+                raise
+        finally:
+            if conn is not None:
+                conn.close()
 
     _replace_stale_thumbnails = False
 
