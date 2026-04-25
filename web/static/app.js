@@ -386,24 +386,40 @@ const PhotoArchive = (() => {
 
         const otherIds = mosaicImages.filter(img => img.id !== id).map(img => img.id);
 
-        // Fire and forget with error handling
-        fetch('/api/mosaic/pick', {
+        const snapshot = {
+            renderToken: mosaicRenderToken,
+            images: mosaicImages.slice(),
+            age: mosaicAge.slice(),
+            replacements: mosaicReplacements.slice(),
+            stats: { ...compareStats },
+            propagationCounts: { ...mosaicPropagationCounts },
+        };
+
+        const savePick = fetch('/api/mosaic/pick', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ winner_id: id, loser_ids: otherIds }),
-        }).catch(() => {
-            showToast('Failed to save pick — check connection');
-        });
+        }).then(async (res) => {
+            let payload = {};
+            try {
+                payload = await res.json();
+            } catch {}
+            if (!res.ok || payload.ok === false) {
+                throw new Error(payload.error || 'Failed to save pick');
+            }
+            return payload;
+        }).then(
+            (payload) => ({ ok: true, payload }),
+            (error) => ({ ok: false, error }),
+        );
 
         // Update stats using precomputed propagation count if available
         const propagated = mosaicPropagationCounts[id] || 0;
         bumpRankingSignals(otherIds.length + propagated, otherIds.length);
         updateCompareProgress();
+        const needsPropagationPoll = propagated <= 0;
         if (propagated > 0) {
             showPropagationBadge(propagated);
-        } else {
-            // Precompute not ready — poll immediately
-            fetchPropagationCount(0);
         }
 
         // Green flash + scale pulse on the picked cell
@@ -430,10 +446,23 @@ const PhotoArchive = (() => {
         if (oldestIdx >= 0 && oldestAge >= 10) replaceIndices.push(oldestIdx);
 
         // Swap after animation completes
-        setTimeout(() => {
+        setTimeout(async () => {
+            if (mosaicRenderToken !== snapshot.renderToken) {
+                const staleSaveResult = await savePick;
+                if (!staleSaveResult.ok) {
+                    showToast('Failed to save pick');
+                }
+                mosaicBusy = false;
+                return;
+            }
+
             for (const ri of replaceIndices) {
                 const targetCell = cells[ri];
-                if (!targetCell || mosaicReplacements.length === 0) continue;
+                if (!targetCell) continue;
+                if (mosaicReplacements.length === 0) {
+                    targetCell.classList.remove('mosaic-picked');
+                    continue;
+                }
                 const newImg = mosaicReplacements.shift();
                 mosaicImages[ri] = newImg;
                 mosaicAge[ri] = 0;
@@ -450,11 +479,27 @@ const PhotoArchive = (() => {
                 scheduleMosaicImageUpgrade(targetCell, newImg, targetCell.clientHeight || 220, mosaicRenderToken, ri);
             }
 
-            mosaicBusy = false;
+            const saveResult = await savePick;
+            if (!saveResult.ok) {
+                mosaicImages = snapshot.images;
+                mosaicAge = snapshot.age;
+                mosaicReplacements = snapshot.replacements;
+                compareStats = snapshot.stats;
+                mosaicPropagationCounts = snapshot.propagationCounts;
+                mosaicBusy = false;
+                renderMosaic();
+                updateCompareProgress();
+                showToast('Failed to save pick; restored the previous grid');
+                return;
+            }
 
             // Refill replacement buffer and recompute propagation for new grid
+            if (needsPropagationPoll) {
+                fetchPropagationCount(0);
+            }
             mosaicFillReplacements();
             precomputePropagation();
+            mosaicBusy = false;
 
             if (mosaicImages.length < 2) {
                 showCompareEmpty();
