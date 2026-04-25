@@ -32,7 +32,7 @@
     <div class="bar-section bar-sorts" id="sort-toggles">
         <select id="sort-field" class="bar-select" onchange="PhotoArchive.setSortField(this.value)">
             <option value="elo">Rating</option>
-            <option value="comparisons">Comparisons</option>
+            <option value="comparisons">Confidence</option>
             <option value="date_taken">Date Taken</option>
             <option value="newest">Date Added</option>
             <option value="date_modified">Date Modified</option>
@@ -57,7 +57,7 @@
     {% include '_filters.html' %}
     <div class="bar-divider"></div>
     <div class="bar-section bar-stats">
-        <span id="compare-stat-comparisons" class="bar-stat-num">0</span><span id="propagation-badge" class="propagation-badge"></span> comparisons
+        <span id="compare-stat-comparisons" class="bar-stat-num">0</span><span id="propagation-badge" class="propagation-badge"></span> rank signals
         <span class="bar-dot">&middot;</span>
         <span id="compare-stat-pool" class="bar-stat-num">0</span> images
     </div>

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -56,6 +57,25 @@ _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/settings",
 }
 _STARTED_AT = time.time()
+
+
+def _positive_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _ranking_signal_count(image: dict) -> int:
+    return int(image.get("comparisons") or 0) + int(image.get("propagated_updates") or 0)
+
+
+def _has_ranking_signal(image: dict) -> bool:
+    return (
+        _ranking_signal_count(image) > 0
+        or abs(float(image.get("elo") or 1200.0) - 1200.0) > 0.0001
+    )
 
 
 def _git_commit() -> str | None:
@@ -1405,9 +1425,9 @@ async def mosaic_next(
     if orientation in ("landscape", "portrait"):
         candidates = [c for c in candidates if c.get("orientation") == orientation]
     if compared == "compared":
-        candidates = [c for c in candidates if c["comparisons"] > 0]
+        candidates = [c for c in candidates if _has_ranking_signal(c)]
     elif compared == "uncompared":
-        candidates = [c for c in candidates if c["comparisons"] == 0]
+        candidates = [c for c in candidates if not _has_ranking_signal(c)]
     elif compared == "confident":
         candidates = [c for c in candidates if c["comparisons"] >= 10]
     if min_stars > 0:
@@ -1457,6 +1477,8 @@ async def mosaic_next(
             "id": img["id"],
             "filename": img["filename"],
             "elo": round(img["effective_elo"], 1),
+            "comparisons": img["comparisons"],
+            "propagated_updates": img.get("propagated_updates") or 0,
             "flag": img.get("flag") or "unflagged",
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             "thumb_url": f"/api/thumb/sm/{img['id']}",
@@ -1483,50 +1505,66 @@ async def mosaic_pick(request: Request):
     K=12 per pair.
     """
     body = await request.json()
-    picked_id = body.get("winner_id")
-    other_ids = body.get("loser_ids", [])
+    picked_id = _positive_int(body.get("winner_id"))
+    raw_other_ids = body.get("loser_ids", [])
 
-    if not picked_id or not other_ids:
+    if picked_id is None or not isinstance(raw_other_ids, list) or not raw_other_ids:
         return JSONResponse({"error": "Need winner_id and loser_ids"}, status_code=400)
 
-    # Single batch query instead of N+1 individual queries
-    all_ids = [picked_id] + list(other_ids)
-    images = await db.get_images_by_ids(all_ids)
+    other_ids = []
+    seen_losers = set()
+    for value in raw_other_ids:
+        loser_id = _positive_int(value)
+        if loser_id is None:
+            return JSONResponse({"error": "loser_ids must contain valid image ids"}, status_code=400)
+        if loser_id == picked_id:
+            return JSONResponse({"error": "Winner cannot also be a loser"}, status_code=400)
+        if loser_id in seen_losers:
+            return JSONResponse({"error": "Duplicate loser_ids are not allowed"}, status_code=400)
+        seen_losers.add(loser_id)
+        other_ids.append(loser_id)
 
-    if picked_id not in images:
-        return JSONResponse({"error": "Picked image not found"}, status_code=404)
+    # Single batch query instead of N+1 individual queries
+    all_ids = [picked_id] + other_ids
+    images = await db.get_active_images_by_ids(all_ids)
+
+    missing_ids = [image_id for image_id in all_ids if image_id not in images]
+    if missing_ids:
+        return JSONResponse(
+            {"error": "Images must exist in an active online catalog", "image_ids": missing_ids},
+            status_code=400,
+        )
 
     picked = images[picked_id]
     picked_elo = picked["elo"]
     comparison_rows = []
     loser_updates = []
+    action_id = uuid.uuid4().hex
 
     conn = await db.get_db()
     try:
         for oid in other_ids:
             other = images.get(oid)
-            if not other:
-                continue
             new_picked, new_other = pairing.update_elo(picked_elo, other["elo"], k=12.0)
 
-            comparison_rows.append((picked_id, oid, picked_elo, other["elo"]))
+            comparison_rows.append((picked_id, oid, picked_elo, other["elo"], action_id))
             loser_updates.append((new_other, oid))
             picked_elo = new_picked
 
         if comparison_rows:
             await conn.executemany(
                 "INSERT INTO comparisons "
-                "(winner_id, loser_id, mode, elo_before_winner, elo_before_loser) "
-                "VALUES (?, ?, 'mosaic', ?, ?)",
+                "(winner_id, loser_id, mode, elo_before_winner, elo_before_loser, action_id) "
+                "VALUES (?, ?, 'mosaic', ?, ?, ?)",
                 comparison_rows,
             )
             await conn.executemany(
-                "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+                "UPDATE images SET elo = ?, comparisons = COALESCE(comparisons, 0) + 1 WHERE id = ?",
                 loser_updates,
             )
 
             await conn.execute(
-                "UPDATE images SET elo = ?, comparisons = comparisons + ? WHERE id = ?",
+                "UPDATE images SET elo = ?, comparisons = COALESCE(comparisons, 0) + ? WHERE id = ?",
                 (picked_elo, len(comparison_rows), picked_id),
             )
         await conn.commit()
@@ -1547,7 +1585,12 @@ async def mosaic_pick(request: Request):
         elo_propagation.propagate_mosaic(picked_id, valid_loser_ids, k=12.0)
     )
 
-    return {"ok": True, "new_elo": round(picked_elo, 1), "pairs_recorded": len(comparison_rows)}
+    return {
+        "ok": True,
+        "new_elo": round(picked_elo, 1),
+        "pairs_recorded": len(comparison_rows),
+        "action_id": action_id,
+    }
 
 
 @app.get("/api/propagation/last")
@@ -1589,9 +1632,9 @@ async def compare_next(
     if orientation in ("landscape", "portrait"):
         image_dicts = [c for c in image_dicts if c.get("orientation") == orientation]
     if compared == "compared":
-        image_dicts = [c for c in image_dicts if c["comparisons"] > 0]
+        image_dicts = [c for c in image_dicts if _has_ranking_signal(c)]
     elif compared == "uncompared":
-        image_dicts = [c for c in image_dicts if c["comparisons"] == 0]
+        image_dicts = [c for c in image_dicts if not _has_ranking_signal(c)]
     elif compared == "confident":
         image_dicts = [c for c in image_dicts if c["comparisons"] >= 10]
     if min_stars > 0:
@@ -1615,8 +1658,24 @@ async def compare_next(
         prefetch_rows.append(left)
         prefetch_rows.append(right)
         result.append({
-            "left": {"id": left["id"], "filename": left["filename"], "elo": round(left["elo"], 1), "flag": left.get("flag") or "unflagged", "thumb_url": f"/api/thumb/md/{left['id']}"},
-            "right": {"id": right["id"], "filename": right["filename"], "elo": round(right["elo"], 1), "flag": right.get("flag") or "unflagged", "thumb_url": f"/api/thumb/md/{right['id']}"},
+            "left": {
+                "id": left["id"],
+                "filename": left["filename"],
+                "elo": round(left["elo"], 1),
+                "comparisons": left["comparisons"],
+                "propagated_updates": left.get("propagated_updates") or 0,
+                "flag": left.get("flag") or "unflagged",
+                "thumb_url": f"/api/thumb/md/{left['id']}",
+            },
+            "right": {
+                "id": right["id"],
+                "filename": right["filename"],
+                "elo": round(right["elo"], 1),
+                "comparisons": right["comparisons"],
+                "propagated_updates": right.get("propagated_updates") or 0,
+                "flag": right.get("flag") or "unflagged",
+                "thumb_url": f"/api/thumb/md/{right['id']}",
+            },
         })
 
     if prefetch_rows:
@@ -1635,15 +1694,23 @@ async def compare_next(
 @app.post("/api/compare")
 async def submit_comparison(request: Request):
     body = await request.json()
-    winner_id = body.get("winner_id")
-    loser_id = body.get("loser_id")
+    winner_id = _positive_int(body.get("winner_id"))
+    loser_id = _positive_int(body.get("loser_id"))
     mode = body.get("mode", "swiss")
 
-    both = await db.get_images_by_ids([winner_id, loser_id])
+    if winner_id is None or loser_id is None:
+        return JSONResponse({"error": "winner_id and loser_id are required"}, status_code=400)
+    if winner_id == loser_id:
+        return JSONResponse({"error": "Winner and loser must be different images"}, status_code=400)
+
+    both = await db.get_active_images_by_ids([winner_id, loser_id])
     winner, loser = both.get(winner_id), both.get(loser_id)
 
     if not winner or not loser:
-        return JSONResponse({"error": "Image not found"}, status_code=404)
+        return JSONResponse(
+            {"error": "Images must exist in an active online catalog"},
+            status_code=400,
+        )
 
     k = pairing.get_k_factor(min(winner["comparisons"], loser["comparisons"]), mode)
     new_winner_elo, new_loser_elo = pairing.update_elo(winner["elo"], loser["elo"], k)
@@ -1725,6 +1792,7 @@ async def api_rankings(
             all_results.append({
                 "id": d["id"], "filename": d["filename"],
                 "elo": round(d["elo"], 1), "comparisons": d["comparisons"],
+                "propagated_updates": d.get("propagated_updates") or 0,
                 "status": d["status"], "flag": d.get("flag") or "unflagged",
                 "aspect_ratio": d.get("aspect_ratio") or 1.5,
                 **_metadata_payload(d),
@@ -1773,6 +1841,7 @@ async def api_rankings(
             "filename": d["filename"],
             "elo": round(d["elo"], 1),
             "comparisons": d["comparisons"],
+            "propagated_updates": d.get("propagated_updates") or 0,
             "status": d["status"],
             "flag": d.get("flag") or "unflagged",
             "aspect_ratio": d.get("aspect_ratio") or 1.5,
@@ -1829,6 +1898,7 @@ async def export_rankings(format: str = "json", ids: str = ""):
         images = [images_dict[i] for i in id_list if i in images_dict]
     else:
         images = await db.get_rankings(limit=10000)
+    image_dicts = [dict(img) for img in images]
     data = [
         {
             "rank": i + 1,
@@ -1836,6 +1906,7 @@ async def export_rankings(format: str = "json", ids: str = ""):
             "filepath": img["filepath"],
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
+            "propagated_updates": img.get("propagated_updates") or 0,
             "status": img["status"],
             "flag": img.get("flag") or "unflagged",
             "date_taken": img.get("date_taken"),
@@ -1850,7 +1921,7 @@ async def export_rankings(format: str = "json", ids: str = ""):
             "latitude": img.get("latitude"),
             "longitude": img.get("longitude"),
         }
-        for i, img in enumerate(images)
+        for i, img in enumerate(image_dicts)
     ]
 
     if format == "csv":
@@ -1905,6 +1976,7 @@ async def api_search(q: str = "", limit: int = 50):
             "filename": img["filename"],
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
+            "propagated_updates": img.get("propagated_updates") or 0,
             "flag": img.get("flag") or "unflagged",
             "similarity": round(score, 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
@@ -1948,6 +2020,7 @@ async def api_similar(image_id: int, limit: int = 50):
             "filename": img["filename"],
             "elo": round(img["elo"], 1),
             "comparisons": img["comparisons"],
+            "propagated_updates": img.get("propagated_updates") or 0,
             "flag": img.get("flag") or "unflagged",
             "similarity": round(float(similarities[idx]), 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
@@ -2228,17 +2301,7 @@ async def build_ai_status():
         }
 
     model_status = ai_models.get_model_status()
-
-    conn = await db.get_db()
-    try:
-        cursor = await conn.execute(
-            "SELECT COUNT(*) as c FROM images i "
-            "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE s.included = 1 AND s.online = 1 AND i.comparisons > 0"
-        )
-        compared = (await cursor.fetchone())["c"]
-    finally:
-        await conn.close()
+    compared = int(stats.get("rated_images") or 0)
 
     recent_rate = float(worker_status.get("recent_images_per_min") or 0.0)
     overall_rate = float(worker_status.get("overall_images_per_min") or 0.0)
@@ -2253,6 +2316,10 @@ async def build_ai_status():
         "remaining": remaining,
         "progress_pct": progress_pct,
         "compared": compared,
+        "rated_images": compared,
+        "direct_comparison_rows": int(stats.get("direct_comparison_rows") or 0),
+        "ranking_signal_count": int(stats.get("ranking_signal_count") or stats.get("total_comparisons") or 0),
+        "imported_ranking_without_history": int(stats.get("imported_ranking_without_history") or 0),
         "model_installed": model_status["installed"],
         "installing": model_status["install"]["running"],
         "install_status": model_status["install"]["status"],

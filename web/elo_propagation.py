@@ -214,10 +214,11 @@ async def propagate_comparison(winner_id: int, loser_id: int, k: float):
             global last_propagation_count
             if updates:
                 await conn.executemany(
-                    "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+                    "UPDATE images SET elo = ?, propagated_updates = COALESCE(propagated_updates, 0) + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
+                db.invalidate_stats_cache()
                 last_propagation_count = len(updates)
                 log.debug(f"Propagated Elo to {len(updates)} neighbors "
                          f"(winner={winner_id}, loser={loser_id})")
@@ -297,10 +298,11 @@ async def propagate_mosaic(winner_id: int, loser_ids: list[int], k: float):
             global last_propagation_count
             if updates:
                 await conn.executemany(
-                    "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+                    "UPDATE images SET elo = ?, propagated_updates = COALESCE(propagated_updates, 0) + 1 WHERE id = ?",
                     updates,
                 )
                 await conn.commit()
+                db.invalidate_stats_cache()
                 last_propagation_count = len(updates)
                 log.debug(f"Propagated mosaic to {len(updates)} neighbors "
                          f"(winner={winner_id}, {len(loser_ids)} losers)")

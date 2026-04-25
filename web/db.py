@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS images (
     filepath TEXT NOT NULL UNIQUE,
     elo REAL DEFAULT 1200.0,
     comparisons INTEGER DEFAULT 0,
+    propagated_updates INTEGER DEFAULT 0,
     status TEXT DEFAULT 'kept',
     flag TEXT DEFAULT 'unflagged',
     orientation TEXT DEFAULT NULL,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS comparisons (
     mode TEXT,
     elo_before_winner REAL,
     elo_before_loser REAL,
+    action_id TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -63,6 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_catalog_sources_active ON catalog_sources(include
 CREATE INDEX IF NOT EXISTS idx_images_elo ON images(elo DESC);
 CREATE INDEX IF NOT EXISTS idx_images_comparisons ON images(comparisons);
 CREATE INDEX IF NOT EXISTS idx_comparisons_pair ON comparisons(winner_id, loser_id);
+CREATE INDEX IF NOT EXISTS idx_comparisons_action_id ON comparisons(action_id);
 
 -- Composite indexes for fast sorted queries with status filter
 CREATE INDEX IF NOT EXISTS idx_images_status_elo ON images(status, elo DESC);
@@ -318,6 +321,7 @@ async def init_db():
                     ("source_id", "INTEGER REFERENCES catalog_sources(id)"),
                     ("orientation", "TEXT DEFAULT NULL"),
                     ("flag", "TEXT DEFAULT 'unflagged'"),
+                    ("propagated_updates", "INTEGER DEFAULT 0"),
                     ("predicted_elo", "REAL DEFAULT NULL"),
                     ("uncertainty", "REAL DEFAULT NULL"),
                     ("aspect_ratio", "REAL DEFAULT NULL"),
@@ -345,6 +349,7 @@ async def init_db():
             ("source_id", "INTEGER REFERENCES catalog_sources(id)"),
             ("orientation", "TEXT DEFAULT NULL"),
             ("flag", "TEXT DEFAULT 'unflagged'"),
+            ("propagated_updates", "INTEGER DEFAULT 0"),
             ("predicted_elo", "REAL DEFAULT NULL"),
             ("uncertainty", "REAL DEFAULT NULL"),
             ("aspect_ratio", "REAL DEFAULT NULL"),
@@ -373,6 +378,13 @@ async def init_db():
             )
         except Exception:
             pass  # Column already exists
+        try:
+            await db.execute(
+                "ALTER TABLE comparisons "
+                "ADD COLUMN action_id TEXT DEFAULT NULL"
+            )
+        except Exception:
+            pass  # Column already exists
         for col, defn in [
             ("display_name", "TEXT DEFAULT ''"),
             ("included", "INTEGER NOT NULL DEFAULT 1"),
@@ -389,6 +401,7 @@ async def init_db():
             except Exception:
                 pass  # Column already exists
         await db.execute("CREATE INDEX IF NOT EXISTS idx_images_flag ON images(flag)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_comparisons_action_id ON comparisons(action_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_images_source_id ON images(source_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_catalog_sources_path ON catalog_sources(path)")
         await db.execute(
@@ -733,13 +746,27 @@ async def purge_source_catalog_data(source_id: int) -> dict:
     db = await get_db()
     try:
         comparison_count = 0
+        comparison_decrements: dict[int, int] = {}
         if image_ids:
+            source_id_set = set(image_ids)
             for chunk in _chunked(image_ids):
                 placeholders = ",".join("?" for _ in chunk)
                 cursor = await db.execute(
                     f"DELETE FROM embeddings WHERE image_id IN ({placeholders})",
                     chunk,
                 )
+                cursor = await db.execute(
+                    f"SELECT winner_id, loser_id FROM comparisons "
+                    f"WHERE winner_id IN ({placeholders}) OR loser_id IN ({placeholders})",
+                    chunk + chunk,
+                )
+                for row in await cursor.fetchall():
+                    winner_id = int(row["winner_id"])
+                    loser_id = int(row["loser_id"])
+                    if winner_id in source_id_set and loser_id not in source_id_set:
+                        comparison_decrements[loser_id] = comparison_decrements.get(loser_id, 0) + 1
+                    elif loser_id in source_id_set and winner_id not in source_id_set:
+                        comparison_decrements[winner_id] = comparison_decrements.get(winner_id, 0) + 1
                 cursor = await db.execute(
                     f"DELETE FROM comparisons "
                     f"WHERE winner_id IN ({placeholders}) OR loser_id IN ({placeholders})",
@@ -754,12 +781,11 @@ async def purge_source_catalog_data(source_id: int) -> dict:
                     f"DELETE FROM images WHERE id IN ({placeholders})",
                     chunk,
                 )
-            await db.execute(
-                "UPDATE images SET comparisons = ("
-                "  SELECT COUNT(*) FROM comparisons "
-                "  WHERE comparisons.winner_id = images.id OR comparisons.loser_id = images.id"
-                ")"
-            )
+            if comparison_decrements:
+                await db.executemany(
+                    "UPDATE images SET comparisons = MAX(COALESCE(comparisons, 0) - ?, 0) WHERE id = ?",
+                    [(count, image_id) for image_id, count in comparison_decrements.items()],
+                )
         await db.execute("DELETE FROM catalog_sources WHERE id = ?", (source_id,))
         await _update_source_counts(db)
         await db.commit()
@@ -837,7 +863,8 @@ async def get_active_images_for_pairing():
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, i.flag, i.orientation, "
+            "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
+            "i.propagated_updates, i.flag, i.orientation, "
             "i.aspect_ratio, i.date_taken, i.camera_make, i.camera_model, i.lens, "
             "i.file_ext, i.file_size, i.width, i.height, i.file_modified_at, "
             "i.latitude, i.longitude FROM images i "
@@ -860,19 +887,30 @@ async def get_past_matchups() -> set[tuple[int, int]]:
         await db.close()
 
 
-async def record_comparison(winner_id: int, loser_id: int, mode: str, elo_before_winner: float, elo_before_loser: float, new_winner_elo: float, new_loser_elo: float):
+async def record_comparison(
+    winner_id: int,
+    loser_id: int,
+    mode: str,
+    elo_before_winner: float,
+    elo_before_loser: float,
+    new_winner_elo: float,
+    new_loser_elo: float,
+    action_id: str | None = None,
+):
     db = await get_db()
     try:
         await db.execute(
-            "INSERT INTO comparisons (winner_id, loser_id, mode, elo_before_winner, elo_before_loser) VALUES (?, ?, ?, ?, ?)",
-            (winner_id, loser_id, mode, elo_before_winner, elo_before_loser),
+            "INSERT INTO comparisons "
+            "(winner_id, loser_id, mode, elo_before_winner, elo_before_loser, action_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (winner_id, loser_id, mode, elo_before_winner, elo_before_loser, action_id),
         )
         await db.execute(
-            "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+            "UPDATE images SET elo = ?, comparisons = COALESCE(comparisons, 0) + 1 WHERE id = ?",
             (new_winner_elo, winner_id),
         )
         await db.execute(
-            "UPDATE images SET elo = ?, comparisons = comparisons + 1 WHERE id = ?",
+            "UPDATE images SET elo = ?, comparisons = COALESCE(comparisons, 0) + 1 WHERE id = ?",
             (new_loser_elo, loser_id),
         )
         await db.commit()
@@ -882,26 +920,62 @@ async def record_comparison(winner_id: int, loser_id: int, mode: str, elo_before
 
 
 async def undo_last_comparison():
-    """Undo the last comparison, restoring Elo ratings."""
+    """Undo the last comparison/action, restoring Elo ratings."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, winner_id, loser_id, elo_before_winner, elo_before_loser FROM comparisons ORDER BY id DESC LIMIT 1"
+            "SELECT id, action_id FROM comparisons ORDER BY id DESC LIMIT 1"
         )
-        row = await cursor.fetchone()
-        if row:
-            await db.execute(
-                "UPDATE images SET elo = ?, comparisons = MAX(comparisons - 1, 0) WHERE id = ?",
-                (row["elo_before_winner"], row["winner_id"]),
-            )
-            await db.execute(
-                "UPDATE images SET elo = ?, comparisons = MAX(comparisons - 1, 0) WHERE id = ?",
-                (row["elo_before_loser"], row["loser_id"]),
-            )
-            await db.execute("DELETE FROM comparisons WHERE id = ?", (row["id"],))
+        latest = await cursor.fetchone()
+        if latest:
+            action_id = latest["action_id"]
+            if action_id:
+                cursor = await db.execute(
+                    "SELECT id, winner_id, loser_id, elo_before_winner, elo_before_loser, action_id "
+                    "FROM comparisons WHERE action_id = ? ORDER BY id ASC",
+                    (action_id,),
+                )
+                rows = await cursor.fetchall()
+            else:
+                cursor = await db.execute(
+                    "SELECT id, winner_id, loser_id, elo_before_winner, elo_before_loser, action_id "
+                    "FROM comparisons WHERE id = ?",
+                    (latest["id"],),
+                )
+                rows = await cursor.fetchall()
+
+            if not rows:
+                return None
+
+            restore_elo: dict[int, float] = {}
+            comparison_decrements: dict[int, int] = {}
+            for row in rows:
+                winner_id = int(row["winner_id"])
+                loser_id = int(row["loser_id"])
+                restore_elo.setdefault(winner_id, float(row["elo_before_winner"]))
+                restore_elo.setdefault(loser_id, float(row["elo_before_loser"]))
+                comparison_decrements[winner_id] = comparison_decrements.get(winner_id, 0) + 1
+                comparison_decrements[loser_id] = comparison_decrements.get(loser_id, 0) + 1
+
+            for image_id, elo in restore_elo.items():
+                await db.execute(
+                    "UPDATE images SET elo = ?, comparisons = MAX(COALESCE(comparisons, 0) - ?, 0) WHERE id = ?",
+                    (elo, comparison_decrements.get(image_id, 0), image_id),
+                )
+
+            if action_id:
+                await db.execute("DELETE FROM comparisons WHERE action_id = ?", (action_id,))
+            else:
+                await db.execute("DELETE FROM comparisons WHERE id = ?", (latest["id"],))
             await db.commit()
             _invalidate_stats_cache()
-            return {"winner_id": row["winner_id"], "loser_id": row["loser_id"]}
+            last_row = rows[-1]
+            return {
+                "winner_id": last_row["winner_id"],
+                "loser_id": last_row["loser_id"],
+                "comparisons_undone": len(rows),
+                "action_id": action_id,
+            }
         return None
     finally:
         await db.close()
@@ -964,9 +1038,14 @@ def _ranking_filter_parts(
         params.append(orientation)
 
     if compared == "compared":
-        conditions.append("i.comparisons > 0")
+        conditions.append(
+            "(i.comparisons > 0 OR i.propagated_updates > 0 OR ABS(COALESCE(i.elo, 1200.0) - 1200.0) > 0.0001)"
+        )
     elif compared == "uncompared":
-        conditions.append("i.comparisons = 0")
+        conditions.append(
+            "i.comparisons = 0 AND COALESCE(i.propagated_updates, 0) = 0 "
+            "AND ABS(COALESCE(i.elo, 1200.0) - 1200.0) <= 0.0001"
+        )
     elif compared == "confident":
         conditions.append("i.comparisons >= 10")
 
@@ -1036,6 +1115,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 
         cursor = await db.execute(
             f"SELECT i.id, i.source_id, i.filename, i.filepath, i.elo, i.comparisons, "
+            f"i.propagated_updates, "
             f"i.status, i.flag, i.aspect_ratio, "
             f"i.date_taken, i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
             f"i.file_modified_at, i.width, i.height, i.latitude, i.longitude, i.created_at "
@@ -1260,11 +1340,61 @@ async def get_stats():
             "JOIN catalog_sources ls ON ls.id = li.source_id "
             "WHERE ws.included = 1 AND ws.online = 1 AND ls.included = 1 AND ls.online = 1"
         )
-        total_comparisons = (await cursor.fetchone())["c"]
+        direct_comparison_rows = int((await cursor.fetchone())["c"] or 0)
         cursor = await db.execute("SELECT COUNT(*) as c FROM comparisons")
-        total_catalog_comparisons = (await cursor.fetchone())["c"]
+        total_catalog_comparison_rows = int((await cursor.fetchone())["c"] or 0)
+
+        cursor = await db.execute(
+            "SELECT "
+            "COALESCE(SUM(COALESCE(i.comparisons, 0)), 0) AS image_comparison_count, "
+            "COALESCE(SUM(COALESCE(i.propagated_updates, 0)), 0) AS propagated_update_count, "
+            "SUM(CASE WHEN COALESCE(i.comparisons, 0) > 0 "
+            "      OR COALESCE(i.propagated_updates, 0) > 0 "
+            "      OR ABS(COALESCE(i.elo, 1200.0) - 1200.0) > 0.0001 "
+            "    THEN 1 ELSE 0 END) AS rated_images "
+            "FROM images i LEFT JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
+        )
+        ranking_counts = await cursor.fetchone()
+
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(cnt), 0) AS c FROM ("
+            "  SELECT c.winner_id AS image_id, COUNT(*) AS cnt FROM comparisons c GROUP BY c.winner_id "
+            "  UNION ALL "
+            "  SELECT c.loser_id AS image_id, COUNT(*) AS cnt FROM comparisons c GROUP BY c.loser_id"
+            ") x "
+            "JOIN images i ON i.id = x.image_id "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1"
+        )
+        direct_image_history_count = int((await cursor.fetchone())["c"] or 0)
+
+        cursor = await db.execute(
+            "SELECT "
+            "COALESCE(SUM(COALESCE(comparisons, 0)), 0) AS image_comparison_count, "
+            "COALESCE(SUM(COALESCE(propagated_updates, 0)), 0) AS propagated_update_count "
+            "FROM images"
+        )
+        catalog_ranking_counts = await cursor.fetchone()
 
         active = int(counts["active_images"] or 0)
+        image_comparison_count = int(ranking_counts["image_comparison_count"] or 0)
+        propagated_update_count = int(ranking_counts["propagated_update_count"] or 0)
+        imported_ranking_without_history = max(0, image_comparison_count - direct_image_history_count)
+        ranking_signal_count = direct_comparison_rows + imported_ranking_without_history + propagated_update_count
+
+        catalog_image_comparison_count = int(catalog_ranking_counts["image_comparison_count"] or 0)
+        catalog_propagated_update_count = int(catalog_ranking_counts["propagated_update_count"] or 0)
+        catalog_imported_without_history = max(
+            0,
+            catalog_image_comparison_count - (total_catalog_comparison_rows * 2),
+        )
+        catalog_ranking_signal_count = (
+            total_catalog_comparison_rows
+            + catalog_imported_without_history
+            + catalog_propagated_update_count
+        )
+
         result = {
             "total_images": active,
             "active_images": active,
@@ -1275,8 +1405,15 @@ async def get_stats():
             "maybe": 0,
             "picked": int(counts["picked"] or 0),
             "rejected": int(counts["rejected"] or 0),
-            "total_comparisons": total_comparisons,
-            "total_catalog_comparisons": total_catalog_comparisons,
+            "total_comparisons": ranking_signal_count,
+            "total_catalog_comparisons": catalog_ranking_signal_count,
+            "direct_comparison_rows": direct_comparison_rows,
+            "direct_catalog_comparison_rows": total_catalog_comparison_rows,
+            "rated_images": int(ranking_counts["rated_images"] or 0),
+            "ranking_signal_count": ranking_signal_count,
+            "catalog_ranking_signal_count": catalog_ranking_signal_count,
+            "propagated_update_count": propagated_update_count,
+            "imported_ranking_without_history": imported_ranking_without_history,
         }
         _stats_cache["data"] = result
         _stats_cache["expires"] = _time.time() + 2  # cache for 2 seconds
@@ -1310,12 +1447,33 @@ async def get_images_by_ids(image_ids: list[int]) -> dict[int, dict]:
         await db.close()
 
 
+async def get_active_images_by_ids(image_ids: list[int]) -> dict[int, dict]:
+    """Fetch active/online images by ID. Returns {id: row_dict}."""
+    if not image_ids:
+        return {}
+    unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+    db = await get_db()
+    try:
+        placeholders = ",".join("?" for _ in unique_ids)
+        cursor = await db.execute(
+            f"SELECT i.* FROM images i "
+            f"JOIN catalog_sources s ON s.id = i.source_id "
+            f"WHERE s.included = 1 AND s.online = 1 AND i.id IN ({placeholders})",
+            unique_ids,
+        )
+        rows = await cursor.fetchall()
+        return {row["id"]: dict(row) for row in rows}
+    finally:
+        await db.close()
+
+
 async def get_top_images(limit: int = 50):
     """Get top N images by Elo for top-tier refinement."""
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, i.flag, i.date_taken, "
+            "SELECT i.id, i.filename, i.filepath, i.elo, i.comparisons, "
+            "i.propagated_updates, i.flag, i.date_taken, "
             "i.camera_make, i.camera_model, i.lens, i.file_ext, i.file_size, "
             "i.width, i.height, i.file_modified_at, i.latitude, i.longitude FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "

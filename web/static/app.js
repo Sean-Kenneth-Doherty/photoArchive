@@ -367,7 +367,7 @@ const PhotoArchive = (() => {
 
         // Update stats using precomputed propagation count if available
         const propagated = mosaicPropagationCounts[id] || 0;
-        compareStats.total_comparisons = (compareStats.total_comparisons || 0) + otherIds.length + propagated;
+        bumpRankingSignals(otherIds.length + propagated, otherIds.length);
         updateCompareProgress();
         if (propagated > 0) {
             showPropagationBadge(propagated);
@@ -532,7 +532,7 @@ const PhotoArchive = (() => {
                     modelText.textContent = data.worker_message || `Loading ${data.model_id}`;
                     modelText.className = 'ai-panel-value';
                 } else if (data.embedded > 0) {
-                    modelText.textContent = `${data.compared.toLocaleString()} images compared · Elo propagation active`;
+                    modelText.textContent = `${Number(data.rated_images ?? data.compared ?? 0).toLocaleString()} ranked images · Elo propagation active`;
                     modelText.className = 'ai-panel-value trained';
                 } else {
                     modelText.textContent = 'Not started';
@@ -540,8 +540,8 @@ const PhotoArchive = (() => {
                 }
             }
             if (predText) {
-                if (data.compared > 0) {
-                    predText.textContent = `${data.compared.toLocaleString()} images ranked via comparisons + propagation`;
+                if (Number(data.ranking_signal_count || 0) > 0) {
+                    predText.textContent = `${Number(data.ranking_signal_count || 0).toLocaleString()} ranking signals`;
                 } else {
                     predText.textContent = 'None yet';
                 }
@@ -677,8 +677,24 @@ const PhotoArchive = (() => {
     let _rollupAnim = null;
     let _displayedComparisons = -1;
 
+    function displayedRankingSignalCount() {
+        return Number(compareStats.ranking_signal_count ?? compareStats.total_comparisons ?? 0);
+    }
+
+    function bumpRankingSignals(signalDelta, directDelta = 0) {
+        const next = Math.max(0, displayedRankingSignalCount() + Number(signalDelta || 0));
+        compareStats.ranking_signal_count = next;
+        compareStats.total_comparisons = next;
+        if (compareStats.direct_comparison_rows !== undefined) {
+            compareStats.direct_comparison_rows = Math.max(
+                0,
+                Number(compareStats.direct_comparison_rows || 0) + Number(directDelta || 0),
+            );
+        }
+    }
+
     function updateCompareProgress() {
-        const total = compareStats.total_comparisons || 0;
+        const total = displayedRankingSignalCount();
         const poolCount = compareStats.filtered_pool ?? compareStats['ke' + 'pt'] ?? 0;
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
@@ -735,14 +751,14 @@ const PhotoArchive = (() => {
         fetch('/api/propagation/last').then(r => r.json()).then(data => {
             const total = directCount + (data.count || 0);
             if (total > 0) {
-                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + total;
+                bumpRankingSignals(total, directCount);
                 updateCompareProgress();
                 if (data.count > 0) showPropagationBadge(data.count);
             }
         }).catch(() => {
             // Propagation fetch failed — still apply direct count
             if (directCount > 0) {
-                compareStats.total_comparisons = (compareStats.total_comparisons || 0) + directCount;
+                bumpRankingSignals(directCount, directCount);
                 updateCompareProgress();
             }
         });
@@ -795,10 +811,16 @@ const PhotoArchive = (() => {
         compareBusy = true;
         try {
             const res = await fetch('/api/compare/undo', { method: 'POST' });
-            if (res.ok && compareIndex > 0) {
-                compareIndex--;
-                compareStats.total_comparisons = Math.max(0, (compareStats.total_comparisons || 1) - 1);
-                showComparePair();
+            if (res.ok) {
+                const result = await res.json();
+                bumpRankingSignals(-Number(result.comparisons_undone || 1), -Number(result.comparisons_undone || 1));
+                updateCompareProgress();
+                if (compareMode !== 'mosaic' && compareIndex > 0) {
+                    compareIndex--;
+                    showComparePair();
+                } else if (compareMode === 'mosaic') {
+                    showToast(`Undid ${Number(result.comparisons_undone || 1)} comparison${Number(result.comparisons_undone || 1) === 1 ? '' : 's'}`);
+                }
             }
         } finally {
             compareBusy = false;
@@ -974,6 +996,7 @@ const PhotoArchive = (() => {
     let searchDebounce = null;
     let rankingsLoading = false;
     let rankingsExhausted = false;
+    let libraryRequestGeneration = 0;
     let thumbHeight = 220;
     let libraryImages = [];
     let lightboxIndex = -1;
@@ -1181,6 +1204,17 @@ const PhotoArchive = (() => {
         return rankingsOffset === 0 ? INITIAL_RANKINGS_PAGE_SIZE : RANKINGS_PAGE_SIZE;
     }
 
+    function resetLibraryResults({ clearBatch = false } = {}) {
+        libraryRequestGeneration++;
+        rankingsOffset = 0;
+        rankingsExhausted = false;
+        libraryImages = [];
+        lastDateGroup = null;
+        rankingsLoading = false;
+        selectedLibraryIndex = -1;
+        if (clearBatch) clearBatchSelection();
+    }
+
     function scheduleCrossViewWarmup(fromView) {
         if (fromView === 'compare') {
             const libraryUrl = buildRankingsUrl({
@@ -1286,8 +1320,7 @@ const PhotoArchive = (() => {
     };
 
     async function initLibrary() {
-        rankingsOffset = 0;
-        rankingsExhausted = false;
+        resetLibraryResults();
         restoreFilters();
 
         // Fire all init requests in parallel — don't block on rankings
@@ -1392,10 +1425,7 @@ const PhotoArchive = (() => {
                     if (clearBtn) clearBtn.classList.toggle('hidden', !searchQuery);
                     updateSimilaritySortOption();
                     // Search is a filter — reload rankings with the query
-                    rankingsOffset = 0;
-                    rankingsExhausted = false;
-                    libraryImages = [];
-                    rankingsLoading = false;
+                    resetLibraryResults({ clearBatch: true });
                     loadRankings(true);
                 }, 300);
             });
@@ -1437,10 +1467,7 @@ const PhotoArchive = (() => {
         if (input) input.value = '';
         if (clearBtn) clearBtn.classList.add('hidden');
         updateSimilaritySortOption();
-        rankingsOffset = 0;
-        rankingsExhausted = false;
-        libraryImages = [];
-        rankingsLoading = false;
+        resetLibraryResults({ clearBatch: true });
         loadRankings(true);
     }
 
@@ -1483,13 +1510,8 @@ const PhotoArchive = (() => {
 
     function setRankingsSort(sort) {
         rankingsSort = sort;
-        rankingsOffset = 0;
-        rankingsExhausted = false;
-        libraryImages = [];
-        lastDateGroup = null;
+        resetLibraryResults({ clearBatch: true });
         dateGroupsData = [];
-        // Clear grid only after new data arrives to avoid blank flash
-        rankingsLoading = false; // allow loadRankings to proceed
         loadRankings(true);  // true = clear grid before appending
         updateDateScrubber();
     }
@@ -1641,13 +1663,17 @@ const PhotoArchive = (() => {
     async function loadRankings(clearFirst = false) {
         if (rankingsLoading) return;
         rankingsLoading = true;
+        const requestGeneration = libraryRequestGeneration;
         const requestOffset = rankingsOffset;
         const limit = currentLibraryPageSize();
         let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
         if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
         const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
         if (!data) {
-            rankingsLoading = false;
+            if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
+            return;
+        }
+        if (requestGeneration !== libraryRequestGeneration) {
             return;
         }
         if (requestOffset === 0 && typeof data.total_images === 'number') {
@@ -1749,7 +1775,7 @@ const PhotoArchive = (() => {
             const label = formatShortDate(img.created_at) || 'Added';
             return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
         }
-        return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} cmp</span>`;
+        return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} signal${Number(img.comparisons || 0) === 1 ? '' : 's'}</span>`;
     }
 
     function formatDateGroup(dateStr) {
@@ -1981,9 +2007,21 @@ const PhotoArchive = (() => {
     let loupeCurrentImage = null;
     let loupeFullLoadTimer = null;
     let loupeFullLoadToken = 0;
-    let loupeTierProbes = [];
+    const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
+
+    function cancelLoupeProbes() {
+        for (const probe of Array.from(loupeTierProbes)) {
+            probe.cancelled = true;
+            if (probe.timer) clearTimeout(probe.timer);
+            probe.img.onload = null;
+            probe.img.onerror = null;
+            probe.img.src = '';
+            loupeTierProbes.delete(probe);
+            probe.resolve(false);
+        }
+    }
 
     function showLoupeImage(img, direction = 0) {
         const loupe = document.getElementById('loupe');
@@ -1995,7 +2033,7 @@ const PhotoArchive = (() => {
         const token = ++loupeImageToken;
         loupeCurrentImage = img;
         loupeFullLoadToken = 0;
-        loupeTierProbes = [];
+        cancelLoupeProbes();
         if (loupeFullLoadTimer) {
             clearTimeout(loupeFullLoadTimer);
             loupeFullLoadTimer = null;
@@ -2036,7 +2074,7 @@ const PhotoArchive = (() => {
 
         const stars = eloToStars(img.elo, img.comparisons);
         const starStr = stars > 0 ? '★'.repeat(stars) + '☆'.repeat(5 - stars) + '  ' : '';
-        if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} comparisons`;
+        if (statsEl) statsEl.textContent = `${starStr}${img.elo} Elo · ${img.comparisons} ranking signals`;
         updateLoupeFlagDisplay(img.flag || 'unflagged');
 
         updateFilmstripActive();
@@ -2150,52 +2188,56 @@ const PhotoArchive = (() => {
     function loadLoupeTier(img, url, rank, token, { adoptDimensions = false, timeoutMs = 0 } = {}) {
         if (!url) return Promise.resolve(false);
         return new Promise((resolve) => {
-            const probe = new Image();
-            let settled = false;
-            let timer = null;
-            loupeTierProbes.push(probe);
-
-            const releaseProbe = () => {
-                const idx = loupeTierProbes.indexOf(probe);
-                if (idx >= 0) loupeTierProbes.splice(idx, 1);
+            const probeImg = new Image();
+            const probe = {
+                img: probeImg,
+                timer: null,
+                resolve,
+                settled: false,
+                cancelled: false,
             };
+            loupeTierProbes.add(probe);
+
             const finish = (loaded) => {
-                if (settled) return;
-                settled = true;
-                if (timer) clearTimeout(timer);
+                if (probe.settled) return;
+                probe.settled = true;
+                if (probe.timer) clearTimeout(probe.timer);
+                loupeTierProbes.delete(probe);
                 resolve(loaded);
             };
 
-            probe.decoding = 'async';
-            if ('fetchPriority' in probe) probe.fetchPriority = rank >= 2 ? 'high' : 'auto';
-            probe.onload = () => {
-                releaseProbe();
-                if (!probe.naturalWidth || !probe.naturalHeight) {
+            probeImg.decoding = 'async';
+            if ('fetchPriority' in probeImg) probeImg.fetchPriority = rank >= 2 ? 'high' : 'auto';
+            probeImg.onload = () => {
+                if (probe.cancelled) {
+                    finish(false);
+                    return;
+                }
+                if (!probeImg.naturalWidth || !probeImg.naturalHeight) {
                     finish(false);
                     return;
                 }
                 if (isCurrentLoupeImage(img, token) && rank > loupeDisplayedTierRank) {
-                    if (adoptDimensions && probe.naturalWidth > 0 && probe.naturalHeight > 0) {
-                        loupeAdoptSourceDimensions(probe.naturalWidth, probe.naturalHeight);
+                    if (adoptDimensions && probeImg.naturalWidth > 0 && probeImg.naturalHeight > 0) {
+                        loupeAdoptSourceDimensions(probeImg.naturalWidth, probeImg.naturalHeight);
                     }
 
                     const loupeImg = document.getElementById('loupe-img');
                     if (loupeImg) {
                         loupeDisplayedTierRank = rank;
-                        loupeImg.src = probe.src;
+                        loupeImg.src = probeImg.src;
                         updateLoupeFlagDisplay(img.flag || 'unflagged');
                     }
                 }
                 finish(true);
             };
-            probe.onerror = () => {
-                releaseProbe();
+            probeImg.onerror = () => {
                 finish(false);
             };
             if (timeoutMs > 0) {
-                timer = setTimeout(() => finish(false), timeoutMs);
+                probe.timer = setTimeout(() => finish(false), timeoutMs);
             }
-            probe.src = url;
+            probeImg.src = url;
         });
     }
 
@@ -2500,13 +2542,13 @@ const PhotoArchive = (() => {
         }
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
+        cancelLoupeProbes();
         if (loupeFullLoadTimer) {
             clearTimeout(loupeFullLoadTimer);
             loupeFullLoadTimer = null;
         }
         loupeCurrentImage = null;
         loupeFullLoadToken = 0;
-        loupeTierProbes = [];
         loupeDisplayedTierRank = -1;
         loupeIsFit = true;
         loupeZoomMode = 'fit';
@@ -2548,11 +2590,7 @@ const PhotoArchive = (() => {
         // Reload the appropriate view based on which page we're on
         const grid = document.getElementById('rankings-grid');
         if (grid) {
-            rankingsOffset = 0;
-            rankingsExhausted = false;
-            libraryImages = [];
-            lastDateGroup = null;
-            rankingsLoading = false;
+            resetLibraryResults({ clearBatch: true });
             loadRankings(true);
             if (isDateSortActive()) updateDateScrubber();
             if (libraryView === 'map') loadMap();
@@ -2697,7 +2735,7 @@ const PhotoArchive = (() => {
     }
 
     function eloToStars(elo, comparisons) {
-        if (comparisons === 0) return 0;
+        if (comparisons === 0 && Math.abs(Number(elo || 1200) - 1200) < 0.01) return 0;
         if (elo >= 1500) return 5;
         if (elo >= 1350) return 4;
         if (elo >= 1250) return 3;
@@ -2712,7 +2750,7 @@ const PhotoArchive = (() => {
     }
 
     function getTierClass(elo, comparisons) {
-        if (comparisons < 5) return '';
+        if (comparisons < 5 && Math.abs(Number(elo || 1200) - 1200) < 0.01) return '';
         if (elo >= 1500) return 'tier-gold';
         if (elo >= 1350) return 'tier-silver';
         if (elo >= 1250) return 'tier-bronze';
@@ -2733,12 +2771,16 @@ const PhotoArchive = (() => {
         const sortToggles = document.getElementById('sort-toggles');
         if (sortToggles) sortToggles.style.opacity = '0.3';
 
+        libraryRequestGeneration++;
+        clearBatchSelection();
         libraryImages = [];
         const grid = document.getElementById('rankings-grid');
         grid.innerHTML = '';
 
+        const requestGeneration = libraryRequestGeneration;
         const res = await fetch(`/api/similar/${img.id}?limit=100`);
         const data = await res.json();
+        if (requestGeneration !== libraryRequestGeneration) return;
 
         for (let i = 0; i < data.images.length; i++) {
             const simg = data.images[i];
@@ -2917,6 +2959,8 @@ const PhotoArchive = (() => {
     let mapZoom = 2;
     let libraryView = 'grid';
     let leafletLoaded = false;
+    let leafletLoadPromise = null;
+    let mapRequestGeneration = 0;
 
     function setLibraryView(mode) {
         libraryView = mode;
@@ -2926,6 +2970,7 @@ const PhotoArchive = (() => {
         const mapBtn = document.getElementById('view-map-btn');
 
         if (mode === 'map') {
+            clearBatchSelection();
             grid.classList.add('hidden');
             mapEl.classList.remove('hidden');
             gridBtn.classList.remove('active');
@@ -2943,8 +2988,20 @@ const PhotoArchive = (() => {
         }
     }
 
+    function loadExternalScript(src) {
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = src;
+            script.onload = resolve;
+            script.onerror = () => reject(new Error(`Failed to load ${src}`));
+            document.head.appendChild(script);
+        });
+    }
+
     async function loadLeaflet() {
         if (leafletLoaded) return;
+        if (leafletLoadPromise) return leafletLoadPromise;
+        leafletLoadPromise = (async () => {
         // Load Leaflet CSS
         const link = document.createElement('link');
         link.rel = 'stylesheet';
@@ -2962,30 +3019,71 @@ const PhotoArchive = (() => {
         document.head.appendChild(mcDefaultLink);
 
         // Load Leaflet JS
-        await new Promise((resolve, reject) => {
-            const script = document.createElement('script');
-            script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-            script.onload = resolve;
-            script.onerror = reject;
-            document.head.appendChild(script);
-        });
+        await loadExternalScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js');
 
         // Load MarkerCluster JS
-        await new Promise((resolve, reject) => {
-            const script = document.createElement('script');
-            script.src = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
-            script.onload = resolve;
-            script.onerror = reject;
-            document.head.appendChild(script);
-        });
+        await loadExternalScript('https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js');
+
+        if (!window.L || typeof window.L.markerClusterGroup !== 'function') {
+            throw new Error('Map library did not initialize');
+        }
 
         leafletLoaded = true;
+        })();
+        try {
+            await leafletLoadPromise;
+        } catch (e) {
+            leafletLoadPromise = null;
+            throw e;
+        }
+    }
+
+    function showMapError(container, message) {
+        if (!container) return;
+        let errorEl = container.querySelector('.map-error');
+        if (!errorEl) {
+            errorEl = document.createElement('div');
+            errorEl.className = 'map-error';
+            container.appendChild(errorEl);
+        }
+        errorEl.textContent = message;
+    }
+
+    function clearMapError(container) {
+        container?.querySelector('.map-error')?.remove();
+    }
+
+    function buildMapPopup(markerData) {
+        const wrap = document.createElement('div');
+        wrap.className = 'map-popup';
+
+        const img = document.createElement('img');
+        img.src = markerData.thumb_url || '';
+        img.alt = markerData.filename || '';
+        img.className = 'map-popup-thumb';
+        img.addEventListener('click', () => openLightboxById(Number(markerData.id)));
+        wrap.appendChild(img);
+
+        const name = document.createElement('div');
+        name.className = 'map-popup-name';
+        name.textContent = markerData.filename || '';
+        wrap.appendChild(name);
+        return wrap;
     }
 
     async function loadMap() {
-        await loadLeaflet();
-
         const container = document.getElementById('map-container');
+        const requestGeneration = ++mapRequestGeneration;
+        try {
+            await loadLeaflet();
+        } catch (e) {
+            console.error('Map library load error:', e);
+            showMapError(container, 'Map unavailable. Check your connection and try again.');
+            return;
+        }
+        if (requestGeneration !== mapRequestGeneration) return;
+        clearMapError(container);
+
         if (!mapInstance) {
             mapInstance = L.map(container).setView(mapCenter, mapZoom);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -3001,6 +3099,7 @@ const PhotoArchive = (() => {
         const url = `/api/map/markers?${filterParams().replace(/^&/, '')}`;
         try {
             const data = await fetch(url).then(r => r.json());
+            if (requestGeneration !== mapRequestGeneration) return;
             if (mapMarkerLayer) {
                 mapInstance.removeLayer(mapMarkerLayer);
             }
@@ -3008,13 +3107,7 @@ const PhotoArchive = (() => {
 
             for (const m of data.markers) {
                 const marker = L.marker([m.lat, m.lng]);
-                marker.bindPopup(
-                    `<div class="map-popup">` +
-                    `<img src="${m.thumb_url}" alt="${m.filename}" class="map-popup-thumb" ` +
-                    `onclick="PhotoArchive.openLightboxById(${m.id})">` +
-                    `<div class="map-popup-name">${m.filename}</div></div>`,
-                    { maxWidth: 200 }
-                );
+                marker.bindPopup(buildMapPopup(m), { maxWidth: 200 });
                 mapMarkerLayer.addLayer(marker);
             }
             mapInstance.addLayer(mapMarkerLayer);
@@ -3036,6 +3129,7 @@ const PhotoArchive = (() => {
             }
         } catch (e) {
             console.error('Map load error:', e);
+            showMapError(container, 'Map markers could not be loaded.');
         }
     }
 
