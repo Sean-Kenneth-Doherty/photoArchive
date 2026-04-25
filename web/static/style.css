@@ -451,9 +451,9 @@ button:disabled {
 
 .progress-bar {
     width: 100%;
-    height: 6px;
+    height: 8px;
     background: #333;
-    border-radius: 3px;
+    border-radius: 4px;
     overflow: hidden;
 }
 
@@ -940,7 +940,7 @@ button:disabled {
 }
 
 .work-row-bar {
-    height: 12px;
+    height: 8px;
     background: #151515;
     border-radius: 999px;
     overflow: hidden;
@@ -1165,7 +1165,7 @@ button:disabled {
 }
 
 .cache-progress {
-    height: 10px;
+    height: 8px;
     background: #151515;
     border-radius: 999px;
     overflow: hidden;
@@ -1204,7 +1204,7 @@ button:disabled {
 }
 
 .cache-budget-bar {
-    height: 14px;
+    height: 8px;
     background: #151515;
     border-radius: 999px;
     overflow: hidden;
