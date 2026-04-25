@@ -7,6 +7,7 @@ const PhotoArchive = (() => {
     let compareIndex = 0;
     let compareMode = 'swiss';
     let compareBusy = false;
+    let compareActionSeq = 0;
     let compareStats = {};
     let compareImageToken = 0;
     const compareDisplayedTier = { left: -1, right: -1 };
@@ -480,7 +481,7 @@ const PhotoArchive = (() => {
                         if (img.thumb_url) replacementUrls.push(img.thumb_url);
                     }
                 }
-                await warmImageUrls(replacementUrls, generation);
+                warmImageUrls(replacementUrls, generation).catch(() => {});
             } catch {} finally {
                 mosaicFilling = false;
             }
@@ -493,12 +494,14 @@ const PhotoArchive = (() => {
     }
 
     let mosaicBusy = false;
+    let mosaicActionSeq = 0;
 
     function mosaicClick(id) {
         if (mosaicBusy) return;
         const idx = mosaicImages.findIndex(img => img.id === id);
         if (idx === -1) return;
         mosaicBusy = true;
+        const actionSeq = ++mosaicActionSeq;
 
         const otherIds = mosaicImages.filter(img => img.id !== id).map(img => img.id);
 
@@ -561,22 +564,13 @@ const PhotoArchive = (() => {
         const replaceIndices = [idx];
         if (oldestIdx >= 0 && oldestAge >= 10) replaceIndices.push(oldestIdx);
 
-        // Swap after animation completes
-        setTimeout(async () => {
-            if (mosaicRenderToken !== snapshot.renderToken) {
-                const staleSaveResult = await savePick;
-                if (!staleSaveResult.ok) {
-                    showToast('Failed to save pick');
-                }
-                mosaicBusy = false;
-                return;
-            }
-
+        if (mosaicRenderToken === snapshot.renderToken) {
             for (const ri of replaceIndices) {
                 const targetCell = cells[ri];
                 if (!targetCell) continue;
                 if (mosaicReplacements.length === 0) {
                     targetCell.classList.remove('mosaic-picked');
+                    mosaicFillReplacements();
                     continue;
                 }
                 const newImg = mosaicReplacements.shift();
@@ -594,18 +588,25 @@ const PhotoArchive = (() => {
                 targetCell.classList.remove('mosaic-picked');
                 scheduleMosaicImageUpgrade(targetCell, newImg, targetCell.clientHeight || 220, mosaicRenderToken, ri);
             }
+            mosaicFillReplacements();
+        }
 
-            const saveResult = await savePick;
+        mosaicBusy = false;
+
+        savePick.then((saveResult) => {
             if (!saveResult.ok) {
-                mosaicImages = snapshot.images;
-                mosaicAge = snapshot.age;
-                mosaicReplacements = snapshot.replacements;
-                compareStats = snapshot.stats;
-                mosaicPropagationCounts = snapshot.propagationCounts;
-                mosaicBusy = false;
-                renderMosaic();
-                updateCompareProgress();
-                showToast('Failed to save pick; restored the previous grid');
+                if (mosaicRenderToken === snapshot.renderToken && mosaicActionSeq === actionSeq) {
+                    mosaicImages = snapshot.images;
+                    mosaicAge = snapshot.age;
+                    mosaicReplacements = snapshot.replacements;
+                    compareStats = snapshot.stats;
+                    mosaicPropagationCounts = snapshot.propagationCounts;
+                    renderMosaic();
+                    updateCompareProgress();
+                    showToast('Failed to save pick; restored the previous grid');
+                } else {
+                    showToast('Failed to save pick');
+                }
                 return;
             }
 
@@ -615,12 +616,11 @@ const PhotoArchive = (() => {
             }
             mosaicFillReplacements();
             precomputePropagation();
-            mosaicBusy = false;
 
             if (mosaicImages.length < 2) {
                 showCompareEmpty();
             }
-        }, 150);
+        });
     }
 
     function showToast(msg) {
@@ -998,37 +998,48 @@ const PhotoArchive = (() => {
         _propagationBadgeTimer = setTimeout(() => badge.classList.remove('visible'), 3000);
     }
 
-    async function submitComparison(side) {
+    function submitComparison(side) {
         if (compareBusy || compareIndex >= comparePairs.length) return;
         compareBusy = true;
+        const actionSeq = ++compareActionSeq;
 
         const pair = comparePairs[compareIndex];
+        const previousIndex = compareIndex;
         const winnerId = side === 'left' ? pair.left.id : pair.right.id;
         const loserId = side === 'left' ? pair.right.id : pair.left.id;
 
-        try {
-            const res = await fetch('/api/compare', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ winner_id: winnerId, loser_id: loserId, mode: compareMode }),
-            });
-            if (res.ok) {
-                const result = await res.json();
-                // Update local elo for display
-                if (side === 'left') {
-                    pair.left.elo = result.winner_elo;
-                    pair.right.elo = result.loser_elo;
-                } else {
-                    pair.right.elo = result.winner_elo;
-                    pair.left.elo = result.loser_elo;
-                }
-                compareIndex++;
-                showComparePair();
-                fetchPropagationCount(1);
+        compareIndex++;
+        showComparePair();
+        compareBusy = false;
+
+        fetch('/api/compare', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ winner_id: winnerId, loser_id: loserId, mode: compareMode }),
+        }).then(async (res) => {
+            let result = {};
+            try {
+                result = await res.json();
+            } catch {}
+            if (!res.ok) throw new Error(result.error || 'Failed to save comparison');
+
+            if (side === 'left') {
+                pair.left.elo = result.winner_elo;
+                pair.right.elo = result.loser_elo;
+            } else {
+                pair.right.elo = result.winner_elo;
+                pair.left.elo = result.loser_elo;
             }
-        } finally {
-            compareBusy = false;
-        }
+            fetchPropagationCount(1);
+        }).catch(() => {
+            if (compareActionSeq === actionSeq && compareMode !== 'mosaic') {
+                compareIndex = previousIndex;
+                showComparePair();
+                showToast('Failed to save comparison; restored the previous pair');
+            } else {
+                showToast('Failed to save comparison');
+            }
+        });
     }
 
     async function undoComparison() {
