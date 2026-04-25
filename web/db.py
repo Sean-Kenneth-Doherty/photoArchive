@@ -1029,6 +1029,7 @@ def _ranking_filter_parts(
     orientation: str = "", compared: str = "", min_stars: int = 0,
     folder: str = "", flag: str = "", date_taken: str = "",
     file_type: str = "", camera: str = "", lens: str = "",
+    visible_thumb_size: str = "", cache_root: str = "",
 ) -> tuple[list[str], list]:
     conditions = ["s.included = 1", "s.online = 1"]
     params = []
@@ -1086,14 +1087,50 @@ def _ranking_filter_parts(
         conditions.append("i.lens = ?")
         params.append(lens)
 
+    if visible_thumb_size and cache_root:
+        conditions.append(
+            "EXISTS ("
+            "  SELECT 1 FROM cache_entries c "
+            "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+            ")"
+        )
+        params.extend([cache_root, visible_thumb_size])
+
     return conditions, params
+
+
+async def get_cached_image_ids(
+    image_ids: list[int],
+    size: str,
+    cache_root: str,
+    chunk_size: int = 900,
+) -> set[int]:
+    """Return IDs with a cache_entries row for the exact cache root/tier."""
+    if not image_ids or not size or not cache_root:
+        return set()
+    unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+    cached: set[int] = set()
+    db = await get_db()
+    try:
+        for chunk in _chunked(unique_ids, chunk_size):
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await db.execute(
+                "SELECT image_id FROM cache_entries "
+                f"WHERE cache_root = ? AND size = ? AND image_id IN ({placeholders})",
+                [cache_root, size] + chunk,
+            )
+            cached.update(int(row["image_id"]) for row in await cursor.fetchall())
+        return cached
+    finally:
+        await db.close()
 
 
 async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
                        orientation: str = "", compared: str = "", min_stars: int = 0,
                        folder: str = "", flag: str = "", date_taken: str = "",
                        file_type: str = "", camera: str = "", lens: str = "",
-                       id_filter: set = None):
+                       id_filter: set = None,
+                       visible_thumb_size: str = "", cache_root: str = ""):
     db = await get_db()
     try:
         order = RANKING_SORTS.get(sort, "elo DESC")
@@ -1101,6 +1138,7 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
         )
 
         if id_filter is not None:
@@ -1131,13 +1169,15 @@ async def get_rankings(limit: int = 100, offset: int = 0, sort: str = "elo",
 async def count_rankings(orientation: str = "", compared: str = "", min_stars: int = 0,
                          folder: str = "", flag: str = "", date_taken: str = "",
                          file_type: str = "", camera: str = "", lens: str = "",
-                         id_filter: set = None) -> int:
+                         id_filter: set = None,
+                         visible_thumb_size: str = "", cache_root: str = "") -> int:
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
         )
         if id_filter is not None:
             if not id_filter:
@@ -1159,13 +1199,15 @@ async def count_rankings(orientation: str = "", compared: str = "", min_stars: i
 
 async def get_date_groups(orientation: str = "", compared: str = "", min_stars: int = 0,
                           folder: str = "", flag: str = "", date_taken: str = "",
-                          file_type: str = "", camera: str = "", lens: str = ""):
+                          file_type: str = "", camera: str = "", lens: str = "",
+                          visible_thumb_size: str = "", cache_root: str = ""):
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken,
             file_type=file_type, camera=camera, lens=lens,
+            visible_thumb_size=visible_thumb_size, cache_root=cache_root,
         )
         cursor = await db.execute(
             "SELECT "
@@ -1196,7 +1238,8 @@ async def get_date_groups(orientation: str = "", compared: str = "", min_stars: 
 
 async def get_map_markers(orientation: str = "", compared: str = "", min_stars: int = 0,
                           folder: str = "", flag: str = "", date_taken: str = "",
-                          file_type: str = "", camera: str = "", lens: str = ""):
+                          file_type: str = "", camera: str = "", lens: str = "",
+                          visible_thumb_size: str = "", cache_root: str = ""):
     db = await get_db()
     try:
         conditions, params = _ranking_filter_parts(
@@ -1212,13 +1255,46 @@ async def get_map_markers(orientation: str = "", compared: str = "", min_stars: 
         )
         total_count = int((await total_cursor.fetchone())["count"] or 0)
 
-        marker_conditions = conditions + ["i.latitude IS NOT NULL", "i.longitude IS NOT NULL"]
+        gps_conditions = conditions + ["i.latitude IS NOT NULL", "i.longitude IS NOT NULL"]
+        gps_total_cursor = await db.execute(
+            f"SELECT COUNT(*) AS count FROM images i "
+            f"JOIN catalog_sources s ON s.id = i.source_id "
+            f"WHERE {' AND '.join(gps_conditions)}",
+            params,
+        )
+        gps_total_count = int((await gps_total_cursor.fetchone())["count"] or 0)
+
+        marker_conditions = list(gps_conditions)
+        marker_params = list(params)
+        visible_total_count = total_count
+        if visible_thumb_size and cache_root:
+            marker_conditions.append(
+                "EXISTS ("
+                "  SELECT 1 FROM cache_entries c "
+                "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+                ")"
+            )
+            marker_params.extend([cache_root, visible_thumb_size])
+            visible_conditions = list(conditions) + [
+                "EXISTS ("
+                "  SELECT 1 FROM cache_entries c "
+                "  WHERE c.cache_root = ? AND c.size = ? AND c.image_id = i.id"
+                ")"
+            ]
+            visible_cursor = await db.execute(
+                f"SELECT COUNT(*) AS count FROM images i "
+                f"JOIN catalog_sources s ON s.id = i.source_id "
+                f"WHERE {' AND '.join(visible_conditions)}",
+                params + [cache_root, visible_thumb_size],
+            )
+            visible_total_count = int((await visible_cursor.fetchone())["count"] or 0)
+
         cursor = await db.execute(
             "SELECT i.id, i.filename, i.latitude, i.longitude FROM images i "
             "JOIN catalog_sources s ON s.id = i.source_id "
             f"WHERE {' AND '.join(marker_conditions)} "
             "ORDER BY i.date_taken DESC, i.id DESC",
-            params,
+            marker_params,
         )
         markers = [
             {
@@ -1233,7 +1309,10 @@ async def get_map_markers(orientation: str = "", compared: str = "", min_stars: 
         return {
             "markers": markers,
             "total_count": total_count,
+            "visible_count": visible_total_count,
             "gps_count": len(markers),
+            "gps_total_count": gps_total_count,
+            "hidden_pending_thumbnails": max(gps_total_count - len(markers), 0),
         }
     finally:
         await db.close()

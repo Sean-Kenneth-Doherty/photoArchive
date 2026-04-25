@@ -195,6 +195,14 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
 
         self.assertFalse(thumbnails.touch_cached_signature("sm", 1, "sig"))
 
+    def test_touch_cached_signature_ignores_sqlite_connect_lock(self):
+        def locked_connect():
+            raise sqlite3.OperationalError("database is locked")
+
+        thumbnails._db_connect = locked_connect
+
+        self.assertFalse(thumbnails.touch_cached_signature("sm", 1, "sig"))
+
     def test_flush_write_queue_requeues_after_sqlite_lock(self):
         class LockedConn:
             def execute(self, *_args, **_kwargs):
@@ -207,6 +215,20 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         with thumbnails._write_queue_lock:
             thumbnails._write_queue.append(("sm", 1, "sig", path, 123, time.time()))
         thumbnails._db_connect = lambda: LockedConn()
+
+        self.assertFalse(thumbnails._flush_write_queue())
+        with thumbnails._write_queue_lock:
+            self.assertEqual(len(thumbnails._write_queue), 1)
+
+    def test_flush_write_queue_requeues_after_sqlite_connect_lock(self):
+        path = os.path.join(self.tempdir.name, "sm", "1.jpg")
+        with thumbnails._write_queue_lock:
+            thumbnails._write_queue.append(("sm", 1, "sig", path, 123, time.time()))
+
+        def locked_connect():
+            raise sqlite3.OperationalError("database is locked")
+
+        thumbnails._db_connect = locked_connect
 
         self.assertFalse(thumbnails._flush_write_queue())
         with thumbnails._write_queue_lock:

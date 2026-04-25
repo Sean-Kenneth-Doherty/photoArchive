@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,10 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.old_schedule_pairing_propagation = app_module._schedule_pairing_propagation
         self.old_get_matrix = elo_propagation.embed_cache.get_matrix
         self.old_get_index = elo_propagation.embed_cache.get_index
+        self.old_prefetch_images = app_module.thumbnails.prefetch_images
+        self.old_schedule_full_image_cache = app_module.thumbnails.schedule_full_image_cache
+        self.old_has_cached_fast = app_module.thumbnails.has_cached_fast
+        self.old_fast_disk_path_entry = app_module.thumbnails.fast_disk_path_entry
 
         db.DB_PATH = os.path.join(self.tempdir.name, "photoarchive-test.db")
         db.invalidate_stats_cache()
@@ -42,6 +47,10 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         app_module._schedule_pairing_propagation = self.old_schedule_pairing_propagation
         elo_propagation.embed_cache.get_matrix = self.old_get_matrix
         elo_propagation.embed_cache.get_index = self.old_get_index
+        app_module.thumbnails.prefetch_images = self.old_prefetch_images
+        app_module.thumbnails.schedule_full_image_cache = self.old_schedule_full_image_cache
+        app_module.thumbnails.has_cached_fast = self.old_has_cached_fast
+        app_module.thumbnails.fast_disk_path_entry = self.old_fast_disk_path_entry
         db.DB_PATH = self.old_db_path
         db.invalidate_stats_cache()
         self.tempdir.cleanup()
@@ -202,6 +211,92 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["propagated_update_count"], 1)
         self.assertEqual(stats["ranking_signal_count"], 8)
         self.assertEqual(stats["total_comparisons"], 8)
+
+    async def test_warm_images_deduplicates_ids_and_ignores_invalid_values(self):
+        source = await self._source()
+        first = await self._image(source["id"], "first.jpg")
+        second = await self._image(source["id"], "second.jpg")
+        prefetch_calls = []
+        full_calls = []
+
+        async def fake_prefetch(rows, tier, limit=None, hot=False):
+            prefetch_calls.append({
+                "tier": tier,
+                "ids": [row["id"] for row in rows],
+                "limit": limit,
+                "hot": hot,
+            })
+            return len(rows)
+
+        async def fake_schedule_full(filepath, image_id, *, hot=True):
+            full_calls.append({"id": image_id, "hot": hot, "filepath": filepath})
+
+        app_module.thumbnails.prefetch_images = fake_prefetch
+        app_module.thumbnails.schedule_full_image_cache = fake_schedule_full
+
+        result = await app_module.warm_images(JsonRequest({
+            "tiers": {
+                "md": [first, str(first), -1, "bad", second, 999999],
+                "full": [first, first, second, "nope"],
+                "bogus": [first],
+            }
+        }))
+
+        self.assertEqual(result["images"], 3)
+        self.assertEqual(result["scheduled"], {"md": 2, "full": 2})
+        self.assertEqual(prefetch_calls, [{
+            "tier": "md",
+            "ids": [first, second],
+            "limit": 2,
+            "hot": True,
+        }])
+        self.assertEqual([call["id"] for call in full_calls], [first, second])
+        self.assertTrue(all(call["hot"] for call in full_calls))
+
+    async def test_warm_images_is_best_effort_when_thumbnail_cache_is_locked(self):
+        source = await self._source()
+        image_id = await self._image(source["id"], "locked.jpg")
+
+        async def locked_prefetch(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        app_module.thumbnails.prefetch_images = locked_prefetch
+
+        result = await app_module.warm_images(JsonRequest({"tiers": {"md": [image_id]}}))
+
+        self.assertEqual(result, {"scheduled": {"md": 0}, "images": 1})
+
+    async def test_warm_images_is_best_effort_when_full_cache_is_locked(self):
+        source = await self._source()
+        image_id = await self._image(source["id"], "locked-full.jpg")
+
+        async def locked_full(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        app_module.thumbnails.schedule_full_image_cache = locked_full
+
+        result = await app_module.warm_images(JsonRequest({"tiers": {"full": [image_id]}}))
+
+        self.assertEqual(result, {"scheduled": {"full": 0}, "images": 1})
+
+    async def test_media_status_reports_cached_tiers_without_image_lookup(self):
+        def fake_has_cached_fast(size, image_id):
+            return image_id == 42 and size == "md"
+
+        def fake_fast_disk_path_entry(size, image_id):
+            if image_id == 42 and size == app_module.thumbnails.FULL_TIER:
+                return ("sig", "/tmp/full.jpg")
+            return None
+
+        app_module.thumbnails.has_cached_fast = fake_has_cached_fast
+        app_module.thumbnails.fast_disk_path_entry = fake_fast_disk_path_entry
+
+        result = await app_module.image_media_status(42)
+
+        self.assertTrue(result["tiers"]["md"]["cached"])
+        self.assertTrue(result["tiers"]["full"]["cached"])
+        self.assertEqual(result["best_cached"], "full")
+        self.assertEqual(result["tiers"]["md"]["cached_url"], "/api/thumb/md/42?cached=1")
 
 
 if __name__ == "__main__":

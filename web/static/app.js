@@ -25,12 +25,18 @@ const PhotoArchive = (() => {
     const LOUPE_TIER_RANKS = { sm: 0, md: 1, lg: 2, full: 3 };
     const MEDIA_STATUS_MAX_AGE_MS = 15000;
     const mediaStatusCache = new Map();
+    const mediaStatusInflight = new Map();
     let selectedLibraryIndex = -1;
     let selectedMosaicIndex = -1;
     const backgroundWarmTimers = new Map();
     const backgroundWarmTokens = new Map();
     const WARM_CACHE_PREFIX = 'photoarchive:warm:';
     const WARM_CACHE_MAX_AGE_MS = 30000;
+    const WARM_TIER_DEDUPE_MS = 8000;
+    const WARM_TIER_BATCH_DELAY_MS = 120;
+    const recentWarmTierIds = new Map();
+    const pendingWarmTiers = new Map();
+    let warmTierFlushTimer = null;
 
     function scheduleBackgroundWarm(key, task, delay = BACKGROUND_WARM_DELAY_MS) {
         const token = (backgroundWarmTokens.get(key) || 0) + 1;
@@ -103,12 +109,36 @@ const PhotoArchive = (() => {
     }
 
     function warmImageTiers(tiers) {
-        const payload = {};
+        const now = Date.now();
+        let queued = false;
         for (const [tier, ids] of Object.entries(tiers || {})) {
             const unique = [...new Set((ids || []).map((id) => Number(id)).filter((id) => id > 0))];
-            if (unique.length) payload[tier] = unique;
+            for (const id of unique) {
+                const key = `${tier}:${id}`;
+                const lastWarm = recentWarmTierIds.get(key) || 0;
+                if (now - lastWarm < WARM_TIER_DEDUPE_MS) continue;
+                recentWarmTierIds.set(key, now);
+                if (!pendingWarmTiers.has(tier)) pendingWarmTiers.set(tier, new Set());
+                pendingWarmTiers.get(tier).add(id);
+                queued = true;
+            }
         }
+        if (!queued || warmTierFlushTimer) return;
+        warmTierFlushTimer = setTimeout(flushWarmImageTiers, WARM_TIER_BATCH_DELAY_MS);
+    }
+
+    function flushWarmImageTiers() {
+        warmTierFlushTimer = null;
+        const payload = {};
+        for (const [tier, ids] of pendingWarmTiers.entries()) {
+            if (ids.size) payload[tier] = Array.from(ids).slice(0, 96);
+        }
+        pendingWarmTiers.clear();
         if (!Object.keys(payload).length) return;
+        const cutoff = Date.now() - (WARM_TIER_DEDUPE_MS * 3);
+        for (const [key, warmedAt] of recentWarmTierIds.entries()) {
+            if (warmedAt < cutoff) recentWarmTierIds.delete(key);
+        }
         fetch('/api/images/warm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -134,9 +164,7 @@ const PhotoArchive = (() => {
     function compareThumbUrls(data) {
         const urls = [];
         for (const pair of data.pairs || []) {
-            if (pair.left?.id) urls.push(`/api/thumb/sm/${pair.left.id}`);
             if (pair.left?.thumb_url) urls.push(pair.left.thumb_url);
-            if (pair.right?.id) urls.push(`/api/thumb/sm/${pair.right.id}`);
             if (pair.right?.thumb_url) urls.push(pair.right.thumb_url);
         }
         return urls;
@@ -260,7 +288,7 @@ const PhotoArchive = (() => {
             cell.style.flexGrow = ar;
             cell.style.flexBasis = (rowH * ar) + 'px';
             cell.onclick = () => mosaicClick(img.id);
-            cell.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
+            cell.innerHTML = `<img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" data-tier-rank="0" onload="this.classList.add('loaded')">`;
             preloadImage(img.thumb_url);
             grid.appendChild(cell);
             scheduleMosaicImageUpgrade(cell, img, rowH, token, index);
@@ -633,8 +661,8 @@ const PhotoArchive = (() => {
         imgEl.onerror = () => {
             if (isCurrentCompareImage(token)) imgEl.classList.remove('fading');
         };
-        imgEl.src = `/api/thumb/sm/${img.id}`;
-        compareDisplayedTier[side] = 0;
+        imgEl.src = img.thumb_url || `/api/thumb/md/${img.id}`;
+        compareDisplayedTier[side] = LOUPE_TIER_RANKS.md;
         upgradeCompareImage(img, imgEl, side, token).catch(() => {});
     }
 
@@ -682,6 +710,37 @@ const PhotoArchive = (() => {
         return Number(compareStats.ranking_signal_count ?? compareStats.total_comparisons ?? 0);
     }
 
+    function visibleTotalLabel(visible, total) {
+        const visibleNum = Number(visible ?? 0);
+        const totalNum = Number(total ?? visibleNum);
+        const visibleText = visibleNum.toLocaleString();
+        if (Number.isFinite(totalNum) && totalNum !== visibleNum) {
+            return `${visibleText} / ${totalNum.toLocaleString()}`;
+        }
+        return visibleText;
+    }
+
+    function poolVisibleCount(stats = compareStats) {
+        return Number(
+            stats.filtered_pool_visible
+            ?? stats.visible_images
+            ?? stats.filtered_pool
+            ?? stats['ke' + 'pt']
+            ?? 0
+        );
+    }
+
+    function poolTotalCount(stats = compareStats) {
+        const visible = poolVisibleCount(stats);
+        return Number(
+            stats.filtered_pool_total
+            ?? stats.total_images
+            ?? stats.total_kept
+            ?? stats.filtered_pool
+            ?? visible
+        );
+    }
+
     function bumpRankingSignals(signalDelta, directDelta = 0) {
         const next = Math.max(0, displayedRankingSignalCount() + Number(signalDelta || 0));
         compareStats.ranking_signal_count = next;
@@ -696,10 +755,9 @@ const PhotoArchive = (() => {
 
     function updateCompareProgress() {
         const total = displayedRankingSignalCount();
-        const poolCount = compareStats.filtered_pool ?? compareStats['ke' + 'pt'] ?? 0;
         const compEl = document.getElementById('compare-stat-comparisons');
         const poolEl = document.getElementById('compare-stat-pool');
-        if (poolEl) poolEl.textContent = poolCount.toLocaleString();
+        if (poolEl) poolEl.textContent = visibleTotalLabel(poolVisibleCount(), poolTotalCount());
         if (!compEl) return;
 
         if (_displayedComparisons < 0) {
@@ -997,6 +1055,7 @@ const PhotoArchive = (() => {
     let searchQuery = '';
     let searchDebounce = null;
     let rankingsLoading = false;
+    let rankingsLoadPromise = null;
     let rankingsExhausted = false;
     let libraryRequestGeneration = 0;
     let thumbHeight = 220;
@@ -1213,6 +1272,7 @@ const PhotoArchive = (() => {
         libraryImages = [];
         lastDateGroup = null;
         rankingsLoading = false;
+        rankingsLoadPromise = null;
         selectedLibraryIndex = -1;
         if (clearBatch) clearBatchSelection();
     }
@@ -1468,6 +1528,8 @@ const PhotoArchive = (() => {
         const clearBtn = document.getElementById('search-clear');
         if (input) input.value = '';
         if (clearBtn) clearBtn.classList.add('hidden');
+        const sortToggles = document.getElementById('sort-toggles');
+        if (sortToggles) sortToggles.style.opacity = '';
         updateSimilaritySortOption();
         resetLibraryResults({ clearBatch: true });
         loadRankings(true);
@@ -1478,6 +1540,13 @@ const PhotoArchive = (() => {
         const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&limit=100`);
         const data = await res.json();
         const grid = document.getElementById('rankings-grid');
+        compareStats = {
+            ...compareStats,
+            filtered_pool: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_visible: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_total: Number(data.total_images ?? data.images?.length ?? 0),
+        };
+        updateCompareProgress();
 
         for (let i = 0; i < data.images.length; i++) {
             const img = data.images[i];
@@ -1495,11 +1564,11 @@ const PhotoArchive = (() => {
             const simPct = (img.similarity * 100).toFixed(0);
 
             card.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
                 ${flagBadge(img.flag)}
                 <div class="rank-card-info">
-                    <span class="rank-elo">${img.elo} Elo</span>
-                    <span class="rank-similarity">${simPct}% match</span>
+                    <span class="rank-elo">${escapeHtml(img.elo)} Elo</span>
+                    <span class="rank-similarity">${escapeHtml(simPct)}% match</span>
                 </div>
             `;
             grid.appendChild(card);
@@ -1663,122 +1732,138 @@ const PhotoArchive = (() => {
     }
 
     async function loadRankings(clearFirst = false) {
-        if (rankingsLoading) return;
+        if (rankingsLoading) return rankingsLoadPromise || 0;
+        const promise = loadRankingsBatch(clearFirst);
+        rankingsLoadPromise = promise;
+        try {
+            return await promise;
+        } finally {
+            if (rankingsLoadPromise === promise) rankingsLoadPromise = null;
+        }
+    }
+
+    async function loadRankingsBatch(clearFirst = false) {
         rankingsLoading = true;
         const requestGeneration = libraryRequestGeneration;
         const requestOffset = rankingsOffset;
         const limit = currentLibraryPageSize();
         let url = `/api/rankings?limit=${limit}&offset=${requestOffset}&sort=${rankingsSort}${filterParams()}`;
         if (searchQuery) url += `&q=${encodeURIComponent(searchQuery)}`;
-        const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
-        if (!data) {
-            if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
-            return;
-        }
-        if (requestGeneration !== libraryRequestGeneration) {
-            rankingsLoading = false;
-            return;
-        }
-        if (requestOffset === 0 && typeof data.total_images === 'number') {
-            compareStats = { ...compareStats, filtered_pool: data.total_images };
-            updateCompareProgress();
-        }
-        const grid = document.getElementById('rankings-grid');
-        if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; lastDateGroup = null; }
-        const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
-        const isDateSort = (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc');
-        const rowH = thumbHeight;
-
-        // Batch DOM writes with DocumentFragment to avoid per-card reflows
-        const frag = document.createDocumentFragment();
-        for (let i = 0; i < data.images.length; i++) {
-            const img = data.images[i];
-            const rank = rankingsOffset + i + 1;
-            const ar = img.aspect_ratio || 1.5;
-            const tier = getTierClass(img.elo, img.comparisons);
-            const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
-
-            // Insert date group header when group changes
-            if (isDateSort) {
-                const group = img.date_group || '';
-                if (group !== lastDateGroup) {
-                    lastDateGroup = group;
-                    const header = document.createElement('div');
-                    header.className = 'date-group-header';
-                    header.dataset.dateGroup = group;
-                    header.textContent = group ? formatDateGroup(group) : 'No Date';
-                    frag.appendChild(header);
-                }
+        try {
+            const data = (requestOffset === 0 ? takeWarmCache(`library:${url}`) : null) || await fetchWarmJson(url);
+            if (!data) return 0;
+            if (requestGeneration !== libraryRequestGeneration) return 0;
+            if (requestOffset === 0 && typeof data.total_images === 'number') {
+                const visible = Number(data.visible_images ?? data.total_images ?? 0);
+                const total = Number(data.total_images ?? data.total_kept ?? visible);
+                compareStats = {
+                    ...compareStats,
+                    filtered_pool: visible,
+                    filtered_pool_visible: visible,
+                    filtered_pool_total: total,
+                };
+                updateCompareProgress();
             }
+            const grid = document.getElementById('rankings-grid');
+            if (clearFirst) { grid.innerHTML = ''; selectedLibraryIndex = -1; lastDateGroup = null; }
+            const showRank = (rankingsSort === 'elo' || rankingsSort === 'elo_asc');
+            const isDateSort = (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc');
+            const rowH = thumbHeight;
 
-            const card = document.createElement('div');
-            card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
-            if (batchMode) card.classList.add('selectable');
-            if (batchSelected.has(img.id)) card.classList.add('selected');
-            card.dataset.imageId = img.id;
-            card.dataset.ar = ar;
-            card.style.height = rowH + 'px';
-            card.style.flexGrow = ar;
-            card.style.flexBasis = (rowH * ar) + 'px';
-            card.title = imageMetadataTitle(img);
-            card.onclick = (e) => handleCardClick(e, img, card, libraryImages.length + i);
+            // Batch DOM writes with DocumentFragment to avoid per-card reflows
+            const frag = document.createDocumentFragment();
+            const baseIndex = libraryImages.length;
+            for (let i = 0; i < data.images.length; i++) {
+                const img = data.images[i];
+                const rank = rankingsOffset + i + 1;
+                const ar = img.aspect_ratio || 1.5;
+                const tier = getTierClass(img.elo, img.comparisons);
+                const conf = img.comparisons > 0 ? getConfidenceClass(img.comparisons) : '';
 
-            const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
-            const infoLine = libraryCardInfoLine(img, rank, showRank);
+                // Insert date group header when group changes
+                if (isDateSort) {
+                    const group = img.date_group || '';
+                    if (group !== lastDateGroup) {
+                        lastDateGroup = group;
+                        const header = document.createElement('div');
+                        header.className = 'date-group-header';
+                        header.dataset.dateGroup = group;
+                        header.textContent = group ? formatDateGroup(group) : 'No Date';
+                        frag.appendChild(header);
+                    }
+                }
 
-            card.innerHTML = `
-                <img src="${img.thumb_url}" alt="${img.filename}" loading="lazy" onload="this.classList.add('loaded')">
-                <div class="select-check">✓</div>
-                ${confDot}
-                ${flagBadge(img.flag)}
-                <div class="rank-card-info">${infoLine}</div>
-            `;
-            frag.appendChild(card);
-            libraryImages.push(img);
-        }
-        grid.appendChild(frag);
+                const card = document.createElement('div');
+                card.className = 'rank-card' + (tier ? ' ' + tier : '') + (flagClass(img.flag) ? ' ' + flagClass(img.flag) : '');
+                if (batchMode) card.classList.add('selectable');
+                if (batchSelected.has(img.id)) card.classList.add('selected');
+                card.dataset.imageId = img.id;
+                card.dataset.ar = ar;
+                card.style.height = rowH + 'px';
+                card.style.flexGrow = ar;
+                card.style.flexBasis = (rowH * ar) + 'px';
+                card.title = imageMetadataTitle(img);
+                card.onclick = (e) => handleCardClick(e, img, card, baseIndex + i);
 
-        rankingsOffset += data.images.length;
-        rankingsLoading = false;
-        if (data.images.length < limit) {
-            rankingsExhausted = true;
-        }
-        if (data.images.length > 0) {
-            // Always warm neighbors — not just on first load
-            scheduleLibraryNeighborWarmup();
-            if (requestOffset === 0) scheduleCrossViewWarmup('library');
-            if (isDateSortActive()) setupScrubberScrollObserver();
+                const confDot = conf ? `<div class="rank-confidence ${conf}"></div>` : '';
+                const infoLine = libraryCardInfoLine(img, rank, showRank);
+
+                card.innerHTML = `
+                    <img src="${escapeHtml(img.thumb_url)}" alt="${escapeHtml(img.filename)}" loading="lazy" onload="this.classList.add('loaded')">
+                    <div class="select-check">✓</div>
+                    ${confDot}
+                    ${flagBadge(img.flag)}
+                    <div class="rank-card-info">${infoLine}</div>
+                `;
+                frag.appendChild(card);
+                libraryImages.push(img);
+            }
+            grid.appendChild(frag);
+
+            rankingsOffset += data.images.length;
+            if (data.images.length < limit) {
+                rankingsExhausted = true;
+            }
+            if (data.images.length > 0) {
+                // Always warm neighbors — not just on first load
+                scheduleLibraryNeighborWarmup();
+                if (requestOffset === 0) scheduleCrossViewWarmup('library');
+                if (isDateSortActive()) setupScrubberScrollObserver();
+            }
+            return data.images.length;
+        } finally {
+            if (requestGeneration === libraryRequestGeneration) rankingsLoading = false;
         }
     }
 
     function libraryCardInfoLine(img, rank, showRank) {
         if (showRank) {
-            return `<span class="rank-number">#${rank}</span><span class="rank-elo">${img.elo}</span>`;
+            return `<span class="rank-number">#${rank}</span><span class="rank-elo">${escapeHtml(img.elo)}</span>`;
         }
         if (rankingsSort === 'date_taken' || rankingsSort === 'date_taken_asc') {
             const label = formatShortDate(img.date_taken) || 'No date';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'file_size' || rankingsSort === 'file_size_asc') {
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${formatBytes(img.file_size)}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(formatBytes(img.file_size))}</span>`;
         }
         if (rankingsSort === 'date_modified' || rankingsSort === 'date_modified_asc') {
             const label = formatShortDate(img.file_modified_at) || 'No modified date';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'resolution' || rankingsSort === 'resolution_asc') {
             const label = resolutionLabel(img) || 'No size';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'camera' || rankingsSort === 'camera_desc') {
             const label = cameraLabel(img) || 'No camera';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
         if (rankingsSort === 'newest' || rankingsSort === 'oldest') {
             const label = formatShortDate(img.created_at) || 'Added';
-            return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${label}</span>`;
+            return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(label)}</span>`;
         }
-        return `<span class="rank-elo">${img.elo}</span><span class="rank-comparisons">${img.comparisons} signal${Number(img.comparisons || 0) === 1 ? '' : 's'}</span>`;
+        return `<span class="rank-elo">${escapeHtml(img.elo)}</span><span class="rank-comparisons">${escapeHtml(img.comparisons)} signal${Number(img.comparisons || 0) === 1 ? '' : 's'}</span>`;
     }
 
     function formatDateGroup(dateStr) {
@@ -1832,7 +1917,7 @@ const PhotoArchive = (() => {
         let html = '';
         for (const group of dateGroupsData) {
             if (!group.date) {
-                html += `<div class="scrubber-label" data-date-group="">No Date</div>`;
+                html += '<div class="scrubber-label" data-date-group="">No Date</div>';
                 continue;
             }
             const year = group.date.substring(0, 4);
@@ -1840,9 +1925,9 @@ const PhotoArchive = (() => {
             const monthName = new Date(parseInt(year), parseInt(month) - 1).toLocaleDateString(undefined, { month: 'short' });
             if (year !== currentYear) {
                 currentYear = year;
-                html += `<div class="scrubber-year" data-date-group="${group.date}">${year}</div>`;
+                html += `<div class="scrubber-year" data-date-group="${escapeHtml(group.date)}">${escapeHtml(year)}</div>`;
             }
-            html += `<div class="scrubber-label" data-date-group="${group.date}" title="${group.label} (${group.count})">${monthName}</div>`;
+            html += `<div class="scrubber-label" data-date-group="${escapeHtml(group.date)}" title="${escapeHtml(group.label)} (${escapeHtml(group.count)})">${escapeHtml(monthName)}</div>`;
         }
         scrubber.innerHTML = html;
 
@@ -1964,7 +2049,11 @@ const PhotoArchive = (() => {
                 lightboxIndex = i;
                 showLoupeImage(libraryImages[i], direction);
             };
-            thumb.innerHTML = `<img src="${img.thumb_url}" alt="${img.filename}" loading="lazy">`;
+            const thumbImg = document.createElement('img');
+            thumbImg.src = img.thumb_url || '';
+            thumbImg.alt = img.filename || '';
+            thumbImg.loading = 'lazy';
+            thumb.appendChild(thumbImg);
             scroll.appendChild(thumb);
         }
         // rAF needed: DOM just rebuilt, need reflow before reading offsetLeft
@@ -2011,6 +2100,7 @@ const PhotoArchive = (() => {
     let loupeCurrentImage = null;
     let loupeFullLoadTimer = null;
     let loupeFullLoadToken = 0;
+    let loupeHideTimer = null;
     const loupeTierProbes = new Set();
     const loupeRefLong = 3840; // lg thumbnail long side used before original dimensions are known
     const LOUPE_PRELOAD_RADIUS = 3;
@@ -2032,6 +2122,10 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         const loupeImg = document.getElementById('loupe-img');
         if (!loupe || !loupeImg) return;
+        if (loupeHideTimer) {
+            clearTimeout(loupeHideTimer);
+            loupeHideTimer = null;
+        }
 
         // Pre-calculate fit dimensions from aspect ratio so all progressive
         // loads (sm/md/lg) display at the same screen size — no size jumps
@@ -2089,7 +2183,7 @@ const PhotoArchive = (() => {
 
         // Load EXIF
         fetch(`/api/image/${img.id}/exif`).then(r => r.json()).then(data => {
-            if (!data.exif || libraryImages[lightboxIndex]?.id !== img.id) return;
+            if (!data.exif || !isCurrentLoupeImage(img, token)) return;
             const e = data.exif;
             const parts = [];
             const camera = [e.camera_make, e.camera_model].filter(Boolean).join(' ');
@@ -2126,15 +2220,25 @@ const PhotoArchive = (() => {
         if (!force && cached && Date.now() - cached.time < MEDIA_STATUS_MAX_AGE_MS) {
             return cached.data;
         }
-        try {
-            const res = await fetch(`/api/image/${imageId}/media-status`);
-            if (!res.ok) return null;
-            const data = await res.json();
-            mediaStatusCache.set(imageId, { time: Date.now(), data });
-            return data;
-        } catch {
-            return null;
+        if (!force && mediaStatusInflight.has(imageId)) {
+            return mediaStatusInflight.get(imageId);
         }
+        let request;
+        request = (async () => {
+            try {
+                const res = await fetch(`/api/image/${imageId}/media-status`);
+                if (!res.ok) return null;
+                const data = await res.json();
+                mediaStatusCache.set(imageId, { time: Date.now(), data });
+                return data;
+            } catch {
+                return null;
+            } finally {
+                if (mediaStatusInflight.get(imageId) === request) mediaStatusInflight.delete(imageId);
+            }
+        })();
+        mediaStatusInflight.set(imageId, request);
+        return request;
     }
 
     function loupeTierUrl(tier, imageId, cachedOnly = false) {
@@ -2182,10 +2286,13 @@ const PhotoArchive = (() => {
             const rank = LOUPE_TIER_RANKS[tier.name];
             if (rank <= loupeDisplayedTierRank) continue;
             if (tier.name === 'full') loupeFullLoadToken = token;
-            await loadLoupeTier(img, loupeTierUrl(tier.name, img.id), rank, token, {
+            const loaded = await loadLoupeTier(img, loupeTierUrl(tier.name, img.id), rank, token, {
                 adoptDimensions: tier.adoptDimensions,
                 timeoutMs: LOUPE_TIER_TIMEOUTS[tier.name],
             });
+            if (tier.name === 'full' && !loaded && isCurrentLoupeImage(img, token) && loupeDisplayedTierRank < rank) {
+                loupeFullLoadToken = 0;
+            }
             if (!isCurrentLoupeImage(img, token)) return;
         }
     }
@@ -2256,6 +2363,10 @@ const PhotoArchive = (() => {
         loadLoupeTier(img, loupeTierUrl('full', img.id), 3, token, {
             adoptDimensions: true,
             timeoutMs: LOUPE_TIER_TIMEOUTS.full,
+        }).then((loaded) => {
+            if (!loaded && isCurrentLoupeImage(img, token) && loupeDisplayedTierRank < LOUPE_TIER_RANKS.full) {
+                loupeFullLoadToken = 0;
+            }
         });
     }
 
@@ -2527,10 +2638,31 @@ const PhotoArchive = (() => {
         });
     }
 
+    async function ensureLibraryImageIndex(index) {
+        if (index < libraryImages.length) return true;
+        if (searchQuery === '__similar__') return false;
+        while (index >= libraryImages.length && !rankingsExhausted) {
+            const before = libraryImages.length;
+            const loaded = await loadRankings(false);
+            if (libraryImages.length <= before && !loaded) break;
+        }
+        return index < libraryImages.length;
+    }
+
     function lightboxNext() {
-        if (lightboxIndex < 0 || lightboxIndex >= libraryImages.length - 1) return;
-        lightboxIndex++;
-        showLoupeImage(libraryImages[lightboxIndex], 1);
+        if (lightboxIndex < 0) return;
+        const nextIndex = lightboxIndex + 1;
+        if (nextIndex < libraryImages.length) {
+            lightboxIndex = nextIndex;
+            showLoupeImage(libraryImages[lightboxIndex], 1);
+            return;
+        }
+        const fromIndex = lightboxIndex;
+        ensureLibraryImageIndex(nextIndex).then((ok) => {
+            if (!ok || lightboxIndex !== fromIndex) return;
+            lightboxIndex = nextIndex;
+            showLoupeImage(libraryImages[lightboxIndex], 1);
+        });
     }
 
     function lightboxPrev() {
@@ -2543,7 +2675,11 @@ const PhotoArchive = (() => {
         const loupe = document.getElementById('loupe');
         if (loupe) {
             loupe.classList.remove('loupe-visible');
-            setTimeout(() => loupe.classList.add('hidden'), 150);
+            if (loupeHideTimer) clearTimeout(loupeHideTimer);
+            loupeHideTimer = setTimeout(() => {
+                if (!document.body.classList.contains('loupe-open')) loupe.classList.add('hidden');
+                loupeHideTimer = null;
+            }, 150);
         }
         document.body.classList.remove('loupe-open');
         loupeImageToken++;
@@ -2779,6 +2915,8 @@ const PhotoArchive = (() => {
         libraryRequestGeneration++;
         clearBatchSelection();
         libraryImages = [];
+        rankingsOffset = 0;
+        rankingsExhausted = true;
         const grid = document.getElementById('rankings-grid');
         grid.innerHTML = '';
 
@@ -2786,6 +2924,13 @@ const PhotoArchive = (() => {
         const res = await fetch(`/api/similar/${img.id}?limit=100`);
         const data = await res.json();
         if (requestGeneration !== libraryRequestGeneration) return;
+        compareStats = {
+            ...compareStats,
+            filtered_pool: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_visible: Number(data.visible_images ?? data.images?.length ?? 0),
+            filtered_pool_total: Number(data.total_images ?? data.images?.length ?? 0),
+        };
+        updateCompareProgress();
 
         for (let i = 0; i < data.images.length; i++) {
             const simg = data.images[i];
@@ -2802,16 +2947,17 @@ const PhotoArchive = (() => {
             card.onclick = () => openLightbox(simg);
 
             card.innerHTML = `
-                <img src="${simg.thumb_url}" alt="${simg.filename}" loading="lazy" onload="this.classList.add('loaded')">
+                <img src="${escapeHtml(simg.thumb_url)}" alt="${escapeHtml(simg.filename)}" loading="lazy" onload="this.classList.add('loaded')">
                 ${flagBadge(simg.flag)}
                 <div class="rank-card-info">
-                    <span class="rank-elo">${simg.elo} Elo</span>
-                    <span class="rank-similarity">${simPct}% match</span>
+                    <span class="rank-elo">${escapeHtml(simg.elo)} Elo</span>
+                    <span class="rank-similarity">${escapeHtml(simPct)}% match</span>
                 </div>
             `;
             grid.appendChild(card);
             libraryImages.push(simg);
         }
+        rankingsOffset = libraryImages.length;
     }
 
     // ==================== BATCH SELECTION ====================
@@ -3126,7 +3272,10 @@ const PhotoArchive = (() => {
                 container.appendChild(info);
             }
             const infoEl = document.getElementById('map-info');
-            infoEl.textContent = `${data.gps_count.toLocaleString()} of ${data.total_count.toLocaleString()} photos have location data`;
+            const gpsVisible = Number(data.gps_count ?? data.markers?.length ?? 0);
+            const gpsTotal = Number(data.gps_total_count ?? gpsVisible);
+            const catalogTotal = Number(data.total_count ?? gpsTotal);
+            infoEl.textContent = `${visibleTotalLabel(gpsVisible, gpsTotal)} located photos shown · ${catalogTotal.toLocaleString()} photos in pool`;
 
             // Fit bounds if markers exist and map hasn't been manually positioned
             if (data.markers.length > 0 && mapZoom === 2) {

@@ -773,8 +773,8 @@ def _get_disk_entry(
         return None
 
     with _meta_lock:
-        conn = _db_connect()
         try:
+            conn = _db_connect()
             row = conn.execute(
                 "SELECT cache_root, size, image_id, path, source_signature, size_bytes "
                 "FROM cache_entries WHERE cache_root = ? AND size = ? AND image_id = ?",
@@ -841,8 +841,9 @@ def touch_cached_signature(size: str, image_id: int, source_signature: str | Non
     if not SSD_CACHE_DIR or _disk_allocations.get(size, 0) <= 0:
         return False
     with _meta_lock:
-        conn = _db_connect()
+        conn = None
         try:
+            conn = _db_connect()
             if source_signature:
                 cursor = conn.execute(
                     "UPDATE cache_entries SET last_accessed = ? "
@@ -859,10 +860,11 @@ def touch_cached_signature(size: str, image_id: int, source_signature: str | Non
             _clear_cache_metadata_lock_backoff()
             return cursor.rowcount > 0
         except sqlite3.OperationalError as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             if _is_sqlite_locked(exc):
                 _note_cache_metadata_lock()
                 return False
@@ -1014,8 +1016,9 @@ def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> byt
             data = f.read()
     except OSError:
         with _meta_lock:
-            conn = _db_connect()
+            conn = None
             try:
+                conn = _db_connect()
                 stale_row = conn.execute(
                     "SELECT cache_root, size, image_id, path FROM cache_entries "
                     "WHERE cache_root = ? AND size = ? AND image_id = ?",
@@ -1026,10 +1029,11 @@ def _read_disk_thumbnail(size: str, image_id: int, source_signature: str) -> byt
                     conn.commit()
                     _clear_cache_metadata_lock_backoff()
             except sqlite3.OperationalError as exc:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 if _is_sqlite_locked(exc):
                     _note_cache_metadata_lock()
                 else:
@@ -1127,8 +1131,9 @@ def _flush_write_queue() -> bool:
 
     now = _current_time()
     with _meta_lock:
-        conn = _db_connect()
+        conn = None
         try:
+            conn = _db_connect()
             now = _current_time()
             for size, image_id, source_signature, path, size_bytes, access_time in batch:
                 previous = conn.execute(
@@ -1155,10 +1160,11 @@ def _flush_write_queue() -> bool:
             _clear_cache_metadata_lock_backoff()
             return True
         except sqlite3.OperationalError as exc:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             _tier_byte_totals.clear()
             with _write_queue_lock:
                 _write_queue[0:0] = batch
@@ -1936,8 +1942,8 @@ def _bulk_tier_room(tier_budgets: dict[str, int]) -> dict[str, int]:
     if _cache_metadata_backoff_active():
         return {size: 0 for size in THUMB_TIERS}
     with _meta_lock:
-        conn = _db_connect()
         try:
+            conn = _db_connect()
             room = {
                 size: max(0, int(tier_budgets.get(size, 0) or 0) - _tier_bytes(conn, size))
                 for size in THUMB_TIERS

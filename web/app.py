@@ -3,6 +3,7 @@ import csv
 import io
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -797,7 +798,10 @@ async def image_media_status(image_id: int):
 @app.post("/api/images/warm")
 async def warm_images(request: Request):
     """Mark current/nearby images as hot and schedule SSD cache warming."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     tier_requests = body.get("tiers") or {}
     requested: dict[str, list[int]] = {}
     all_ids: set[int] = set()
@@ -806,13 +810,16 @@ async def warm_images(request: Request):
         if tier not in thumbnails.ALL_TIERS:
             continue
         ids = []
-        for value in values or []:
+        seen_for_tier = set()
+        values_iter = values if isinstance(values, (list, tuple, set)) else [values]
+        for value in values_iter or []:
             try:
                 image_id = int(value)
             except (TypeError, ValueError):
                 continue
-            if image_id <= 0:
+            if image_id <= 0 or image_id in seen_for_tier:
                 continue
+            seen_for_tier.add(image_id)
             ids.append(image_id)
             all_ids.add(image_id)
         if ids:
@@ -821,7 +828,15 @@ async def warm_images(request: Request):
     if not requested or not all_ids:
         return {"scheduled": {}, "images": 0}
 
-    rows_by_id = await db.get_images_by_ids(list(all_ids))
+    try:
+        rows_by_id = await db.get_images_by_ids(list(all_ids))
+    except (sqlite3.OperationalError, OSError) as exc:
+        print(f"Warm image lookup skipped: {exc}")
+        return {"scheduled": {tier: 0 for tier in requested}, "images": len(all_ids)}
+    except Exception as exc:
+        print(f"Warm image lookup skipped: {exc}")
+        return {"scheduled": {tier: 0 for tier in requested}, "images": len(all_ids)}
+
     scheduled = {}
     for tier, ids in requested.items():
         rows = [rows_by_id[image_id] for image_id in ids if image_id in rows_by_id]
@@ -829,20 +844,32 @@ async def warm_images(request: Request):
             scheduled[tier] = 0
             continue
         if tier in thumbnails.THUMB_TIERS:
-            scheduled[tier] = await thumbnails.prefetch_images(
-                rows,
-                tier,
-                limit=len(rows),
-                hot=True,
-            )
+            try:
+                scheduled[tier] = await thumbnails.prefetch_images(
+                    rows,
+                    tier,
+                    limit=len(rows),
+                    hot=True,
+                )
+            except (sqlite3.OperationalError, OSError) as exc:
+                print(f"Warm {tier} skipped: {exc}")
+                scheduled[tier] = 0
+            except Exception as exc:
+                print(f"Warm {tier} skipped: {exc}")
+                scheduled[tier] = 0
         elif tier == thumbnails.FULL_TIER:
             count = 0
             for row in rows[:12]:
                 ext = os.path.splitext(row["filepath"])[1].lower()
                 if ext not in _BROWSER_IMAGE_EXTENSIONS:
                     continue
-                await thumbnails.schedule_full_image_cache(row["filepath"], row["id"], hot=True)
-                count += 1
+                try:
+                    await thumbnails.schedule_full_image_cache(row["filepath"], row["id"], hot=True)
+                    count += 1
+                except (sqlite3.OperationalError, OSError) as exc:
+                    print(f"Warm full image {row['id']} skipped: {exc}")
+                except Exception as exc:
+                    print(f"Warm full image {row['id']} skipped: {exc}")
             scheduled[tier] = count
 
     return {"scheduled": scheduled, "images": len(all_ids)}
@@ -1213,6 +1240,89 @@ def _metadata_payload(image: dict) -> dict:
     }
 
 
+def _visibility_counts(total_images: int, visible_images: int) -> dict:
+    total = max(0, int(total_images or 0))
+    visible = max(0, int(visible_images or 0))
+    return {
+        "visible_images": visible,
+        "total_images": total,
+        "hidden_pending_thumbnails": max(total - visible, 0),
+    }
+
+
+def _cache_root() -> str:
+    return thumbnails.SSD_CACHE_DIR
+
+
+def _chunks(values: list[int], size: int = 900):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+async def _cached_image_ids(image_ids, size: str) -> set[int]:
+    ids = [int(image_id) for image_id in image_ids if image_id is not None]
+    return await db.get_cached_image_ids(ids, size, _cache_root())
+
+
+async def _filter_visible_candidates(candidates: list[dict], size: str) -> list[dict]:
+    if not candidates:
+        return []
+    cached_ids = await _cached_image_ids([c.get("id") for c in candidates], size)
+    return [c for c in candidates if int(c.get("id") or 0) in cached_ids]
+
+
+async def _visible_ranked_images(ranked_ids: list[int], limit: int, size: str = "sm") -> list[dict]:
+    """Fetch active images in ranked order, skipping IDs without the displayed tier."""
+    if limit <= 0 or not ranked_ids:
+        return []
+    results: list[dict] = []
+    seen: set[int] = set()
+    unique_ids = []
+    for image_id in ranked_ids:
+        try:
+            normalized = int(image_id)
+        except (TypeError, ValueError):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_ids.append(normalized)
+
+    for chunk in _chunks(unique_ids):
+        cached_ids = await _cached_image_ids(chunk, size)
+        if not cached_ids:
+            continue
+        active_rows = await db.get_active_images_by_ids([image_id for image_id in chunk if image_id in cached_ids])
+        for image_id in chunk:
+            row = active_rows.get(image_id)
+            if row is None:
+                continue
+            results.append(row)
+            if len(results) >= limit:
+                return results
+    return results
+
+
+async def _count_visible_ranked_ids(ranked_ids: list[int], size: str = "sm") -> int:
+    if not ranked_ids:
+        return 0
+    visible = 0
+    seen: set[int] = set()
+    unique_ids = []
+    for image_id in ranked_ids:
+        try:
+            normalized = int(image_id)
+        except (TypeError, ValueError):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_ids.append(normalized)
+    for chunk in _chunks(unique_ids):
+        visible += len(await _cached_image_ids(chunk, size))
+    return visible
+
+
 def _filter_by_metadata(
     images: list[dict],
     date_taken: str = "",
@@ -1416,7 +1526,13 @@ async def mosaic_next(
         images = await _get_pairing_images()
 
     if len(images) < 2:
-        return {"images": [], "total_images": len(images), "total_kept": len(images)}
+        visible = await _filter_visible_candidates([dict(img) for img in images], "sm")
+        counts = _visibility_counts(len(images), len(visible))
+        stats = dict(await db.get_stats())
+        stats["filtered_pool"] = len(visible)
+        stats["filtered_pool_visible"] = len(visible)
+        stats["filtered_pool_total"] = len(images)
+        return {"images": [], **counts, "total_kept": len(images), "stats": stats}
 
     import random
     candidates = [dict(img) for img in images if img["id"] not in exclude_ids]
@@ -1439,11 +1555,14 @@ async def mosaic_next(
     if flag in ("picked", "unflagged", "rejected"):
         candidates = [c for c in candidates if (c.get("flag") or "unflagged") == flag]
     candidates = _filter_by_metadata(candidates, date_taken, file_type, camera, lens)
+    filtered_total = len(candidates)
+    candidates = await _filter_visible_candidates(candidates, "sm")
+    visible_count = len(candidates)
+
     # Effective Elo: use direct if compared, predicted if not, 1200 as fallback
     for img in candidates:
         img["effective_elo"] = img["elo"]
-    filtered_count = len(candidates)
-    count = min(n, filtered_count)
+    count = min(n, visible_count)
 
     if strategy == "diverse":
         # Maximize visual diversity: pick images that are most dissimilar from each other
@@ -1493,8 +1612,15 @@ async def mosaic_next(
         )
 
     stats = dict(await db.get_stats())
-    stats["filtered_pool"] = filtered_count
-    return {"images": result, "total_images": filtered_count, "total_kept": filtered_count, "stats": stats}
+    stats["filtered_pool"] = visible_count
+    stats["filtered_pool_visible"] = visible_count
+    stats["filtered_pool_total"] = filtered_total
+    return {
+        "images": result,
+        **_visibility_counts(filtered_total, visible_count),
+        "total_kept": filtered_total,
+        "stats": stats,
+    }
 
 
 @app.post("/api/mosaic/pick")
@@ -1624,7 +1750,17 @@ async def compare_next(
         images = await _get_pairing_images()
 
     if len(images) < 2:
-        return {"pairs": [], "total_images": len(images), "total_kept": len(images)}
+        visible = await _filter_visible_candidates([dict(img) for img in images], "md")
+        stats = dict(await db.get_stats())
+        stats["filtered_pool"] = len(visible)
+        stats["filtered_pool_visible"] = len(visible)
+        stats["filtered_pool_total"] = len(images)
+        return {
+            "pairs": [],
+            **_visibility_counts(len(images), len(visible)),
+            "total_kept": len(images),
+            "stats": stats,
+        }
 
     image_dicts = [dict(img) for img in images]
 
@@ -1646,9 +1782,21 @@ async def compare_next(
     if flag in ("picked", "unflagged", "rejected"):
         image_dicts = [c for c in image_dicts if (c.get("flag") or "unflagged") == flag]
     image_dicts = _filter_by_metadata(image_dicts, date_taken, file_type, camera, lens)
+    filtered_total = len(image_dicts)
+    image_dicts = await _filter_visible_candidates(image_dicts, "md")
+    visible_count = len(image_dicts)
 
     if len(image_dicts) < 2:
-        return {"pairs": [], "total_images": len(image_dicts), "total_kept": len(image_dicts)}
+        stats = dict(await db.get_stats())
+        stats["filtered_pool"] = visible_count
+        stats["filtered_pool_visible"] = visible_count
+        stats["filtered_pool_total"] = filtered_total
+        return {
+            "pairs": [],
+            **_visibility_counts(filtered_total, visible_count),
+            "total_kept": filtered_total,
+            "stats": stats,
+        }
     past = await _get_past_matchups()
     pairs = pairing.swiss_pair(image_dicts, past, max_pairs=n)
 
@@ -1687,8 +1835,15 @@ async def compare_next(
         )
 
     stats = dict(await db.get_stats())
-    stats["filtered_pool"] = len(image_dicts)
-    return {"pairs": result, "total_images": len(image_dicts), "total_kept": len(image_dicts), "stats": stats}
+    stats["filtered_pool"] = visible_count
+    stats["filtered_pool_visible"] = visible_count
+    stats["filtered_pool_total"] = filtered_total
+    return {
+        "pairs": result,
+        **_visibility_counts(filtered_total, visible_count),
+        "total_kept": filtered_total,
+        "stats": stats,
+    }
 
 
 @app.post("/api/compare")
@@ -1779,12 +1934,28 @@ async def api_rankings(
 
     # Similarity sort: fetch all matches, sort in Python, then paginate
     if sort == "similarity" and search_scores:
+        total_images, visible_images = await asyncio.gather(
+            db.count_rankings(
+                orientation=orientation, compared=compared, min_stars=min_stars,
+                folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+                camera=camera, lens=lens,
+                id_filter=search_ids,
+            ),
+            db.count_rankings(
+                orientation=orientation, compared=compared, min_stars=min_stars,
+                folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+                camera=camera, lens=lens,
+                id_filter=search_ids,
+                visible_thumb_size="sm", cache_root=_cache_root(),
+            ),
+        )
         images = await db.get_rankings(
-            limit=len(search_ids), offset=0, sort="elo",
+            limit=visible_images, offset=0, sort="elo",
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
             camera=camera, lens=lens,
             id_filter=search_ids,
+            visible_thumb_size="sm", cache_root=_cache_root(),
         )
         all_results = []
         for img in images:
@@ -1808,17 +1979,25 @@ async def api_rankings(
             )
         return {
             "images": page,
-            "total_images": len(all_results),
-            "total_kept": len(all_results),
+            **_visibility_counts(total_images, visible_images),
+            "total_kept": total_images,
         }
 
-    images, total_images = await asyncio.gather(
+    images, visible_images, total_images = await asyncio.gather(
         db.get_rankings(
             limit=limit, offset=offset, sort=sort,
             orientation=orientation, compared=compared, min_stars=min_stars,
             folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
             camera=camera, lens=lens,
             id_filter=search_ids,
+            visible_thumb_size="sm", cache_root=_cache_root(),
+        ),
+        db.count_rankings(
+            orientation=orientation, compared=compared, min_stars=min_stars,
+            folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
+            camera=camera, lens=lens,
+            id_filter=search_ids,
+            visible_thumb_size="sm", cache_root=_cache_root(),
         ),
         db.count_rankings(
             orientation=orientation, compared=compared, min_stars=min_stars,
@@ -1856,7 +2035,7 @@ async def api_rankings(
         result.append(entry)
     return {
         "images": result,
-        "total_images": total_images,
+        **_visibility_counts(total_images, visible_images),
         "total_kept": total_images,
     }
 
@@ -1872,6 +2051,7 @@ async def api_date_groups(
         orientation=orientation, compared=compared, min_stars=min_stars,
         folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
         camera=camera, lens=lens,
+        visible_thumb_size="sm", cache_root=_cache_root(),
     )
     return {"groups": groups}
 
@@ -1887,6 +2067,7 @@ async def api_map_markers(
         orientation=orientation, compared=compared, min_stars=min_stars,
         folder=folder, flag=flag, date_taken=date_taken, file_type=file_type,
         camera=camera, lens=lens,
+        visible_thumb_size="sm", cache_root=_cache_root(),
     )
 
 
@@ -1943,7 +2124,7 @@ async def export_rankings(format: str = "json", ids: str = ""):
 async def api_search(q: str = "", limit: int = 50):
     """Search images by text query using embedding similarity."""
     if not q.strip():
-        return {"images": [], "query": q}
+        return {"images": [], "query": q, **_visibility_counts(0, 0)}
     limit = max(1, min(int(limit), 500))
 
     try:
@@ -1958,19 +2139,19 @@ async def api_search(q: str = "", limit: int = 50):
 
     image_ids, matrix = await embed_cache.get_matrix()
     if image_ids is None:
-        return {"images": [], "query": q}
+        return {"images": [], "query": q, **_visibility_counts(0, 0)}
 
     similarities = matrix @ text_vec
-    top_indices = _top_indices_desc(similarities, limit)
-    top_ids = [image_ids[i] for i in top_indices]
-    top_scores = [float(similarities[i]) for i in top_indices]
+    ranked_indices = _top_indices_desc(similarities, len(image_ids))
+    ranked_ids = [int(image_ids[int(i)]) for i in ranked_indices]
+    visible_images = await _count_visible_ranked_ids(ranked_ids, "sm")
+    visible_rows = await _visible_ranked_images(ranked_ids, limit, "sm")
+    score_by_id = {int(image_ids[int(i)]): float(similarities[int(i)]) for i in ranked_indices}
 
-    images = await db.get_images_by_ids(top_ids)
     result = []
-    for img_id, score in zip(top_ids, top_scores):
-        img = images.get(img_id)
-        if not img:
-            continue
+    for img in visible_rows:
+        img_id = int(img["id"])
+        score = score_by_id.get(img_id, 0.0)
         result.append({
             "id": img_id,
             "filename": img["filename"],
@@ -1984,7 +2165,11 @@ async def api_search(q: str = "", limit: int = 50):
             "thumb_url": f"/api/thumb/sm/{img_id}",
         })
 
-    return {"images": result, "query": q}
+    return {
+        "images": result,
+        "query": q,
+        **_visibility_counts(len(ranked_ids), visible_images),
+    }
 
 
 @app.get("/api/similar/{image_id}")
@@ -1998,7 +2183,7 @@ async def api_similar(image_id: int, limit: int = 50):
 
     image_ids, matrix = await embed_cache.get_matrix()
     if image_ids is None:
-        return {"images": [], "source_id": image_id}
+        return {"images": [], "source_id": image_id, **_visibility_counts(0, 0)}
 
     source_vec = embed_cache.get_vector(image_id)
     if source_vec is None:
@@ -2006,15 +2191,18 @@ async def api_similar(image_id: int, limit: int = 50):
 
     similarities = matrix @ source_vec
     source_index = embed_cache.get_index().get(image_id)
-    top_indices = _top_indices_desc(similarities, limit, exclude_index=source_index)
-    top_ids = [image_ids[idx] for idx in top_indices]
+    ranked_indices = [
+        int(idx)
+        for idx in _top_indices_desc(similarities, len(image_ids), exclude_index=source_index)
+        if int(image_ids[int(idx)]) != image_id
+    ]
+    ranked_ids = [int(image_ids[idx]) for idx in ranked_indices]
+    visible_images = await _count_visible_ranked_ids(ranked_ids, "sm")
+    visible_rows = await _visible_ranked_images(ranked_ids, limit, "sm")
+    score_by_id = {int(image_ids[idx]): float(similarities[idx]) for idx in ranked_indices}
     results = []
-    images_data = await db.get_images_by_ids(top_ids)
-    for idx in top_indices:
-        img_id = image_ids[idx]
-        img = images_data.get(img_id)
-        if not img:
-            continue
+    for img in visible_rows:
+        img_id = int(img["id"])
         results.append({
             "id": img_id,
             "filename": img["filename"],
@@ -2022,13 +2210,17 @@ async def api_similar(image_id: int, limit: int = 50):
             "comparisons": img["comparisons"],
             "propagated_updates": img.get("propagated_updates") or 0,
             "flag": img.get("flag") or "unflagged",
-            "similarity": round(float(similarities[idx]), 4),
+            "similarity": round(score_by_id.get(img_id, 0.0), 4),
             "aspect_ratio": img.get("aspect_ratio") or 1.5,
             **_metadata_payload(img),
             "thumb_url": f"/api/thumb/sm/{img_id}",
         })
 
-    return {"images": results, "source_id": image_id}
+    return {
+        "images": results,
+        "source_id": image_id,
+        **_visibility_counts(len(ranked_ids), visible_images),
+    }
 
 
 @app.get("/api/duplicates")
@@ -2042,13 +2234,16 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
 
     image_ids, matrix = await embed_cache.get_matrix()
     if image_ids is None or len(image_ids) < 2:
-        return {"pairs": []}
+        return {"pairs": [], "visible_pairs": 0, "total_pairs": 0, "hidden_pending_thumbnails": 0}
 
     # Process in batches to avoid allocating a full n×n matrix (~850MB for 20k images).
     # Each batch computes similarities for a chunk of rows against all columns.
     BATCH = 500
     n = len(image_ids)
+    cached_sm_ids = await _cached_image_ids([int(image_id) for image_id in image_ids], "sm")
     pairs = []
+    total_pairs = 0
+    hidden_pairs = 0
     for start in range(0, n, BATCH):
         end = min(start + BATCH, n)
         chunk_sims = matrix[start:end] @ matrix.T  # (BATCH, n) — manageable
@@ -2060,7 +2255,13 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
             above = (row >= threshold).nonzero()[0]
             for offset in above:
                 j = j_start + int(offset)
-                pairs.append((image_ids[i], image_ids[j], float(row[int(offset)])))
+                id_a = int(image_ids[i])
+                id_b = int(image_ids[j])
+                total_pairs += 1
+                if id_a in cached_sm_ids and id_b in cached_sm_ids:
+                    pairs.append((id_a, id_b, float(row[int(offset)])))
+                else:
+                    hidden_pairs += 1
                 if len(pairs) >= limit:
                     break
             if len(pairs) >= limit:
@@ -2083,7 +2284,12 @@ async def api_duplicates(threshold: float = 0.95, limit: int = 100):
             "b": {"id": id_b, "filename": b["filename"], "elo": round(b["elo"], 1), "thumb_url": f"/api/thumb/sm/{id_b}"},
         })
 
-    return {"pairs": result}
+    return {
+        "pairs": result,
+        "visible_pairs": len(result),
+        "total_pairs": total_pairs,
+        "hidden_pending_thumbnails": hidden_pairs,
+    }
 
 
 _exif_cache: dict[int, dict] = {}
@@ -2148,7 +2354,11 @@ async def api_collections(n_clusters: int = 20):
     if image_ids is None or len(image_ids) < n_clusters:
         return {"collections": []}
 
-    cache_key = (int(n_clusters), len(image_ids))
+    cached_sm_ids = await _cached_image_ids([int(image_id) for image_id in image_ids], "sm")
+    if not cached_sm_ids:
+        return {"collections": []}
+
+    cache_key = (int(n_clusters), len(image_ids), len(cached_sm_ids))
     if _collections_cache["key"] == cache_key and _collections_cache["data"] is not None:
         return _collections_cache["data"]
 
@@ -2177,10 +2387,20 @@ async def api_collections(n_clusters: int = 20):
         centroid = kmeans.cluster_centers_[c]
         cluster_vecs = matrix[cluster_indices]
         dists = np.linalg.norm(cluster_vecs - centroid, axis=1)
-        rep_idx = int(cluster_indices[int(np.argmin(dists))])
-        rep_id = image_ids[rep_idx]
+        rep_idx = None
+        for local_idx in np.argsort(dists):
+            candidate_idx = int(cluster_indices[int(local_idx)])
+            candidate_id = int(image_ids[candidate_idx])
+            if candidate_id in cached_sm_ids:
+                rep_idx = candidate_idx
+                break
+        if rep_idx is None:
+            continue
+        rep_id = int(image_ids[rep_idx])
         representative_ids.append(rep_id)
-        member_ids = [image_ids[int(i)] for i in cluster_indices[:50]]
+        member_ids = [int(image_ids[int(i)]) for i in cluster_indices[:50] if int(image_ids[int(i)]) in cached_sm_ids]
+        if rep_id not in member_ids:
+            member_ids.insert(0, rep_id)
         collection_drafts.append((c, int(cluster_indices.size), rep_id, member_ids))
 
     images_data = await db.get_images_by_ids(representative_ids)
