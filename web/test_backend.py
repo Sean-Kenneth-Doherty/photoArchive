@@ -918,6 +918,86 @@ class BackendRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["best_cached"], "full")
         self.assertEqual(result["tiers"]["md"]["cached_url"], "/api/thumb/md/42?cached=1")
 
+    async def test_cache_status_reports_preview_and_original_progress_separately(self):
+        source = await self._source()
+        await self._image(source["id"], "browser-original.jpg")
+        await self._image(source["id"], "raw-original.nef")
+
+        def tier(count, bytes_used, budget):
+            return {
+                "count": count,
+                "bytes": bytes_used,
+                "current_count": count,
+                "current_bytes": bytes_used,
+                "stale_count": 0,
+                "replacement_mode": False,
+                "budget_bytes": budget,
+            }
+
+        cache_stats = {
+            "memory": {"used_bytes": 0, "limit_bytes": 1, "tiers": {}},
+            "disk": {
+                "root": app_module.thumbnails.SSD_CACHE_DIR,
+                "limit_bytes": 1000,
+                "used_bytes": 460,
+                "tiers": {
+                    "sm": tier(2, 20, 100),
+                    "md": tier(2, 80, 200),
+                    "lg": tier(2, 160, 300),
+                    "full": tier(0, 0, 400),
+                },
+            },
+            "thumbnail_config": {"changed_at": 0, "replace_stale_thumbnails": False},
+        }
+        captured = {}
+
+        def fake_pregen_status(target_total, stats=None, original_total=0):
+            captured["target_total"] = target_total
+            captured["original_total"] = original_total
+            return {
+                "state": "running",
+                "manual_pause": False,
+                "active_phase": "full",
+                "phases": {
+                    "sm": {"count": 2, "total": 2, "remaining": 0},
+                    "md": {"count": 2, "total": 2, "remaining": 0},
+                    "lg": {"count": 2, "total": 2, "remaining": 0},
+                },
+                "preview": {"count": 6, "total": 6, "remaining": 0, "progress_pct": 100.0},
+                "originals": {"count": 0, "total": original_total, "remaining": original_total},
+                "remaining": 0,
+                "eta_seconds": None,
+                "original_eta_seconds": None,
+                "replacement_mode": False,
+            }
+
+        old_cache_stats = app_module.thumbnails.cache_stats
+        old_pregen_status = app_module.thumbnails.get_pregen_status
+        old_recommendations = app_module._cache_recommendations
+        try:
+            app_module.thumbnails.cache_stats = lambda: cache_stats
+            app_module.thumbnails.get_pregen_status = fake_pregen_status
+            app_module._cache_recommendations = (
+                lambda _cache, eligible, total, browser: {
+                    "eligible_images": eligible,
+                    "total_images": total,
+                    "browser_original_images": browser,
+                    "tiers": {},
+                }
+            )
+
+            result = await app_module.build_cache_status(ahead=0)
+        finally:
+            app_module.thumbnails.cache_stats = old_cache_stats
+            app_module.thumbnails.get_pregen_status = old_pregen_status
+            app_module._cache_recommendations = old_recommendations
+
+        self.assertEqual(captured, {"target_total": 2, "original_total": 1})
+        self.assertEqual(result["disk"]["tiers"]["sm"]["progress_total"], 2)
+        self.assertEqual(result["disk"]["tiers"]["full"]["progress_total"], 1)
+        self.assertEqual(result["pregen"]["preview"]["remaining"], 0)
+        self.assertEqual(result["pregen"]["originals"]["remaining"], 1)
+
     async def test_ui_settings_returns_default_loupe_cache_status(self):
         result = await app_module.api_ui_settings()
 

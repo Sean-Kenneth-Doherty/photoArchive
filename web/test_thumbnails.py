@@ -23,6 +23,9 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         self.old_db_connect = thumbnails._db_connect
         self.old_db_path = thumbnails.db.DB_PATH
         self.old_persistent_conn = thumbnails._persistent_conn
+        self.old_prefetching = thumbnails._prefetching
+        self.old_pregen_manual_mode = thumbnails._pregen_manual_mode
+        self.old_pregen_manual_pause = thumbnails._pregen_manual_pause
 
         thumbnails.SSD_CACHE_DIR = self.tempdir.name
         thumbnails.db.DB_PATH = os.path.join(self.tempdir.name, "thumbnail-cache-test.db")
@@ -40,6 +43,11 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         thumbnails._tier_byte_totals.clear()
         thumbnails._source_stat_cache.clear()
         thumbnails._thumbnail_retry_after.clear()
+        thumbnails._prefetching = True
+        thumbnails._pregen_manual_mode = True
+        thumbnails._pregen_manual_pause = False
+        thumbnails._reset_pregen_bulk_cursor()
+        thumbnails._reset_pregen_full_cursor()
         with thumbnails._write_queue_lock:
             thumbnails._write_queue.clear()
         with thumbnails._disk_index_lock:
@@ -57,11 +65,16 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         thumbnails._persistent_conn = self.old_persistent_conn
         thumbnails.db.DB_PATH = self.old_db_path
         thumbnails.MEMORY_CACHE_BYTES = self.old_memory_bytes
+        thumbnails._prefetching = self.old_prefetching
+        thumbnails._pregen_manual_mode = self.old_pregen_manual_mode
+        thumbnails._pregen_manual_pause = self.old_pregen_manual_pause
         thumbnails._clear_memory_cache()
         thumbnails._clear_disk_index()
         thumbnails._tier_byte_totals.clear()
         thumbnails._source_stat_cache.clear()
         thumbnails._thumbnail_retry_after.clear()
+        thumbnails._reset_pregen_bulk_cursor()
+        thumbnails._reset_pregen_full_cursor()
         with thumbnails._write_queue_lock:
             thumbnails._write_queue.clear()
         thumbnails._clear_cache_metadata_lock_backoff()
@@ -72,6 +85,33 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         Image.new("RGB", (1200, 800), color=(120, 80, 40)).save(path, "JPEG", quality=90)
         os.utime(path, (time.time(), 1712345678.25))
         return path
+
+    def _make_original_file(self, name: str, size: int) -> str:
+        path = os.path.join(self.tempdir.name, name)
+        with open(path, "wb") as f:
+            f.write(bytes([len(name) % 251]) * size)
+        os.utime(path, (time.time(), 1712345678.25 + size))
+        return path
+
+    def _add_catalog_original(self, image_id: int, path: str):
+        stat = os.stat(path)
+        with sqlite3.connect(thumbnails.db.DB_PATH) as conn:
+            conn.executescript(thumbnails.db.SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO catalog_sources "
+                "(id, path, display_name, included, online) VALUES (1, ?, 'catalog', 1, 1)",
+                (self.tempdir.name,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO images "
+                "(id, source_id, filename, filepath, status, file_size, file_modified_at, missing_at) "
+                "VALUES (?, 1, ?, ?, 'kept', ?, ?, NULL)",
+                (image_id, os.path.basename(path), path, int(stat.st_size), float(stat.st_mtime)),
+            )
+
+    def _cache_original_now(self, image_id: int, path: str):
+        signature = thumbnails._build_source_signature(path, thumbnails.FULL_TIER, image_id)
+        return thumbnails._cache_full_image_sync(path, image_id, signature, hot=False)
 
     def _catalog_signatures(self, path: str, image_id: int = 1) -> tuple[dict[str, str], int, float]:
         stat = os.stat(path)
@@ -218,6 +258,51 @@ class ThumbnailBulkWarmupTests(unittest.TestCase):
         self.assertIn("sm", needed)
         self.assertIn("md", needed)
         self.assertNotIn("lg", needed)
+
+    def test_full_warmup_copies_until_budget_room_is_used_and_skips_cached(self):
+        thumbnails._disk_allocations[thumbnails.FULL_TIER] = 70
+        first = self._make_original_file("first.jpg", 30)
+        second = self._make_original_file("second.jpg", 40)
+        third = self._make_original_file("third.jpg", 40)
+        for image_id, path in ((1, first), (2, second), (3, third)):
+            self._add_catalog_original(image_id, path)
+
+        self.assertNotEqual(self._cache_original_now(1, first), first)
+
+        warmed = asyncio.run(thumbnails._run_full_warm_batch(generate_batch=10))
+
+        self.assertEqual(warmed, 1)
+        self.assertTrue(thumbnails.has_cached(thumbnails.FULL_TIER, first, 1))
+        self.assertTrue(thumbnails.has_cached(thumbnails.FULL_TIER, second, 2))
+        self.assertFalse(thumbnails.has_cached(thumbnails.FULL_TIER, third, 3))
+
+    def test_full_warmup_does_not_churn_when_full_tier_is_full(self):
+        thumbnails._disk_allocations[thumbnails.FULL_TIER] = 80
+        first = self._make_original_file("one.jpg", 40)
+        second = self._make_original_file("two.jpg", 40)
+        third = self._make_original_file("three.jpg", 10)
+        for image_id, path in ((1, first), (2, second), (3, third)):
+            self._add_catalog_original(image_id, path)
+
+        self.assertNotEqual(self._cache_original_now(1, first), first)
+        self.assertNotEqual(self._cache_original_now(2, second), second)
+
+        warmed = asyncio.run(thumbnails._run_full_warm_batch(generate_batch=10))
+
+        self.assertEqual(warmed, 0)
+        self.assertTrue(thumbnails.has_cached(thumbnails.FULL_TIER, first, 1))
+        self.assertTrue(thumbnails.has_cached(thumbnails.FULL_TIER, second, 2))
+        self.assertFalse(thumbnails.has_cached(thumbnails.FULL_TIER, third, 3))
+
+    def test_full_warmup_skips_oversized_originals(self):
+        thumbnails._disk_allocations[thumbnails.FULL_TIER] = 32
+        path = self._make_original_file("oversized.jpg", 64)
+        self._add_catalog_original(1, path)
+
+        warmed = asyncio.run(thumbnails._run_full_warm_batch(generate_batch=10))
+
+        self.assertEqual(warmed, 0)
+        self.assertFalse(thumbnails.has_cached(thumbnails.FULL_TIER, path, 1))
 
     def test_touch_cached_signature_ignores_sqlite_lock(self):
         class LockedConn:

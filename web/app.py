@@ -49,7 +49,7 @@ app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000)
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
-_BROWSER_IMAGE_EXTENSIONS = {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_BROWSER_IMAGE_EXTENSIONS = thumbnails.BROWSER_ORIGINAL_EXTENSIONS
 _IDLE_ACTIVITY_EXCLUDED_PATHS = {
     "/api/ai/status",
     "/api/cache/status",
@@ -912,12 +912,31 @@ async def warm_images(request: Request):
 
 # --- Cache Status ---
 
-def _cache_recommendations(cache: dict, eligible_images: int, total_images: int) -> dict:
+async def _browser_original_count() -> int:
+    conn = await db.get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT i.filepath FROM images i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE s.included = 1 AND s.online = 1 AND i.missing_at IS NULL"
+        )
+        rows = await cursor.fetchall()
+        return sum(1 for row in rows if thumbnails.is_browser_displayable_original(row["filepath"]))
+    finally:
+        await conn.close()
+
+
+def _cache_recommendations(
+    cache: dict,
+    eligible_images: int,
+    total_images: int,
+    browser_original_images: int,
+) -> dict:
     estimates = thumbnails.cache_archive_estimates()
     tiers = {}
     for tier_name in thumbnails.ALL_TIERS:
         avg_bytes = int(estimates.get("avg_bytes", {}).get(tier_name) or thumbnails.estimated_tier_bytes(tier_name))
-        target_count = total_images if tier_name == thumbnails.FULL_TIER else eligible_images
+        target_count = browser_original_images if tier_name == thumbnails.FULL_TIER else eligible_images
         full_archive_bytes = avg_bytes * max(0, int(target_count))
         budget_bytes = int(cache.get("disk", {}).get("tiers", {}).get(tier_name, {}).get("budget_bytes") or 0)
         estimated_cached = int(budget_bytes / avg_bytes) if avg_bytes > 0 else 0
@@ -933,6 +952,7 @@ def _cache_recommendations(cache: dict, eligible_images: int, total_images: int)
     return {
         "eligible_images": eligible_images,
         "total_images": total_images,
+        "browser_original_images": browser_original_images,
         "budget": thumbnails.cache_budget_config(),
         "tiers": tiers,
     }
@@ -941,6 +961,7 @@ def _cache_recommendations(cache: dict, eligible_images: int, total_images: int)
 async def build_cache_status(ahead: int = 100):
     stats = await db.get_stats()
     active_total = stats["kept"] + stats["maybe"]
+    browser_original_total = await _browser_original_count()
     cache = thumbnails.cache_stats()
 
     memory = cache["memory"]
@@ -955,7 +976,7 @@ async def build_cache_status(ahead: int = 100):
     ) if disk["limit_bytes"] > 0 else 0.0
 
     for tier_name, tier in disk["tiers"].items():
-        progress_total = active_total if tier_name in thumbnails.THUMB_TIERS else stats["total_images"]
+        progress_total = active_total if tier_name in thumbnails.THUMB_TIERS else browser_original_total
         progress_count = (
             tier.get("current_count", 0)
             if tier.get("replacement_mode")
@@ -972,8 +993,14 @@ async def build_cache_status(ahead: int = 100):
     result = {
         **cache,
         "eligible_images": active_total,
-        "recommendations": _cache_recommendations(cache, active_total, stats["total_images"]),
-        "pregen": thumbnails.get_pregen_status(active_total, cache),
+        "browser_original_images": browser_original_total,
+        "recommendations": _cache_recommendations(
+            cache,
+            active_total,
+            stats["total_images"],
+            browser_original_total,
+        ),
+        "pregen": thumbnails.get_pregen_status(active_total, cache, browser_original_total),
         "governor": resource_governor.get_background_decision(
             thumbnails.get_idle_seconds()
         ).to_dict(),
@@ -1024,7 +1051,10 @@ async def cache_pregen_stop():
 @app.get("/api/cache/pregen/status")
 async def cache_pregen_status():
     stats = await db.get_stats()
-    return thumbnails.get_pregen_status(stats["kept"] + stats["maybe"])
+    return thumbnails.get_pregen_status(
+        stats["kept"] + stats["maybe"],
+        original_total=await _browser_original_count(),
+    )
 
 
 @app.post("/api/ai/embeddings/pause")

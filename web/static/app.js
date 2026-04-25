@@ -2810,11 +2810,11 @@ const PhotoArchive = (() => {
 
     function loupeCacheStatusText(status = loupeCurrentMediaStatus) {
         return [
-            'cache:',
+            'ssd:',
             `sm ${loupeCacheMark(status, 'sm')}`,
             `md ${loupeCacheMark(status, 'md')}`,
             `lg ${loupeCacheMark(status, 'lg')}`,
-            `og ssd ${loupeCacheMark(status, 'full')}`,
+            `original ${loupeCacheMark(status, 'full')}`,
             `· viewing ${loupeViewingTierName()}`,
         ].join(' ');
     }
@@ -4475,18 +4475,33 @@ const PhotoArchive = (() => {
         const embedAvailable = ai.worker_state !== 'unavailable';
         const embedComplete = embedRemaining <= 0 && embedTotal > 0;
 
-        // Thumbnail progress — aggregate across tiers
+        // Preview cache progress stays separate from original SSD warming.
         const diskTiers = disk.tiers || {};
-        const tierNames = ['sm', 'md', 'lg', 'full'];
-        let thumbDone = 0, thumbTotal = 0;
-        for (const name of tierNames) {
-            const t = diskTiers[name] || {};
-            thumbDone += Number(t.progress_count ?? t.count ?? 0);
-            thumbTotal += Number(t.progress_total || 0);
+        const previewTierNames = ['sm', 'md', 'lg'];
+        const previewSummary = pregen.preview || {};
+        let previewDone = Number(previewSummary.count || 0);
+        let previewTotal = Number(previewSummary.total || 0);
+        if (previewTotal <= 0) {
+            for (const name of previewTierNames) {
+                const t = diskTiers[name] || {};
+                previewDone += Number(t.progress_count ?? t.count ?? 0);
+                previewTotal += Number(t.progress_total || 0);
+            }
         }
-        const thumbPct = thumbTotal > 0 ? Math.min(100, thumbDone / thumbTotal * 100) : 0;
+        const previewPct = previewTotal > 0 ? Math.min(100, previewDone / previewTotal * 100) : 0;
         const thumbPaused = Boolean(pregen.manual_pause);
-        const thumbComplete = thumbPct >= 95;
+        const previewComplete = previewPct >= 95;
+
+        const fullTier = diskTiers.full || {};
+        const originals = pregen.originals || {};
+        const originalDone = Number(originals.count ?? fullTier.progress_count ?? fullTier.count ?? 0);
+        const originalTotal = Number(originals.total ?? fullTier.progress_total ?? 0);
+        const originalBudget = Number(originals.budget_bytes ?? fullTier.budget_bytes ?? 0);
+        const originalPct = originalTotal > 0
+            ? Math.min(100, originalDone / originalTotal * 100)
+            : Math.min(100, Number(originals.utilization_pct ?? fullTier.utilization_pct ?? 0));
+        const originalEnabled = originalBudget > 0 || originalTotal > 0 || originalDone > 0;
+        const originalComplete = !originalEnabled || originalPct >= 95 || Number(originals.remaining || 0) <= 0;
 
         // ETAs
         let embedEta = '';
@@ -4494,17 +4509,22 @@ const PhotoArchive = (() => {
         else if (ai.eta_seconds) embedEta = formatEta(ai.eta_seconds);
         else if (ai.worker_state === 'embedding') embedEta = 'Measuring\u2026';
 
-        let thumbEta = '';
-        if (thumbComplete) thumbEta = 'Done';
-        else if (pregen.eta_seconds) thumbEta = formatEta(pregen.eta_seconds);
-        else if (pregen.state === 'running') thumbEta = 'Measuring\u2026';
+        let previewEta = '';
+        if (previewComplete) previewEta = 'Done';
+        else if (pregen.eta_seconds) previewEta = formatEta(pregen.eta_seconds);
+        else if (pregen.state === 'running') previewEta = 'Measuring\u2026';
+
+        let originalEta = '';
+        if (originalComplete) originalEta = 'Done';
+        else if (pregen.original_eta_seconds) originalEta = formatEta(pregen.original_eta_seconds);
+        else if (pregen.state === 'running' && pregen.active_phase === 'full') originalEta = 'Measuring\u2026';
 
         // Speeds
         const embedSpeed = Number(ai.recent_images_per_min || ai.overall_images_per_min || 0);
         const thumbSpeed = Number(pregen.recent_images_per_min || pregen.overall_images_per_min || 0);
 
         // Build HTML
-        const allDone = embedComplete && thumbComplete;
+        const allDone = embedComplete && previewComplete && originalComplete;
         const pauseAllLabel = (embedPaused && thumbPaused) ? 'Resume All' : 'Pause All';
         const pauseAllAction = (embedPaused && thumbPaused) ? 'resumeAllWork' : 'pauseAllWork';
 
@@ -4529,13 +4549,24 @@ const PhotoArchive = (() => {
                 </div>
                 <div class="work-row thumb">
                     <div class="work-row-head">
-                        <span class="work-row-label">Thumbnail Cache</span>
-                        <span class="work-row-stat">${thumbDone.toLocaleString()} / ${thumbTotal.toLocaleString()}</span>
+                        <span class="work-row-label">Preview Cache</span>
+                        <span class="work-row-stat">${previewDone.toLocaleString()} / ${previewTotal.toLocaleString()}</span>
                     </div>
-                    <div class="work-row-bar"><div class="work-row-fill" style="width:${thumbPct}%"></div></div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${previewPct}%"></div></div>
                     <div class="work-row-detail">
-                        <span>${thumbSpeed > 0 ? formatRatePerMinute(thumbSpeed) : (thumbComplete ? 'Complete' : thumbPaused ? 'Paused' : 'Waiting')}</span>
-                        <span class="work-row-eta">${thumbEta}</span>
+                        <span>${thumbSpeed > 0 ? formatRatePerMinute(thumbSpeed) : (previewComplete ? 'Complete' : thumbPaused ? 'Paused' : 'Waiting')}</span>
+                        <span class="work-row-eta">${previewEta}</span>
+                    </div>
+                </div>
+                <div class="work-row thumb">
+                    <div class="work-row-head">
+                        <span class="work-row-label">Original SSD Cache</span>
+                        <span class="work-row-stat">${originalDone.toLocaleString()} / ${originalTotal.toLocaleString()}</span>
+                    </div>
+                    <div class="work-row-bar"><div class="work-row-fill" style="width:${originalPct}%"></div></div>
+                    <div class="work-row-detail">
+                        <span>${originalComplete ? 'Complete' : thumbPaused ? 'Paused' : pregen.active_phase === 'full' ? 'Warming' : 'Waiting'}</span>
+                        <span class="work-row-eta">${originalEta}</span>
                     </div>
                 </div>
             </div>
@@ -4567,6 +4598,7 @@ const PhotoArchive = (() => {
         const warmed = (name) => Number(diskTiers[name]?.progress_pct || 0);
         const smWarm = warmed('sm');
         const mdWarm = warmed('md');
+        const originalsRemaining = Number(cs.pregen?.originals?.remaining || 0);
         const estimateIsEarly = (name) => {
             const plan = rec.tiers[name] || {};
             const tier = diskTiers[name] || {};
@@ -4577,13 +4609,13 @@ const PhotoArchive = (() => {
             return total > 0 && count / total < 0.05;
         };
         const headline = mdWarm >= 95
-            ? 'Fast browsing cache is fully warmed'
+            ? (originalsRemaining > 0 ? 'Fast browsing cache is warm; originals are warming' : 'Fast browsing cache is fully warmed')
             : smWarm >= 95
                 ? 'Grid browsing is warmed; loupe previews are still building'
                 : 'photoArchive is building the fast cache';
 
         if (titleEl) {
-            const building = mdWarm < 95;
+            const building = mdWarm < 95 || originalsRemaining > 0;
             titleEl.innerHTML = headline + (building ? ' <span class="cache-building-dot"></span>' : '');
         }
         if (subtitleEl) {
@@ -4616,13 +4648,18 @@ const PhotoArchive = (() => {
                 state = 'Refreshing';
                 cls = 'selective';
             }
-            const remaining = Number(cs.pregen?.phases?.[name]?.remaining || 0);
-            const etaText = remaining > 0 && cs.pregen?.eta_seconds
-                ? `<div class="cache-card-meta"><span>${remaining.toLocaleString()} remaining</span><span>ETA ${formatEta(cs.pregen.eta_seconds)}</span></div>`
+            const remaining = name === 'full'
+                ? Number(cs.pregen?.originals?.remaining || 0)
+                : Number(cs.pregen?.phases?.[name]?.remaining || 0);
+            const etaSeconds = name === 'full' ? cs.pregen?.original_eta_seconds : cs.pregen?.eta_seconds;
+            const etaText = remaining > 0 && etaSeconds
+                ? `<div class="cache-card-meta"><span>${remaining.toLocaleString()} remaining</span><span>ETA ${formatEta(etaSeconds)}</span></div>`
                 : '';
             const availabilityText = actual.replacement_mode && staleCount > 0
                 ? `${cached} refreshed · ${staleCount.toLocaleString()} older usable`
-                : `${cached} of ${total} generated`;
+                : name === 'full'
+                    ? `${cached} of ${total} cached`
+                    : `${cached} of ${total} generated`;
             return `
                 <div class="cache-friendly-card tier-${name} ${cls}">
                     <div class="cache-card-meta"><strong>${title}</strong><span>${state}</span></div>
@@ -4636,7 +4673,7 @@ const PhotoArchive = (() => {
             card('sm', 'Grid scrolling'),
             card('md', 'Loupe previews'),
             card('lg', 'High-res previews'),
-            card('full', 'Original files'),
+            card('full', 'Original SSD cache'),
         ].join('');
 
         if (adviceEl) {
